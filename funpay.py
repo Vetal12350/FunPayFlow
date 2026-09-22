@@ -300,6 +300,15 @@ class FunPayClient:
     # ломалось на ответах вида "Подождите 4 секунды" и ставило кулдаун 7200 сек).
 
     async def bump_lots(self, user_id: int, is_cancelled=None):
+        abandoned = threading.Event()
+
+        def _raise_if_active(game_id):
+            # to_thread может начать работу уже после отмены ожидающей coroutine.
+            if abandoned.is_set() or (is_cancelled and is_cancelled()):
+                return False
+            self.account.raise_lots(game_id)
+            return True
+
         def _prepare_profile():
             self.account.get()
             user_profile = self.account.get_user(user_id)
@@ -357,10 +366,15 @@ class FunPayClient:
 
             await asyncio.sleep(random.uniform(5.0, 9.0))
 
+            if is_cancelled and is_cancelled():
+                logger.info("Автоподнятие прервано из-за кнопки выключателя.")
+                return False, "Автоподнятие остановлено.", 0
+
             try:
                 # account.raise_lots сам поднимает ВСЕ разделы (node_id) данной
                 # категории через уже авторизованную сессию self.account.
-                await asyncio.to_thread(self.account.raise_lots, game_id)
+                if not await asyncio.to_thread(_raise_if_active, game_id):
+                    return False, "Автоподнятие остановлено.", 0
 
                 wait_time = 7200
                 next_time = time.time() + wait_time
@@ -368,6 +382,10 @@ class FunPayClient:
                 # Храним кортеж: (имя игры, кол-во разделов, время кулдауна) — для красивого Telegram-сообщения
                 raised_cats.append((game_name, node_count, wait_time))
                 logger.success(f"[BUMP] ✅ {display_name}: поднята")
+
+            except asyncio.CancelledError:
+                abandoned.set()
+                raise
 
             except FunPayAPI.exceptions.RaiseError as e:
                 # У этой версии библиотеки error_message часто пустой, а str(e) -
