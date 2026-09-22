@@ -207,25 +207,15 @@ async def _fetch_and_send_review(
     bot: Bot,
     client: FunPayClient,
     order_id: str,
-    buyer: str,
     delay: float = 0,
 ) -> None:
-    """
-    Отправляет уведомление об отзыве, если он есть.
-    delay=0 — запустить сразу (отзыв уже точно есть, пойман по NEW_FEEDBACK).
-    delay=5 — подождать 5 сек перед первой попыткой (отзыв мог быть оставлен
-    после закрытия заказа — как у Кардинала в get_order_from_object).
-    """
+    """Проверяет входящий отзыв по Order; событие служит только триггером."""
+    if not isinstance(order_id, str) or not re.fullmatch(r"[A-Z0-9]{8}", order_id):
+        logger.notify("Отзыв пропущен: некорректный ID заказа.")
+        return
     if delay > 0:
         await asyncio.sleep(delay)
     try:
-        # Как в Кардинале (get_order_from_object) - review может быть еще не
-        # проставлен на сервере FunPay в первый момент после системного
-        # сообщения о нем, поэтому делаем несколько попыток с паузой, а не
-        # одну. Раньше был ровно один запрос без повтора - если сервер
-        # отвечал на долю секунды раньше, чем сам проставлял review в заказ,
-        # отзыв "терялся" молча (review приходил None, а второй попытки
-        # уже не было).
         review = None
         full_order = None
         for attempt in range(3):
@@ -236,40 +226,60 @@ async def _fetch_and_send_review(
             await asyncio.sleep(1)
 
         if review is None:
-            logger.notify(f"Заказ {order_id}: отзыв не найден или пуст (после 3 попыток).")
+            logger.notify("Отзыв не найден после 3 попыток.")
             return
 
-        # Отзыв уже отправляли по этому заказу (сработал второй путь
-        # обнаружения) - не дублируем в Telegram.
-        if order_id in client._notified_reviews:
+        verified_order_id = getattr(full_order, "id", None)
+        if verified_order_id != order_id or getattr(review, "order_id", None) != verified_order_id:
+            logger.notify("Отзыв пропущен: несоответствие ID заказа и отзыва.")
             return
-        client._notified_reviews.add(order_id)
 
+        account_id = getattr(client.account, "id", None)
+        seller_id = getattr(full_order, "seller_id", None)
+        buyer_id = getattr(full_order, "buyer_id", None)
+        author_id = getattr(review, "author_id", None)
+        if not all(type(value) is int and value > 0 for value in (account_id, seller_id, buyer_id, author_id)):
+            logger.notify("Отзыв пропущен: отсутствуют достоверные ID участников.")
+            return
+        if seller_id != account_id or buyer_id == account_id or author_id != buyer_id:
+            logger.notify("Отзыв пропущен: направление не соответствует нашей продаже.")
+            return
+
+        text_content = getattr(review, "text", None)
+        if not isinstance(text_content, str) or not text_content.strip():
+            # reply продавца сам по себе не является входящим отзывом.
+            logger.notify("Отзыв пропущен: нет текста отзыва покупателя.")
+            return
+
+        buyer = getattr(full_order, "buyer_username", None) or "Покупатель"
         stars = getattr(review, "stars", None)
-        stars_str = "⭐" * int(stars) if isinstance(stars, int) and stars > 0 else ""
-        text_content = getattr(review, "text", None) or ""
+        stars_str = "⭐" * stars if type(stars) is int and 1 <= stars <= 5 else ""
         review_text = (
             "🌟 <b>Новый отзыв</b>\n"
             f"Покупатель: <b>{buyer}</b>\n"
             + (f"Оценка: {stars_str}\n" if stars_str else "")
-            + (f"Текст: {text_content}" if text_content else "📝 <i>(без текста)</i>")
+            + f"Текст: {text_content}"
         )
-        logger.notify(_strip_html(review_text))
 
-        for recipient_id in get_all_recipients():
-            u = get_user_settings(recipient_id)
-            if not u.get("notifications_enabled", True):
-                continue
-            if not u.get("notify_review", True):
-                continue
-            try:
-                await bot.send_message(recipient_id, review_text, parse_mode="HTML")
-            except Exception as e:
-                if not _is_ignorable_send_error(e):
-                    logger.notify(f"Не удалось отправить отзыв пользователю {recipient_id}: {e}")
+        # Два пути обнаружения могут дойти сюда одновременно.
+        async with client._review_notification_lock:
+            if verified_order_id in client._notified_reviews:
+                return
+            for recipient_id in get_all_recipients():
+                u = get_user_settings(recipient_id)
+                if not u.get("notifications_enabled", True) or not u.get("notify_review", True):
+                    continue
+                try:
+                    await bot.send_message(recipient_id, review_text, parse_mode="HTML")
+                except Exception as e:
+                    logger.notify(f"Не удалось отправить отзыв: {type(e).__name__}.")
+                else:
+                    # Отметка означает доставку хотя бы одному получателю.
+                    # При частичной доставке повтор всей рассылки не выполняется.
+                    client._notified_reviews.add(verified_order_id)
 
     except Exception as e:
-        logger.notify(f"Не удалось получить данные заказа {order_id}: {e}")
+        logger.notify(f"Не удалось проверить отзыв: {type(e).__name__}.")
 
 
 async def notifications_loop(bot: Bot, client: FunPayClient):
@@ -310,17 +320,15 @@ async def notifications_loop(bot: Bot, client: FunPayClient):
         for setting_key, text in client.describe_event(event):
             # _review_check_immediate — отзыв поймали через NEW_FEEDBACK в чате, сразу проверяем
             if setting_key == "_review_check_immediate":
-                order_id_r, buyer_r = text.split("|||", 1)
                 asyncio.create_task(
-                    _fetch_and_send_review(bot, client, order_id_r, buyer_r, delay=0)
+                    _fetch_and_send_review(bot, client, text, delay=0)
                 )
                 continue
             # _review_check — заказ закрыт, ждём 5 сек (покупатель мог оставить отзыв
             # чуть позже закрытия), затем 3 попытки — точно как у Кардинала
             if setting_key == "_review_check":
-                order_id_r, buyer_r = text.split("|||", 1)
                 asyncio.create_task(
-                    _fetch_and_send_review(bot, client, order_id_r, buyer_r, delay=5)
+                    _fetch_and_send_review(bot, client, text, delay=5)
                 )
                 continue
 
