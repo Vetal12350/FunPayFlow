@@ -207,7 +207,9 @@ def on_icon(state: bool) -> str:
 def get_reply_keyboard():
     return ReplyKeyboardMarkup(
         keyboard=[[KeyboardButton(text="🛠 Главное меню")]],
-        resize_keyboard=True
+        resize_keyboard=True,
+        one_time_keyboard=False,
+        is_persistent=True,
     )
 
 
@@ -288,6 +290,11 @@ async def callback_handler(callback: CallbackQuery):
 
     # Возврат в главное меню
     elif action == "menu_main":
+        await callback.answer()
+        await callback.message.answer(
+            "Клавиатура управления активирована 👇",
+            reply_markup=get_reply_keyboard(),
+        )
         try:
             await callback.message.edit_text(
                 MAIN_MENU_TEXT,
