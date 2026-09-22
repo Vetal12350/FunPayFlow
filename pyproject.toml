@@ -1,0 +1,26 @@
+[project]
+name = "funpay"
+version = "0.1.0"
+description = "FunPay automation bot — Telegram notifications and lot auto-bump"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "aiogram>=3.7,<4",
+    "FunPayAPI>=1.1.0",
+    "requests>=2.28",
+    "beautifulsoup4>=4.12",
+    "python-dotenv>=1.0",
+]
+
+[project.scripts]
+funpay-bot = "main:run"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.uv]
+package = true
+
+[dependency-groups]
+dev = []

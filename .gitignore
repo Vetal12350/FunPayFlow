@@ -1,0 +1,31 @@
+﻿# Secrets
+.env
+.env.*
+!.env.example
+
+# Virtual environments
+.venv/
+venv/
+
+# Runtime / personal state
+bot.lock
+bot_settings.json
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Logs
+*.log
+logs/
+
+# Tool caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
