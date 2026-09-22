@@ -1,5 +1,6 @@
 import asyncio
 import os
+import queue
 import re
 import subprocess
 import sys
@@ -315,7 +316,10 @@ async def notifications_loop(bot: Bot, client: FunPayClient):
 
     while True:
         # Забираем следующее событие из очереди, не блокируя asyncio-цикл
-        event = await asyncio.to_thread(client.event_queue.get)
+        try:
+            event = await asyncio.to_thread(client.event_queue.get, True, 1.0)
+        except queue.Empty:
+            continue
 
         for setting_key, text in client.describe_event(event):
             # _review_check_immediate — отзыв поймали через NEW_FEEDBACK в чате, сразу проверяем
@@ -369,6 +373,53 @@ async def session_refresh_loop(client: FunPayClient):
             logger.warning(f"Не удалось обновить сессию FunPay: {e}")
 
 
+async def _supervise_tasks(bot: Bot, client: FunPayClient):
+    """Завершает runtime при остановке polling или критической фоновой задачи."""
+    tasks = {
+        "telegram_polling": asyncio.create_task(
+            dp.start_polling(bot, close_bot_session=False), name="telegram_polling"
+        ),
+        "auto_bump": asyncio.create_task(auto_bump_loop(bot, client), name="auto_bump"),
+        "notifications": asyncio.create_task(notifications_loop(bot, client), name="notifications"),
+        "session_refresh": asyncio.create_task(session_refresh_loop(client), name="session_refresh"),
+    }
+    polling = tasks["telegram_polling"]
+    failed = False
+    try:
+        done, _ = await asyncio.wait(tasks.values(), return_when=asyncio.FIRST_COMPLETED)
+        for name, task in tasks.items():
+            if task in done and task is not polling:
+                if task.cancelled() or task.exception() is None:
+                    logger.error(f"Критическая задача {name} неожиданно завершилась.")
+                    failed = True
+    finally:
+        for task in tasks.values():
+            if task is not polling and not task.done():
+                task.cancel()
+        try:
+            if not polling.done():
+                try:
+                    # Штатная остановка позволяет aiogram завершить свои polling tasks.
+                    await asyncio.wait_for(dp.stop_polling(), timeout=10.0)
+                except Exception as e:
+                    logger.error(f"Не удалось штатно остановить polling: {type(e).__name__}.")
+                    failed = True
+        finally:
+            if not polling.done():
+                polling.cancel()
+            results = await asyncio.gather(*tasks.values(), return_exceptions=True)
+            for name, result in zip(tasks, results):
+                if isinstance(result, asyncio.CancelledError):
+                    continue
+                if isinstance(result, BaseException):
+                    # Текст исключения и traceback могут содержать credentials.
+                    logger.error(f"Ошибка задачи {name}: {type(result).__name__}.")
+                    failed = True
+
+    if failed:
+        raise RuntimeError("Runtime остановлен из-за завершения критической задачи.") from None
+
+
 async def main():
 
     bot = Bot(token=_require_env("BOT_TOKEN"))
@@ -398,10 +449,17 @@ async def main():
 
     logger.success("Бот подключен к Telegram. Запуск фоновых процессов...")
 
-    asyncio.create_task(auto_bump_loop(bot, client))
-    asyncio.create_task(notifications_loop(bot, client))
-    asyncio.create_task(session_refresh_loop(client))
-    await dp.start_polling(bot)
+    try:
+        await _supervise_tasks(bot, client)
+    finally:
+        unwinding_exception = sys.exc_info()[0] is not None
+        try:
+            await bot.session.close()
+        except asyncio.CancelledError:
+            if not unwinding_exception:
+                raise
+        except Exception as e:
+            logger.error(f"Не удалось закрыть сессию Telegram: {type(e).__name__}.")
 
 
 def run():
