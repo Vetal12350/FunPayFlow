@@ -520,36 +520,10 @@ class FunPayClient:
                     try:
                         return original_method(request_method, api_method, headers, payload, *args, **kwargs)
                     except Exception as e:
-                        # Сам Runner внутри себя ловит это исключение и просто печатает
-                        # обобщенное "Произошла ошибка при получении событий", реальную
-                        # причину не показывая. Печатаем ее здесь, чтобы было видно,
-                        # что именно не так (401/403/JSON/таймаут и т.д.)
+                        # Логируем только операцию и тип ошибки: текст исключения,
+                        # ответ сервера и состояние Account могут содержать секреты.
                         if api_method == "runner/":
-                            logger.debug(f"Реальная ошибка запроса runner/: {type(e).__name__}: {e}")
-                            # Библиотека в тексте исключения показывает то, что МЫ отправили,
-                            # но не показывает, что ОТВЕТИЛ сервер - а именно там причина 400.
-                            # Пытаемся вытащить тело ответа откуда угодно, где оно может лежать.
-                            resp = getattr(e, "response", None)
-                            if resp is not None:
-                                try:
-                                    logger.debug(f"Тело ответа сервера: {resp.text[:1000]}")
-                                except Exception:
-                                    pass
-                            for attr in ("response_text", "text", "body", "message", "msg"):
-                                val = getattr(e, attr, None)
-                                if val:
-                                    logger.debug(f"e.{attr} = {str(val)[:1000]}")
-                            logger.debug(f"Все атрибуты исключения: {vars(e) if hasattr(e, '__dict__') else 'нет __dict__'}")
-
-                            # FIX: подробные дампы внутренних атрибутов аккаунта (включая
-                            # потенциально куки/токены) выводятся ТОЛЬКО при DEBUG=1, чтобы
-                            # не светить чувствительные данные в production-логах.
-                            if os.getenv("DEBUG", "0") == "1":
-                                logger.debug(f"dir(self.account) содержит: {[a for a in dir(self.account) if not a.startswith('_')]}")
-                                acc_vars = {}
-                                for k, v in vars(self.account).items():
-                                    acc_vars[k] = repr(v)[:200]
-                                logger.debug(f"vars(self.account): {acc_vars}")
+                            logger.debug(f"Ошибка запроса runner/: {type(e).__name__}")
                         raise
 
             self.account.method = patched_method

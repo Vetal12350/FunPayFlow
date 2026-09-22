@@ -161,10 +161,12 @@ def _is_rate_limited(user_id: int) -> bool:
     entry = _failed_attempts.get(user_id)
     if not entry:
         return False
-    if entry.get("blocked_until", 0) > time.monotonic():
-        return True
-    # Блокировка истекла — сбрасываем
-    _failed_attempts.pop(user_id, None)
+    blocked_until = entry.get("blocked_until", 0)
+    if blocked_until > 0:
+        if blocked_until > time.monotonic():
+            return True
+        # Сбрасываем только действительно истёкшую блокировку.
+        _failed_attempts.pop(user_id, None)
     return False
 
 
