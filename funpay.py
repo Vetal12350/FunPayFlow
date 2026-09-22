@@ -11,6 +11,10 @@ import FunPayAPI
 from FunPayAPI.common.enums import SubCategoryTypes
 import logger
 
+
+class _AutobumpActionCancelled(Exception):
+    """Отмена поднятия до отправки запроса."""
+
 # ---------------------------------------------------------------------------
 # ФИКС ДЛЯ 400 "Необходимая cookie отсутствует или устарела" на runner/
 # ---------------------------------------------------------------------------
@@ -272,6 +276,16 @@ class FunPayClient:
         # бы улететь в Telegram дважды.
         self._notified_reviews: set[str] = set()
         self._review_notification_lock = asyncio.Lock()
+        self._raise_action_gate = threading.local()
+        original_account_method = self.account.method
+
+        def action_gated_method(request_method, api_method, headers, payload, *args, **kwargs):
+            allowed = getattr(self._raise_action_gate, "is_allowed", None)
+            if api_method == "lots/raise" and allowed is not None and not allowed():
+                raise _AutobumpActionCancelled()
+            return original_account_method(request_method, api_method, headers, payload, *args, **kwargs)
+
+        self.account.method = action_gated_method
 
     async def get_dashboard(self):
         try:
@@ -306,7 +320,15 @@ class FunPayClient:
             # to_thread может начать работу уже после отмены ожидающей coroutine.
             if abandoned.is_set() or (is_cancelled and is_cancelled()):
                 return False
-            self.account.raise_lots(game_id)
+            self._raise_action_gate.is_allowed = lambda: (
+                not abandoned.is_set() and (is_cancelled is None or not is_cancelled())
+            )
+            try:
+                self.account.raise_lots(game_id)
+            except _AutobumpActionCancelled:
+                return False
+            finally:
+                del self._raise_action_gate.is_allowed
             return True
 
         def _prepare_profile():
@@ -538,6 +560,7 @@ class FunPayClient:
                 # потоков за общим CSRF-токеном/сессией валит запросы 400-й ошибкой.
                 with self._account_lock:
                     try:
+                        # original_method проверяет допуск autobump уже после захвата lock.
                         return original_method(request_method, api_method, headers, payload, *args, **kwargs)
                     except Exception as e:
                         # Логируем только операцию и тип ошибки: текст исключения,
