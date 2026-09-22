@@ -270,6 +270,8 @@ class FunPayClient:
         # Отзыв теперь пытаются поймать ДВА независимых пути (через чат и
         # через закрытие заказа) - без этого набора один и тот же отзыв мог
         # бы улететь в Telegram дважды.
+        self._notified_reviews: set[str] = set()
+        self._review_notification_lock = asyncio.Lock()
 
     async def get_dashboard(self):
         try:
@@ -692,8 +694,7 @@ class FunPayClient:
                             match = re.search(r'#([A-Z0-9]{8})', msg_text)
                             if match:
                                 order_id = match.group(1)
-                                buyer = getattr(chat, "name", None) or "Покупатель"
-                                results.append(("_review_check_immediate", f"{order_id}|||{buyer}"))
+                                results.append(("_review_check_immediate", order_id))
                                 if chat_id is not None:
                                     self._notified_unread_chats[chat_id] = now
                         
@@ -762,7 +763,7 @@ class FunPayClient:
                     # если review реально найден, а по каждому order_id/чату это
                     # сработает максимум пару раз за жизнь заказа.
                     if order_id and order_id != "—":
-                        results.append(("_review_check", f"{order_id}|||{buyer}"))
+                        results.append(("_review_check", order_id))
 
                 elif refunded_status is not None and status == refunded_status:
                     text = (
@@ -778,22 +779,11 @@ class FunPayClient:
             new_review_et = getattr(event_types, "NEW_REVIEW", None)
             if new_review_et is not None and event.type is new_review_et:
                 review = getattr(event, "review", None)
-                if review is not None:
-                    buyer_r = (
-                        getattr(review, "buyer_username", None)
-                        or getattr(review, "author", None)
-                        or "Покупатель"
-                    )
-                    stars = getattr(review, "stars", None)
-                    stars_str = "⭐" * int(stars) if isinstance(stars, int) and stars > 0 else ""
-                    text_content = getattr(review, "text", None) or ""
-                    review_text = (
-                        "🌟 <b>Новый отзыв</b>\n"
-                        f"Покупатель: <b>{buyer_r}</b>\n"
-                        + (f"Оценка: {stars_str}\n" if stars_str else "")
-                        + (f"Текст: {text_content}" if text_content else "📝 <i>(без текста)</i>")
-                    )
-                    results.append(("notify_review", review_text))
+                order_id = getattr(review, "order_id", None)
+                if isinstance(order_id, str) and re.fullmatch(r"[A-Z0-9]{8}", order_id):
+                    results.append(("_review_check_immediate", order_id))
+                else:
+                    logger.notify("Событие отзыва пропущено: нет корректного ID заказа.")
 
         except Exception as e:
             # Если тут вылетает AttributeError - значит установленная версия
