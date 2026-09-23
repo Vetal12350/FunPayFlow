@@ -33,6 +33,11 @@ class ReviewReceiptStore:
         if not isinstance(order_id, str) or not re.fullmatch(r"[A-Z0-9]{8}", order_id):
             raise StateError("Invalid review receipt ID.")
 
+    @staticmethod
+    def _require_fingerprint(fingerprint: str) -> None:
+        if not isinstance(fingerprint, str) or not re.fullmatch(r"[0-9a-f]{64}", fingerprint):
+            raise StateError("Invalid review fingerprint.")
+
     def initialize(self) -> None:
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -50,8 +55,15 @@ class ReviewReceiptStore:
                     if (columns.get("order_id", (None,) * 6)[5] != 1
                             or columns.get("delivered_at", (None,) * 6)[3] != 1):
                         raise StateError("Persistent state schema is incompatible.")
+                    if "fingerprint" not in columns:
+                        connection.execute("ALTER TABLE review_receipts ADD COLUMN fingerprint TEXT")
+                        columns = {
+                            row[1]: row for row in connection.execute("PRAGMA table_info(review_receipts)")
+                        }
+                    if columns["fingerprint"][2].upper() != "TEXT":
+                        raise StateError("Persistent review schema is incompatible.")
                     connection.execute(
-                        "SELECT order_id, delivered_at FROM review_receipts LIMIT 1"
+                        "SELECT order_id, delivered_at, fingerprint FROM review_receipts LIMIT 1"
                     ).fetchone()
                     connection.execute(
                         "CREATE TABLE IF NOT EXISTS orders ("
@@ -88,14 +100,50 @@ class ReviewReceiptStore:
         except (sqlite3.Error, OSError):
             raise StateError("Persistent state read failed.") from None
 
-    def record_review_receipt(self, order_id: str) -> None:
+    def get_review_receipt(self, order_id: str) -> tuple[bool, str | None]:
         self._require_order_id(order_id)
+        try:
+            with closing(self._connect()) as connection:
+                row = connection.execute(
+                    "SELECT fingerprint FROM review_receipts WHERE order_id = ? LIMIT 1",
+                    (order_id,),
+                ).fetchone()
+                if row is None:
+                    return False, None
+                if row[0] is not None:
+                    self._require_fingerprint(row[0])
+                return True, row[0]
+        except (sqlite3.Error, OSError):
+            raise StateError("Persistent state read failed.") from None
+
+    def baseline_review_fingerprint(self, order_id: str, fingerprint: str) -> None:
+        self._require_order_id(order_id)
+        self._require_fingerprint(fingerprint)
+        try:
+            with closing(self._connect()) as connection:
+                with connection:
+                    result = connection.execute(
+                        "UPDATE review_receipts SET fingerprint = ? "
+                        "WHERE order_id = ? AND fingerprint IS NULL",
+                        (fingerprint, order_id),
+                    )
+                    if result.rowcount != 1:
+                        raise StateError("Legacy review receipt unavailable.")
+        except (sqlite3.Error, OSError):
+            raise StateError("Persistent state write failed.") from None
+
+    def record_review_receipt(self, order_id: str, fingerprint: str | None = None) -> None:
+        self._require_order_id(order_id)
+        if fingerprint is not None:
+            self._require_fingerprint(fingerprint)
         try:
             with closing(self._connect()) as connection:
                 with connection:
                     connection.execute(
-                        "INSERT OR IGNORE INTO review_receipts (order_id) VALUES (?)",
-                        (order_id,),
+                        "INSERT INTO review_receipts (order_id, fingerprint) VALUES (?, ?) "
+                        "ON CONFLICT(order_id) DO UPDATE SET "
+                        "fingerprint = COALESCE(excluded.fingerprint, review_receipts.fingerprint)",
+                        (order_id, fingerprint),
                     )
         except (sqlite3.Error, OSError):
             raise StateError("Persistent state write failed.") from None

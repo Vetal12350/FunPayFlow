@@ -1,4 +1,6 @@
 import asyncio
+import hashlib
+import json
 import os
 import queue
 import re
@@ -13,8 +15,9 @@ load_dotenv()
 import FunPayAPI
 from telegram import (dp, bot_settings, get_user_settings, get_all_recipients,
                       set_runtime_status_context, clear_runtime_status_context,
-                      disable_autobump, get_reply_keyboard)
-from funpay import FunPayClient, _AmbiguousRaiseOutcome
+                      disable_autobump, get_reply_keyboard, is_night_mode_enabled)
+from funpay import (FunPayClient, _AmbiguousRaiseOutcome,
+                    NIGHT_MODE_MESSAGE_TEXT, NIGHT_MODE_ORDER_TEXT)
 from state import ReviewReceiptStore, StateError
 import logger
 
@@ -179,7 +182,7 @@ async def auto_bump_loop(bot: Bot, client: FunPayClient):
             if wait_time == 0:  # Прервано пользователем во время перебора
                 continue
 
-            logger.bump(f"Цикл завершен. Следующий запуск через {wait_time} сек.")
+            logger.bump(f"Цикл завершён. Следующая проверка через {wait_time} сек.")
 
             # Отправляем отчет всем, у кого включены notifications_enabled + notify_bump.
             # message_text пустой, если все лоты были на кулдауне — в этом случае ничего не шлём.
@@ -205,15 +208,31 @@ async def auto_bump_loop(bot: Bot, client: FunPayClient):
             await asyncio.sleep(1)
 
 
-async def _review_state_operation(client: FunPayClient, operation, order_id: str):
+async def _review_state_operation(client: FunPayClient, operation, *args):
     try:
-        return await asyncio.to_thread(operation, order_id)
+        return await asyncio.to_thread(operation, *args)
     except StateError:
         client._review_state_failed = True
         raise
     except Exception:
         client._review_state_failed = True
         raise StateError("Persistent state operation failed.") from None
+
+
+def _review_fingerprint(stars, text: str) -> str:
+    """Fingerprint только оценки и текста покупателя, без reply продавца."""
+    payload = json.dumps([stars if type(stars) is int else None, text],
+                         ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _safe_review_event_part(value: str, limit: int) -> str:
+    clean = " ".join("".join(ch if ch.isprintable() else " " for ch in value).split())
+    clean = re.sub(
+        r"(?i)\b(?:golden_key|bot_token|password|cookie|phpsessid|csrf_token)\s*[:=]\s*\S+",
+        "[скрыто]", clean,
+    )
+    return clean[:limit] + ("…" if len(clean) > limit else "")
 
 
 async def _fetch_and_send_review(
@@ -224,7 +243,7 @@ async def _fetch_and_send_review(
 ) -> None:
     """Проверяет входящий отзыв по Order; событие служит только триггером."""
     if not isinstance(order_id, str) or not re.fullmatch(r"[A-Z0-9]{8}", order_id):
-        logger.notify("Отзыв пропущен: некорректный ID заказа.")
+        logger.warning("Отзыв пропущен: некорректный ID заказа.")
         return
     if delay > 0:
         await asyncio.sleep(delay)
@@ -238,65 +257,74 @@ async def _fetch_and_send_review(
         for pause in retry_pauses:
             if pause:
                 await asyncio.sleep(pause)
-            if order_id in client._notified_reviews:
-                return
             try:
                 full_order, account_id = await asyncio.to_thread(client.get_order_snapshot, order_id)
             except StateError:
                 raise
             except Exception as e:
-                logger.notify(f"Не удалось прочитать заказ при проверке отзыва: {type(e).__name__}.")
+                logger.warning(f"Не удалось прочитать заказ при проверке отзыва: {type(e).__name__}.")
                 continue
             review = getattr(full_order, "review", None)
             if review is not None and isinstance(getattr(review, "text", None), str) and review.text.strip():
                 break
 
         if review is None or not isinstance(getattr(review, "text", None), str) or not review.text.strip():
-            logger.notify("Отзыв покупателя не найден после ограниченных проверок.")
+            logger.warning("Отзыв покупателя не найден после ограниченных проверок.")
             return
 
         verified_order_id = getattr(full_order, "id", None)
         if verified_order_id != order_id or getattr(review, "order_id", None) != verified_order_id:
-            logger.notify("Отзыв пропущен: несоответствие ID заказа и отзыва.")
+            logger.warning("Отзыв пропущен: несоответствие ID заказа и отзыва.")
             return
 
         seller_id = getattr(full_order, "seller_id", None)
         buyer_id = getattr(full_order, "buyer_id", None)
         author_id = getattr(review, "author_id", None)
         if not all(type(value) is int and value > 0 for value in (account_id, seller_id, buyer_id, author_id)):
-            logger.notify("Отзыв пропущен: отсутствуют достоверные ID участников.")
+            logger.warning("Отзыв пропущен: отсутствуют достоверные ID участников.")
             return
         if seller_id != account_id or buyer_id == account_id or author_id != buyer_id:
-            logger.notify("Отзыв пропущен: направление не соответствует нашей продаже.")
+            logger.warning("Отзыв пропущен: направление не соответствует нашей продаже.")
             return
 
         text_content = getattr(review, "text", None)
         if not isinstance(text_content, str) or not text_content.strip():
             # reply продавца сам по себе не является входящим отзывом.
-            logger.notify("Отзыв пропущен: нет текста отзыва покупателя.")
+            logger.warning("Отзыв пропущен: нет текста отзыва покупателя.")
             return
 
         buyer = getattr(full_order, "buyer_username", None) or "Покупатель"
         stars = getattr(review, "stars", None)
         stars_str = "⭐" * stars if type(stars) is int and 1 <= stars <= 5 else ""
-        review_text = (
-            "🌟 <b>Новый отзыв</b>\n"
-            f"Покупатель: <b>{escape(str(buyer))}</b>\n"
-            + (f"Оценка: {stars_str}\n" if stars_str else "")
-            + f"Текст: {escape(text_content)}"
-        )
+        fingerprint = _review_fingerprint(stars, text_content)
 
         # Два пути обнаружения могут дойти сюда одновременно.
         async with client._review_notification_lock:
             if getattr(client, "_review_state_failed", False):
                 raise StateError("Persistent state unavailable.")
-            if verified_order_id in client._notified_reviews:
+            if client._notified_reviews.get(verified_order_id) == fingerprint:
                 return
-            if await _review_state_operation(
-                client, client.review_state.has_review_receipt, verified_order_id
-            ):
-                client._notified_reviews.add(verified_order_id)
+            exists, previous = await _review_state_operation(
+                client, client.review_state.get_review_receipt, verified_order_id
+            )
+            if exists and previous is None:
+                # Legacy receipt: сначала фиксируем baseline, без ложного повтора.
+                await _review_state_operation(
+                    client, client.review_state.baseline_review_fingerprint,
+                    verified_order_id, fingerprint,
+                )
+                client._notified_reviews[verified_order_id] = fingerprint
                 return
+            if previous == fingerprint:
+                client._notified_reviews[verified_order_id] = fingerprint
+                return
+            title = "✏️ Отзыв изменён" if exists else "🌟 Новый отзыв"
+            review_text = (
+                f"<b>{title}</b>\n"
+                f"Покупатель: <b>{escape(str(buyer))}</b>\n"
+                + (f"Оценка: {stars_str}\n" if stars_str else "")
+                + f"Текст: {escape(text_content)}"
+            )
             delivered = False
             for recipient_id in get_all_recipients():
                 u = get_user_settings(recipient_id)
@@ -305,21 +333,73 @@ async def _fetch_and_send_review(
                 try:
                     await bot.send_message(recipient_id, review_text, parse_mode="HTML")
                 except Exception as e:
-                    logger.notify(f"Не удалось отправить отзыв: {type(e).__name__}.")
+                    logger.warning(f"Не удалось отправить отзыв: {type(e).__name__}.")
                 else:
                     if not delivered:
                         # Receipt пишется только после первой успешной доставки.
                         # При частичной доставке повтор всей рассылки не выполняется.
                         await _review_state_operation(
-                            client, client.review_state.record_review_receipt, verified_order_id
+                            client, client.review_state.record_review_receipt,
+                            verified_order_id, fingerprint,
                         )
-                        client._notified_reviews.add(verified_order_id)
+                        client._notified_reviews[verified_order_id] = fingerprint
                         delivered = True
+
+            if delivered:
+                safe_buyer = _safe_review_event_part(str(buyer), 64)
+                safe_text = _safe_review_event_part(text_content, 180)
+                safe_stars = str(stars) if type(stars) is int and 1 <= stars <= 5 else "—"
+                logger.notify(
+                    f"{title} | Покупатель: {safe_buyer} | № заказа: {verified_order_id} "
+                    f"| Оценка: {safe_stars} | Текст: {safe_text}"
+                )
 
     except StateError:
         raise
     except Exception as e:
-        logger.notify(f"Не удалось проверить отзыв: {type(e).__name__}.")
+        logger.warning(f"Не удалось проверить отзыв: {type(e).__name__}.")
+
+
+async def _send_night_mode_reply(
+    client: FunPayClient, value: str | tuple[str, int | None], kind: str,
+) -> None:
+    """Старый автоответ, с повторной проверкой тумблера под Account RLock."""
+    if not is_night_mode_enabled():
+        return
+
+    def send_if_enabled() -> bool:
+        with client._account_lock:
+            if not is_night_mode_enabled():
+                return False
+            if kind == "message":
+                chat_id = int(value) if value.isdecimal() else None
+            else:
+                buyer, fallback_chat_id = value
+                chat = None
+                if isinstance(buyer, str) and buyer != "—":
+                    try:
+                        chat = client.account.get_chat_by_name(buyer)
+                    except Exception:
+                        pass
+                chat_id = getattr(chat, "id", None)
+                if chat_id is None:
+                    chat_id = fallback_chat_id
+            if type(chat_id) is not int or chat_id <= 0:
+                return False
+            if not is_night_mode_enabled():
+                return False
+            client.account.send_message(
+                chat_id,
+                NIGHT_MODE_MESSAGE_TEXT if kind == "message" else NIGHT_MODE_ORDER_TEXT,
+                update_last_saved_message=True,
+            )
+            return True
+
+    try:
+        if await asyncio.to_thread(send_if_enabled):
+            logger.notify("Ночной режим: автоответ отправлен.")
+    except Exception as e:
+        logger.warning(f"Не удалось отправить автоответ: {type(e).__name__}.")
 
 
 def _order_observation(event) -> tuple[str, str] | None:
@@ -417,6 +497,12 @@ async def notifications_loop(bot: Bot, client: FunPayClient):
                     raise StateError("Persistent order write failed.") from None
 
             for setting_key, text in client.describe_event(event):
+                if setting_key == "_night_mode_reply_message":
+                    await _send_night_mode_reply(client, text, "message")
+                    continue
+                if setting_key == "_night_mode_reply_order":
+                    await _send_night_mode_reply(client, text, "order")
+                    continue
                 # _review_check_immediate — отзыв поймали через NEW_FEEDBACK в чате, сразу проверяем
                 if setting_key == "_review_check_immediate":
                     start_review_check(text, delay=0)
