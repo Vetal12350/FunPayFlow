@@ -17,7 +17,7 @@ class _AutobumpActionCancelled(Exception):
 
 
 class _RunnerStopRequested(BaseException):
-    """Выход из Runner.listen(), который перехватывает обычные Exception."""
+    """Остановка producer до отправки следующего runner/ запроса."""
 
 # ---------------------------------------------------------------------------
 # ФИКС ДЛЯ 400 "Необходимая cookie отсутствует или устарела" на runner/
@@ -286,6 +286,12 @@ class FunPayClient:
         self._runner_stop = threading.Event()
         self._runner_finished = threading.Event()
         self._runner_failure_type: str | None = None
+        self._runner_health_lock = threading.Lock()
+        self._runner_health = "starting"
+        self._runner_last_success_monotonic: float | None = None
+        self._runner_consecutive_errors = 0
+        self._runner_last_failure_category: str | None = None
+        self._runner_last_failure_type: str | None = None
         self._raise_action_gate = threading.local()
         original_account_method = self.account.method
 
@@ -651,15 +657,34 @@ class FunPayClient:
                 self.init_runner()
             if not self._runner_stop.is_set():
                 self.listen_events(is_cancelled=self._runner_stop.is_set)
+            if not self._runner_stop.is_set():
+                self._runner_failure_type = "UnexpectedStop"
+                with self._runner_health_lock:
+                    self._runner_health = "failed"
+                    self._runner_last_failure_category = "FATAL"
+                    self._runner_last_failure_type = "UnexpectedStop"
+                logger.error("Runner producer неожиданно остановился.")
         except _RunnerStopRequested:
             if not self._runner_stop.is_set():
                 self._runner_failure_type = "UnexpectedStop"
+                with self._runner_health_lock:
+                    self._runner_health = "failed"
+                    self._runner_last_failure_category = "FATAL"
+                    self._runner_last_failure_type = "UnexpectedStop"
                 logger.error("Runner producer неожиданно остановился.")
         except Exception as e:
             self._runner_failure_type = type(e).__name__
             if not self._runner_stop.is_set():
+                with self._runner_health_lock:
+                    if self._runner_health != "failed":
+                        self._runner_health = "failed"
+                        self._runner_last_failure_category = self._classify_runner_error(e)
+                        self._runner_last_failure_type = type(e).__name__
                 logger.error(f"Runner producer завершился с ошибкой: {type(e).__name__}.")
         finally:
+            if self._runner_stop.is_set():
+                with self._runner_health_lock:
+                    self._runner_health = "stopped"
             self._runner_finished.set()
 
     def stop_runner(self):
@@ -684,13 +709,40 @@ class FunPayClient:
     def runner_stop_requested(self) -> bool:
         return self._runner_stop.is_set()
 
+    def get_runner_health(self) -> dict:
+        """Потокобезопасный снимок состояния producer без данных Account/response."""
+        with self._runner_health_lock:
+            return {
+                "state": self._runner_health,
+                "last_success_monotonic": self._runner_last_success_monotonic,
+                "consecutive_errors": self._runner_consecutive_errors,
+                "last_failure_category": self._runner_last_failure_category,
+                "last_failure_type": self._runner_last_failure_type,
+            }
+
+    @staticmethod
+    def _classify_runner_error(error: Exception) -> str:
+        if isinstance(error, FunPayAPI.exceptions.UnauthorizedError):
+            return "AUTH"
+        if isinstance(error, FunPayAPI.exceptions.RequestFailedError):
+            status = error.status_code
+            if status in (401, 403):
+                return "AUTH"
+            if status in (408, 429, 500, 502, 503, 504):
+                return "RECOVERABLE"
+            return "UNKNOWN"
+        if isinstance(error, requests.exceptions.SSLError):
+            return "FATAL"
+        if isinstance(error, (requests.exceptions.Timeout, requests.exceptions.ConnectionError)):
+            return "RECOVERABLE"
+        if isinstance(error, (ValueError, TypeError, KeyError, AttributeError, AssertionError)):
+            return "FATAL"
+        return "UNKNOWN"
+
     def listen_events(self, is_cancelled=lambda: False, requests_delay: float = 15.0):
         """
-        БЛОКИРУЮЩИЙ генератор. Запускать ТОЛЬКО в отдельном потоке (Thread),
+        БЛОКИРУЮЩИЙ polling. Запускать ТОЛЬКО в отдельном потоке (Thread),
         а не напрямую в asyncio-цикле - иначе он застопорит весь бот.
-
-        requests_delay увеличен с 6 до 15 сек, чтобы при повторяющихся сбоях
-        сообщения об ошибке не сыпались в Telegram/консоль слишком часто.
 
         Кладет каждое полученное от FunPay событие в self.event_queue,
         откуда его потом асинхронно забирает основной цикл в main.py.
@@ -700,11 +752,51 @@ class FunPayClient:
         if self.runner is None:
             self.init_runner()
 
-        for event in self.runner.listen(requests_delay=requests_delay):
-            with self._runner_publish_lock:
+        delay = max(15.0, requests_delay)
+        consecutive_errors = 0
+        while not is_cancelled():
+            try:
+                updates = self.runner.get_updates()
+                events = self.runner.parse_updates(updates)
+                for event in events:
+                    with self._runner_publish_lock:
+                        if is_cancelled():
+                            return
+                        self.event_queue.put(event)
+            except _RunnerStopRequested:
+                raise
+            except Exception as e:
                 if is_cancelled():
-                    break
-                self.event_queue.put(event)
+                    return
+                category = self._classify_runner_error(e)
+                error_type = type(e).__name__
+                if category == "RECOVERABLE":
+                    consecutive_errors += 1
+                else:
+                    consecutive_errors = 0
+                with self._runner_health_lock:
+                    self._runner_consecutive_errors = consecutive_errors
+                    self._runner_last_failure_category = category
+                    self._runner_last_failure_type = error_type
+                    self._runner_health = "backoff" if category == "RECOVERABLE" and consecutive_errors < 8 else "failed"
+                if category != "RECOVERABLE" or consecutive_errors >= 8:
+                    logger.error(f"Runner polling остановлен: {category}, {error_type}.")
+                    raise
+                backoff = min(delay * 2 ** (consecutive_errors - 1), max(delay, 300.0))
+                logger.warning(f"Runner polling retry: {category}, {error_type}, попытка {consecutive_errors}/8.")
+                if self._runner_stop.wait(backoff):
+                    return
+                continue
+
+            if is_cancelled():
+                return
+            consecutive_errors = 0
+            with self._runner_health_lock:
+                self._runner_last_success_monotonic = time.monotonic()
+                self._runner_consecutive_errors = 0
+                self._runner_health = "healthy"
+            if self._runner_stop.wait(delay):
+                return
 
     def describe_event(self, event):
         """
