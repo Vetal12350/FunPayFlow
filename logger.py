@@ -21,7 +21,39 @@ logger.py — Красивый консольный логгер в стиле F
 """
 
 import os
+import logging
 from datetime import datetime
+
+
+class _SafeFunPayApiFilter(logging.Filter):
+    """Пропускает только известные фиксированные сообщения библиотеки."""
+
+    def __init__(self, allowed: frozenset[str]):
+        super().__init__()
+        self.allowed = allowed
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return (record.levelno >= logging.WARNING and type(record.msg) is str
+                and record.msg in self.allowed and not record.args
+                and record.exc_info is None and record.stack_info is None)
+
+
+def configure_funpayapi_logging() -> None:
+    # Эти два logger'а используются установленной FunPayAPI 1.1.0.
+    # Отбрасываем raw response/exception records до попадания в root handlers.
+    account = logging.getLogger("FunPayAPI.account")
+    runner = logging.getLogger("FunPayAPI.runner")
+    account.setLevel(logging.WARNING)
+    runner.setLevel(logging.WARNING)
+    account.addFilter(_SafeFunPayApiFilter(frozenset()))
+    runner.addFilter(_SafeFunPayApiFilter(frozenset({
+        "Не удалось обновить список заказов.",
+        "Не удалось обновить список продаж: превышено кол-во попыток.",
+        "Произошла ошибка при получении событий. (ничего страшного, если это сообщение появляется нечасто).",
+    })))
+
+
+configure_funpayapi_logging()
 
 # Включаем ANSI-escape-коды на Windows (cmd / PowerShell / Windows Terminal)
 if os.name == "nt":
