@@ -5,8 +5,6 @@ import re
 import subprocess
 import sys
 import atexit
-import threading
-import time
 from dotenv import load_dotenv
 from aiogram import Bot
 
@@ -301,25 +299,22 @@ async def notifications_loop(bot: Bot, client: FunPayClient):
     с ошибками - именно это давало частые "Произошла ошибка при получении
     событий" в логах.
     """
-    def runner_thread():
-        while True:
-            try:
-                client.init_runner()
-                # is_cancelled всегда False - слушаем, пока не упадет с ошибкой
-                client.listen_events(is_cancelled=lambda: False)
-                logger.warning("Runner неожиданно завершился, перезапуск через 30 сек...")
-            except Exception as e:
-                logger.error(f"Ошибка в потоке Runner'а: {e}")
-            time.sleep(30)
-
-    threading.Thread(target=runner_thread, daemon=True).start()
+    client.start_runner()
 
     while True:
+        if client.runner_stop_requested():
+            return
+        if client.runner_failed():
+            raise RuntimeError("Runner producer неожиданно завершился.") from None
         # Забираем следующее событие из очереди, не блокируя asyncio-цикл
         try:
             event = await asyncio.to_thread(client.event_queue.get, True, 1.0)
         except queue.Empty:
             continue
+        if client.runner_stop_requested():
+            return
+        if client.runner_failed():
+            raise RuntimeError("Runner producer неожиданно завершился.") from None
 
         for setting_key, text in client.describe_event(event):
             # _review_check_immediate — отзыв поймали через NEW_FEEDBACK в чате, сразу проверяем
@@ -393,28 +388,38 @@ async def _supervise_tasks(bot: Bot, client: FunPayClient):
                     logger.error(f"Критическая задача {name} неожиданно завершилась.")
                     failed = True
     finally:
-        for task in tasks.values():
-            if task is not polling and not task.done():
-                task.cancel()
+        client.stop_runner()
         try:
-            if not polling.done():
-                try:
-                    # Штатная остановка позволяет aiogram завершить свои polling tasks.
-                    await asyncio.wait_for(dp.stop_polling(), timeout=10.0)
-                except Exception as e:
-                    logger.error(f"Не удалось штатно остановить polling: {type(e).__name__}.")
-                    failed = True
+            for task in tasks.values():
+                if task is not polling and not task.done():
+                    task.cancel()
+            try:
+                if not polling.done():
+                    try:
+                        # Штатная остановка позволяет aiogram завершить свои polling tasks.
+                        await asyncio.wait_for(dp.stop_polling(), timeout=10.0)
+                    except Exception as e:
+                        logger.error(f"Не удалось штатно остановить polling: {type(e).__name__}.")
+                        failed = True
+            finally:
+                if not polling.done():
+                    polling.cancel()
+                results = await asyncio.gather(*tasks.values(), return_exceptions=True)
+                for name, result in zip(tasks, results):
+                    if isinstance(result, asyncio.CancelledError):
+                        continue
+                    if isinstance(result, BaseException):
+                        # Текст исключения и traceback могут содержать credentials.
+                        logger.error(f"Ошибка задачи {name}: {type(result).__name__}.")
+                        failed = True
         finally:
-            if not polling.done():
-                polling.cancel()
-            results = await asyncio.gather(*tasks.values(), return_exceptions=True)
-            for name, result in zip(tasks, results):
-                if isinstance(result, asyncio.CancelledError):
-                    continue
-                if isinstance(result, BaseException):
-                    # Текст исключения и traceback могут содержать credentials.
-                    logger.error(f"Ошибка задачи {name}: {type(result).__name__}.")
+            try:
+                if not await client.join_runner():
+                    logger.error("Runner producer не завершился при shutdown.")
                     failed = True
+            except Exception as e:
+                logger.error(f"Не удалось дождаться Runner producer: {type(e).__name__}.")
+                failed = True
 
     if failed:
         raise RuntimeError("Runtime остановлен из-за завершения критической задачи.") from None
