@@ -19,6 +19,14 @@ class _AutobumpActionCancelled(Exception):
 class _RunnerStopRequested(BaseException):
     """Остановка producer до отправки следующего runner/ запроса."""
 
+
+class _EventQueueOverflow(Exception):
+    """Распарсенное событие не удалось передать consumer без потери."""
+
+
+# Буфер для короткого всплеска Runner; переполнение завершает runtime, а не растит память.
+EVENT_QUEUE_CAPACITY = 256
+
 # ---------------------------------------------------------------------------
 # ФИКС ДЛЯ 400 "Необходимая cookie отсутствует или устарела" на runner/
 # ---------------------------------------------------------------------------
@@ -241,7 +249,7 @@ class FunPayClient:
         self.csrf_token = ""  # Переменная для хранения токена
 
         self.runner = None  # FunPayAPI.Runner - слушатель событий (сообщения/заказы/отзывы)
-        self.event_queue: "queue.Queue" = queue.Queue()  # сюда Runner кладет события из отдельного потока
+        self.event_queue: "queue.Queue" = queue.Queue(maxsize=EVENT_QUEUE_CAPACITY)
 
         # Поднятие лотов (в потоке asyncio.to_thread) и Runner (в отдельном Thread)
         # используют ОДИН И ТОТ ЖЕ self.account - общую сессию/CSRF-токен. Без
@@ -746,6 +754,8 @@ class FunPayClient:
 
     @staticmethod
     def _classify_runner_error(error: Exception) -> str:
+        if isinstance(error, _EventQueueOverflow):
+            return "FATAL"
         if isinstance(error, FunPayAPI.exceptions.UnauthorizedError):
             return "AUTH"
         if isinstance(error, FunPayAPI.exceptions.RequestFailedError):
@@ -787,7 +797,11 @@ class FunPayClient:
                     with self._runner_publish_lock:
                         if is_cancelled():
                             return
-                        self.event_queue.put(event)
+                        try:
+                            self.event_queue.put_nowait(event)
+                        except queue.Full:
+                            logger.error("Event queue overflow.")
+                            raise _EventQueueOverflow() from None
             except _RunnerStopRequested:
                 raise
             except Exception as e:
