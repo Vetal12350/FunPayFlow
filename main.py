@@ -12,6 +12,7 @@ load_dotenv()
 
 from telegram import dp, bot_settings, get_user_settings, get_all_recipients
 from funpay import FunPayClient
+from state import ReviewReceiptStore, StateError
 import logger
 
 
@@ -202,6 +203,17 @@ async def auto_bump_loop(bot: Bot, client: FunPayClient):
             await asyncio.sleep(1)
 
 
+async def _review_state_operation(client: FunPayClient, operation, order_id: str):
+    try:
+        return await asyncio.to_thread(operation, order_id)
+    except StateError:
+        client._review_state_failed = True
+        raise
+    except Exception:
+        client._review_state_failed = True
+        raise StateError("Persistent state operation failed.") from None
+
+
 async def _fetch_and_send_review(
     bot: Bot,
     client: FunPayClient,
@@ -261,8 +273,16 @@ async def _fetch_and_send_review(
 
         # Два пути обнаружения могут дойти сюда одновременно.
         async with client._review_notification_lock:
+            if getattr(client, "_review_state_failed", False):
+                raise StateError("Persistent state unavailable.")
             if verified_order_id in client._notified_reviews:
                 return
+            if await _review_state_operation(
+                client, client.review_state.has_review_receipt, verified_order_id
+            ):
+                client._notified_reviews.add(verified_order_id)
+                return
+            delivered = False
             for recipient_id in get_all_recipients():
                 u = get_user_settings(recipient_id)
                 if not u.get("notifications_enabled", True) or not u.get("notify_review", True):
@@ -272,10 +292,17 @@ async def _fetch_and_send_review(
                 except Exception as e:
                     logger.notify(f"Не удалось отправить отзыв: {type(e).__name__}.")
                 else:
-                    # Отметка означает доставку хотя бы одному получателю.
-                    # При частичной доставке повтор всей рассылки не выполняется.
-                    client._notified_reviews.add(verified_order_id)
+                    if not delivered:
+                        # Receipt пишется только после первой успешной доставки.
+                        # При частичной доставке повтор всей рассылки не выполняется.
+                        await _review_state_operation(
+                            client, client.review_state.record_review_receipt, verified_order_id
+                        )
+                        client._notified_reviews.add(verified_order_id)
+                        delivered = True
 
+    except StateError:
+        raise
     except Exception as e:
         logger.notify(f"Не удалось проверить отзыв: {type(e).__name__}.")
 
@@ -513,6 +540,13 @@ async def main():
         raise RuntimeError("Начальная сессия FunPay не инициализирована.") from None
 
     _validate_funpay_user_id(client)
+    client.review_state = ReviewReceiptStore()
+    try:
+        await asyncio.to_thread(client.review_state.initialize)
+    except Exception as e:
+        logger.error(f"Не удалось инициализировать persistent state: {type(e).__name__}.")
+        raise RuntimeError("Persistent state недоступен.") from None
+
     logger.banner(client.account.username)
     logger.success(f"Сессия FunPay инициализирована (аккаунт: {client.account.username}).")
     if os.name == "nt":
