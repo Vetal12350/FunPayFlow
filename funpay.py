@@ -15,6 +15,10 @@ import logger
 class _AutobumpActionCancelled(Exception):
     """Отмена поднятия до отправки запроса."""
 
+
+class _RunnerStopRequested(BaseException):
+    """Выход из Runner.listen(), который перехватывает обычные Exception."""
+
 # ---------------------------------------------------------------------------
 # ФИКС ДЛЯ 400 "Необходимая cookie отсутствует или устарела" на runner/
 # ---------------------------------------------------------------------------
@@ -276,6 +280,12 @@ class FunPayClient:
         # бы улететь в Telegram дважды.
         self._notified_reviews: set[str] = set()
         self._review_notification_lock = asyncio.Lock()
+        self._runner_thread: threading.Thread | None = None
+        self._runner_start_lock = threading.Lock()
+        self._runner_publish_lock = threading.Lock()
+        self._runner_stop = threading.Event()
+        self._runner_finished = threading.Event()
+        self._runner_failure_type: str | None = None
         self._raise_action_gate = threading.local()
         original_account_method = self.account.method
 
@@ -560,6 +570,9 @@ class FunPayClient:
                 # потоков за общим CSRF-токеном/сессией валит запросы 400-й ошибкой.
                 with self._account_lock:
                     try:
+                        if (api_method == "runner/" and self._runner_stop.is_set()
+                                and threading.current_thread() is self._runner_thread):
+                            raise _RunnerStopRequested()
                         # original_method проверяет допуск autobump уже после захвата lock.
                         return original_method(request_method, api_method, headers, payload, *args, **kwargs)
                     except Exception as e:
@@ -613,6 +626,64 @@ class FunPayClient:
 
         self.runner = FunPayAPI.Runner(self.account)
 
+    def start_runner(self):
+        """Запускает единственный producer для этого Account."""
+        with self._runner_start_lock:
+            if self._runner_thread is not None:
+                if self._runner_thread.is_alive():
+                    return
+                raise RuntimeError("Runner producer уже завершился.")
+            if self._runner_stop.is_set():
+                raise RuntimeError("Runner producer уже остановлен.")
+            thread = threading.Thread(target=self._run_runner, name="funpay-runner", daemon=True)
+            self._runner_thread = thread
+            try:
+                thread.start()
+            except BaseException:
+                self._runner_thread = None
+                raise
+
+    def _run_runner(self):
+        try:
+            if self._runner_stop.is_set():
+                return
+            if self.runner is None:
+                self.init_runner()
+            if not self._runner_stop.is_set():
+                self.listen_events(is_cancelled=self._runner_stop.is_set)
+        except _RunnerStopRequested:
+            if not self._runner_stop.is_set():
+                self._runner_failure_type = "UnexpectedStop"
+                logger.error("Runner producer неожиданно остановился.")
+        except Exception as e:
+            self._runner_failure_type = type(e).__name__
+            if not self._runner_stop.is_set():
+                logger.error(f"Runner producer завершился с ошибкой: {type(e).__name__}.")
+        finally:
+            self._runner_finished.set()
+
+    def stop_runner(self):
+        """После возврата новые события producer не публикуются."""
+        with self._runner_publish_lock:
+            self._runner_stop.set()
+
+    async def join_runner(self, timeout: float = 30.0) -> bool:
+        """Ограниченно ожидает поток, не блокируя asyncio loop."""
+        thread = self._runner_thread
+        if thread is None:
+            return True
+        await asyncio.to_thread(thread.join, timeout)
+        if thread.is_alive():
+            logger.warning("Runner producer не завершился за время ожидания.")
+            return False
+        return True
+
+    def runner_failed(self) -> bool:
+        return self._runner_finished.is_set() and not self._runner_stop.is_set()
+
+    def runner_stop_requested(self) -> bool:
+        return self._runner_stop.is_set()
+
     def listen_events(self, is_cancelled=lambda: False, requests_delay: float = 15.0):
         """
         БЛОКИРУЮЩИЙ генератор. Запускать ТОЛЬКО в отдельном потоке (Thread),
@@ -624,13 +695,16 @@ class FunPayClient:
         Кладет каждое полученное от FunPay событие в self.event_queue,
         откуда его потом асинхронно забирает основной цикл в main.py.
         """
+        if is_cancelled():
+            return
         if self.runner is None:
             self.init_runner()
 
         for event in self.runner.listen(requests_delay=requests_delay):
-            if is_cancelled():
-                break
-            self.event_queue.put(event)
+            with self._runner_publish_lock:
+                if is_cancelled():
+                    break
+                self.event_queue.put(event)
 
     def describe_event(self, event):
         """
