@@ -13,7 +13,7 @@ load_dotenv()
 import FunPayAPI
 from telegram import (dp, bot_settings, get_user_settings, get_all_recipients,
                       set_runtime_status_context, clear_runtime_status_context,
-                      disable_autobump)
+                      disable_autobump, get_reply_keyboard)
 from funpay import FunPayClient, _AmbiguousRaiseOutcome
 from state import ReviewReceiptStore, StateError
 import logger
@@ -231,15 +231,28 @@ async def _fetch_and_send_review(
     try:
         review = None
         full_order = None
-        for attempt in range(3):
-            full_order, account_id = await asyncio.to_thread(client.get_order_snapshot, order_id)
+        # Сохраняем первые 3 быстрые проверки старого бота. После закрытия
+        # заказа отзыв может появиться значительно позже; дополнительные
+        # проверки ограничены примерно 130 секундами.
+        retry_pauses = (0, 1, 1, 8, 15, 30, 30, 30, 10) if delay > 0 else (0, 1, 1)
+        for pause in retry_pauses:
+            if pause:
+                await asyncio.sleep(pause)
+            if order_id in client._notified_reviews:
+                return
+            try:
+                full_order, account_id = await asyncio.to_thread(client.get_order_snapshot, order_id)
+            except StateError:
+                raise
+            except Exception as e:
+                logger.notify(f"Не удалось прочитать заказ при проверке отзыва: {type(e).__name__}.")
+                continue
             review = getattr(full_order, "review", None)
-            if review is not None:
+            if review is not None and isinstance(getattr(review, "text", None), str) and review.text.strip():
                 break
-            await asyncio.sleep(1)
 
-        if review is None:
-            logger.notify("Отзыв не найден после 3 попыток.")
+        if review is None or not isinstance(getattr(review, "text", None), str) or not review.text.strip():
+            logger.notify("Отзыв покупателя не найден после ограниченных проверок.")
             return
 
         verified_order_id = getattr(full_order, "id", None)
@@ -346,7 +359,7 @@ async def notifications_loop(bot: Bot, client: FunPayClient):
     с ошибками - именно это давало частые "Произошла ошибка при получении
     событий" в логах.
     """
-    # Каждая review task может ждать 5 секунд и ещё три snapshot attempts.
+    # Проверка закрытого заказа может ждать до ~130 секунд.
     # Один полный burst очереди допустим, но backlog после dequeue не растёт бесконечно.
     max_review_tasks = 256
     review_tasks: set[asyncio.Task] = set()
@@ -408,8 +421,7 @@ async def notifications_loop(bot: Bot, client: FunPayClient):
                 if setting_key == "_review_check_immediate":
                     start_review_check(text, delay=0)
                     continue
-                # _review_check — заказ закрыт, ждём 5 сек (покупатель мог оставить отзыв
-                # чуть позже закрытия), затем 3 попытки — точно как у Кардинала
+                # _review_check — после закрытия проверяем заказ до ~130 секунд.
                 if setting_key == "_review_check":
                     start_review_check(text, delay=5)
                     continue
@@ -465,16 +477,20 @@ async def session_refresh_loop(client: FunPayClient):
             logger.warning(f"Не удалось обновить сессию FunPay: {type(e).__name__}.")
 
 
-async def _send_runtime_notice(bot: Bot, message: str) -> None:
+async def _send_runtime_notice(bot: Bot, message: str, *, restore_keyboard: bool = False) -> None:
     """Одна попытка отправки каждому авторизованному получателю."""
     try:
         recipients = get_all_recipients()
     except Exception as e:
         logger.warning(f"Не удалось получить получателей системного уведомления: {type(e).__name__}.")
         return
+    notice_kwargs = {"reply_markup": get_reply_keyboard()} if restore_keyboard else {}
     for recipient_id in recipients:
         try:
-            await asyncio.wait_for(bot.send_message(recipient_id, message), timeout=5.0)
+            await asyncio.wait_for(
+                bot.send_message(recipient_id, message, **notice_kwargs),
+                timeout=5.0,
+            )
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -609,7 +625,7 @@ async def main():
     runtime_ready = False
     try:
         logger.success("Бот подключен к Telegram. Запуск фоновых процессов...")
-        await _send_runtime_notice(bot, "🟢 Бот запущен.")
+        await _send_runtime_notice(bot, "🟢 Бот запущен.", restore_keyboard=True)
         runtime_ready = True
         set_runtime_status_context(client)
         await _supervise_tasks(bot, client)

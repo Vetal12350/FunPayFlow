@@ -5,7 +5,7 @@ import json
 import math
 import time
 import tempfile
-from aiogram import Dispatcher
+from aiogram import Dispatcher, F
 from aiogram.filters import Command
 from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, ReplyKeyboardMarkup, KeyboardButton
 from funpay import FunPayClient
@@ -382,7 +382,10 @@ def on_icon(state: bool) -> str:
 # Постоянная клавиатура внизу экрана (Контекстное меню)
 def get_reply_keyboard():
     return ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text="🛠 Главное меню")]],
+        keyboard=[
+            [KeyboardButton(text="🛠 Главное меню")],
+            [KeyboardButton(text="🩺 Статус"), KeyboardButton(text="📊 Статистика")],
+        ],
         resize_keyboard=True,
         one_time_keyboard=False,
         is_persistent=True,
@@ -433,8 +436,7 @@ async def cmd_start(message: Message):
         await message.answer("🔒 <b>Доступ закрыт.</b>\nВведите пароль:", parse_mode="HTML")
 
 
-@dp.message(Command("status"))
-async def cmd_status(message: Message):
+async def _send_status(message: Message):
     if not is_authorized(message.from_user.id):
         await message.answer("⛔ Доступ запрещен!")
         return
@@ -446,8 +448,7 @@ async def cmd_status(message: Message):
     await message.answer(status_text)
 
 
-@dp.message(Command("stats"))
-async def cmd_stats(message: Message):
+async def _send_stats(message: Message):
     if not is_authorized(message.from_user.id):
         await message.answer("⛔ Доступ запрещен!")
         return
@@ -470,6 +471,26 @@ async def cmd_stats(message: Message):
         await message.answer("📊 Статистика недоступна")
         return
     await message.answer("\n".join(lines))
+
+
+@dp.message(Command("status"))
+async def cmd_status(message: Message):
+    await _send_status(message)
+
+
+@dp.message(Command("stats"))
+async def cmd_stats(message: Message):
+    await _send_stats(message)
+
+
+@dp.message(F.text == "🩺 Статус")
+async def text_status(message: Message):
+    await _send_status(message)
+
+
+@dp.message(F.text == "📊 Статистика")
+async def text_stats(message: Message):
+    await _send_stats(message)
 
 
 @dp.callback_query()
