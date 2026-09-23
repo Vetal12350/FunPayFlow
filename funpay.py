@@ -353,9 +353,8 @@ class FunPayClient:
     # событий" в Runner'е. Поэтому поднятие лотов теперь идет через официальный
     # self.account.raise_lots(...) - он использует ТУ ЖЕ сессию, что и Runner,
     # и сам поднимает все разделы (node_id), относящиеся к переданной категории.
-    # RaiseError библиотеки приходит после ответа сервера, но не доказывает,
-    # что modifying action не успело выполниться; такой исход приостанавливает
-    # автоподнятие до явного включения пользователем.
+    # Положительный RaiseError.wait_time означает штатный cooldown.
+    # Прочие ошибки после начала lots/raise остаются неопределёнными.
 
     async def bump_lots(self, user_id: int, is_cancelled=None):
         abandoned = threading.Event()
@@ -460,14 +459,48 @@ class FunPayClient:
                     raise _AmbiguousRaiseOutcome() from None
                 raise
 
+            except FunPayAPI.exceptions.RaiseError as e:
+                wait_time = getattr(e, "wait_time", None)
+                if type(wait_time) is not int or wait_time <= 0:
+                    wait_time = None
+                    error_message = getattr(e, "error_message", None)
+                    if isinstance(error_message, str):
+                        match = re.search(
+                            r"^\s*Подождите\s+([1-9]\d*)\s+"
+                            r"(час(?:а|ов)?|минут(?:а|ы)?|секунд(?:а|ы|у)?)(?!\w)",
+                            error_message,
+                            re.IGNORECASE,
+                        )
+                        if match:
+                            amount = int(match.group(1))
+                            unit = match.group(2).lower()
+                            if unit.startswith("час"):
+                                wait_time = amount * 3600
+                            elif unit.startswith("минут"):
+                                wait_time = amount * 60
+                            else:
+                                wait_time = amount + 2  # Как в старой рабочей версии.
+
+                if transport_started.is_set() and type(wait_time) is int and wait_time > 0:
+                    self.raise_time[game_id] = time.time() + wait_time
+                    min_wait = min(min_wait, wait_time)
+                    cooldown_count += 1
+                    transport_started.clear()
+                    logger.bump(f"[{display_name}] на кулдауне (~{wait_time} сек).")
+                    continue
+
+                if not transport_started.is_set():
+                    logger.error("Не удалось подготовить lots/raise: RaiseError.")
+                    return False, "Не удалось подготовить поднятие лотов.", 600
+                logger.error("Результат lots/raise неизвестен: RaiseError.")
+                raise _AmbiguousRaiseOutcome() from None
+
             except Exception as e:
                 if not transport_started.is_set():
                     # Ошибка возникла до Account.method("lots/raise");
                     # modifying transport ещё не начинался.
                     logger.error(f"Не удалось подготовить lots/raise: {type(e).__name__}.")
                     return False, "Не удалось подготовить поднятие лотов.", 600
-                # Даже RaiseError после ответа сервера не доказывает, что
-                # modifying request не имел побочных эффектов.
                 logger.error(f"Результат lots/raise неизвестен: {type(e).__name__}.")
                 raise _AmbiguousRaiseOutcome() from None
 
@@ -856,30 +889,6 @@ class FunPayClient:
                 logger.debug(f"chat_id={chat_id} unread={getattr(chat, 'unread', '<нет поля>')} "
                       f"last_message_type={getattr(chat, 'last_message_type', '<нет поля>')}")
 
-                # unread=False - либо уже прочитано на сайте, либо это НАШЕ
-                # исходящее сообщение (учитывается автоматически, доп. проверка
-                # author_id тут не нужна). Если чат стал прочитанным - убираем
-                # его из "уже уведомили", чтобы СЛЕДУЮЩАЯ новая непрочитанная
-                # серия сообщений снова дала уведомление.
-                if not getattr(chat, "unread", False):
-                    if chat_id is not None:
-                        self._notified_unread_chats.pop(chat_id, None)
-                    return results
-
-                # Уведомление по этому чату уже отправлялось недавно -
-                # пропускаем повтор. Раньше это проверялось ТОЛЬКО через
-                # chat.unread (пока не станет False), но если этот флаг
-                # у FunPay обновляется с задержкой или "мигает" - повторные
-                # уведомления все равно проскакивали, даже если вы читали
-                # сообщение мгновенно. Теперь дополнительно действует
-                # страховочный таймер: если чат уже уведомлялся
-                # < _NOTIFY_COOLDOWN_SECONDS секунд назад - не шлем снова,
-                # независимо от того, что говорит chat.unread.
-                now = time.time()
-                last_notified = self._notified_unread_chats.get(chat_id) if chat_id is not None else None
-                if last_notified is not None and (now - last_notified) < self._NOTIFY_COOLDOWN_SECONDS:
-                    return results
-
                 # Пропускаем системные записи в чате (создание/закрытие заказа
                 # и т.п.) - под них есть отдельные события NEW_ORDER /
                 # ORDER_STATUS_CHANGED выше и ниже по коду.
@@ -911,11 +920,21 @@ class FunPayClient:
                             if match:
                                 order_id = match.group(1)
                                 results.append(("_review_check_immediate", order_id))
-                                if chat_id is not None:
-                                    self._notified_unread_chats[chat_id] = now
                         
                         # Остальные системные сообщения игнорируем
                         return results
+
+                # Системное событие отзыва не обязано делать чат непрочитанным.
+                # Дедуп обычных сообщений не должен скрывать NEW_FEEDBACK.
+                if not getattr(chat, "unread", False):
+                    if chat_id is not None:
+                        self._notified_unread_chats.pop(chat_id, None)
+                    return results
+
+                now = time.time()
+                last_notified = self._notified_unread_chats.get(chat_id) if chat_id is not None else None
+                if last_notified is not None and (now - last_notified) < self._NOTIFY_COOLDOWN_SECONDS:
+                    return results
 
                 author = escape(str(getattr(chat, "name", None) or "Покупатель"))
                 chat_link = f"https://funpay.com/chat/?node={chat_id}" if chat_id is not None else None
