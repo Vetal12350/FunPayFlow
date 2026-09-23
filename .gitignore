@@ -10,6 +10,8 @@ venv/
 # Runtime / personal state
 bot.lock
 bot_settings.json
+/state.sqlite3
+/state.sqlite3-*
 
 # Python
 __pycache__/
