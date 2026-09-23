@@ -4,6 +4,7 @@ import os
 import json
 import math
 import time
+import tempfile
 from aiogram import Dispatcher
 from aiogram.filters import Command
 from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, ReplyKeyboardMarkup, KeyboardButton
@@ -215,6 +216,25 @@ def load_settings() -> None:
         with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
             saved = json.load(f)
 
+        # Проверяем до изменения глобального состояния: строка "false" truthy.
+        if not isinstance(saved, dict) or type(saved.get("auto_bump", False)) is not bool:
+            raise ValueError("Invalid global settings.")
+        user_ids = saved.get("authorized_user_ids", [])
+        if (not isinstance(user_ids, list)
+                or any(type(uid) is not int or uid <= 0 for uid in user_ids)):
+            raise ValueError("Invalid authorized users.")
+        personal = saved.get("user_settings", {})
+        if not isinstance(personal, dict):
+            raise ValueError("Invalid user settings.")
+        for uid, settings in personal.items():
+            if (not isinstance(uid, str) or not uid.isdecimal() or int(uid) <= 0
+                    or not isinstance(settings, dict)
+                    or any(type(value) is not bool for key, value in settings.items()
+                           if key in _DEFAULT_USER_SETTINGS)):
+                raise ValueError("Invalid user settings.")
+        if any(type(saved[key]) is not bool for key in _DEFAULT_USER_SETTINGS if key in saved):
+            raise ValueError("Invalid legacy settings.")
+
         # --- Миграция старого формата (без user_settings) ---
         # Раньше notify_* хранились в корне — теперь они персональные.
         # При обнаружении старого формата переносим их в настройки ADMIN_ID.
@@ -247,14 +267,17 @@ def load_settings() -> None:
             except (ValueError, TypeError):
                 pass
 
-        print(f"[SETTINGS] Настройки загружены из {SETTINGS_FILE}. "
-              f"Глобальные: {bot_settings} | Пользователи с персональными настройками: {list(_user_settings.keys())}")
+        print("[SETTINGS] Настройки загружены.")
     except Exception as e:
-        print(f"[SETTINGS] Не удалось загрузить {SETTINGS_FILE}, использую значения по умолчанию: {e}")
+        bot_settings.clear()
+        bot_settings.update(_DEFAULT_GLOBAL_SETTINGS)
+        _user_settings.clear()
+        print(f"[SETTINGS] Ошибка загрузки, использую значения по умолчанию: {type(e).__name__}.")
 
 
-def save_settings() -> None:
-    """Сохраняет текущие настройки (глобальные + персональные) на диск."""
+def save_settings(*, required: bool = False) -> None:
+    """Атомарно сохраняет настройки; required не скрывает ошибку записи."""
+    temporary_path = None
     try:
         data = {
             "auto_bump": bot_settings["auto_bump"],
@@ -263,10 +286,30 @@ def save_settings() -> None:
                 str(uid): sett for uid, sett in _user_settings.items()
             },
         }
-        with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+        descriptor, temporary_path = tempfile.mkstemp(
+            prefix=".bot_settings-", suffix=".tmp", dir=os.path.dirname(SETTINGS_FILE)
+        )
+        with os.fdopen(descriptor, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temporary_path, SETTINGS_FILE)
+        temporary_path = None
     except Exception as e:
-        print(f"[SETTINGS] Не удалось сохранить настройки: {e}")
+        if temporary_path is not None:
+            try:
+                os.unlink(temporary_path)
+            except OSError:
+                pass
+        if required:
+            raise RuntimeError("Не удалось сохранить настройки автоподнятия.") from None
+        print(f"[SETTINGS] Не удалось сохранить настройки: {type(e).__name__}.")
+
+
+def disable_autobump() -> None:
+    """Выключает автоподнятие и надёжно сохраняет OFF."""
+    bot_settings["auto_bump"] = False
+    save_settings(required=True)
 
 
 load_settings()
@@ -440,8 +483,15 @@ async def callback_handler(callback: CallbackQuery):
 
     # Включение/выключение автоподнятия (глобальная настройка — влияет на всех)
     if action == "toggle_bump":
-        bot_settings["auto_bump"] = not bot_settings["auto_bump"]
-        save_settings()
+        enabling = not bot_settings["auto_bump"]
+        bot_settings["auto_bump"] = enabling
+        try:
+            save_settings(required=True)
+        except RuntimeError:
+            if enabling:
+                bot_settings["auto_bump"] = False
+            await callback.answer("Не удалось сохранить настройку. Автоподнятие не включено.", show_alert=True)
+            return
         state_text = "включено" if bot_settings["auto_bump"] else "выключено"
         await callback.answer(f"Автоподнятие {state_text}!")
         try:
