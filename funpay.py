@@ -68,7 +68,7 @@ def _apply_funpay_cookie_patch():
                     if name in ("PHPSESSID", "fav_games"):
                         continue
                     if _funpay_extra_cookies.get(name) != value:
-                        logger.debug(f"Получена новая доп. кука от FunPay: {name}")
+                        logger.debug("Получена новая доп. кука от FunPay.")
                     _funpay_extra_cookies[name] = value
             except Exception:
                 pass
@@ -201,7 +201,7 @@ def _apply_funpay_cookie_patch():
                     if name in ("PHPSESSID", "fav_games"):
                         continue
                     if _funpay_extra_cookies.get(name) != value:
-                        logger.debug(f"Получена новая доп. кука от FunPay: {name}")
+                        logger.debug("Получена новая доп. кука от FunPay.")
                     _funpay_extra_cookies[name] = value
             except Exception:
                 pass
@@ -250,7 +250,7 @@ class FunPayClient:
         # обновить токен - и запрос Runner'а улетает с уже недействительным
         # токеном, из-за чего FunPay отвечает 400. Лок гарантирует, что запросы
         # к self.account всегда идут строго по одному, без гонки.
-        self._account_lock = threading.Lock()
+        self._account_lock = threading.RLock()
 
         # Чаты, по которым уведомление УЖЕ отправлено, пока они остаются
         # непрочитанными. LAST_CHAT_MESSAGE_CHANGED срабатывает на КАЖДОЕ
@@ -305,16 +305,31 @@ class FunPayClient:
 
     async def get_dashboard(self):
         try:
-            await asyncio.to_thread(self.account.get)
-            # Реальный баланс берем из атрибутов аккаунта (если библиотека их предоставляет).
-            # Если поле недоступно в текущей версии FunPayAPI — возвращаем прочерк.
-            balance = getattr(self.account, "balance", None) or "—"
+            balance = await asyncio.to_thread(self.get_dashboard_balance)
             return True, {
                 "balance": balance,
                 "messages": "0"
             }
         except Exception as e:
-            return False, str(e)
+            return False, f"Ошибка получения данных: {type(e).__name__}."
+
+    def get_dashboard_balance(self):
+        with self._account_lock:
+            self.account.get()
+            return getattr(self.account, "balance", None) or "—"
+
+    def initialize_account(self):
+        with self._account_lock:
+            return self.account.get()
+
+    def refresh_session(self):
+        with self._account_lock:
+            return self.account.get(True)
+
+    def get_order_snapshot(self, order_id: str):
+        with self._account_lock:
+            order = self.account.get_order(order_id)
+            return order, self.account.id
 
     # ВАЖНО: специально НЕ создаем здесь отдельную requests.Session с тем же
     # golden_key (как было раньше в _init_session/_raise_lot_safe). У self.account
@@ -336,27 +351,30 @@ class FunPayClient:
             # to_thread может начать работу уже после отмены ожидающей coroutine.
             if abandoned.is_set() or (is_cancelled and is_cancelled()):
                 return False
-            self._raise_action_gate.is_allowed = lambda: (
-                not abandoned.is_set() and (is_cancelled is None or not is_cancelled())
-            )
-            try:
-                self.account.raise_lots(game_id)
-            except _AutobumpActionCancelled:
-                return False
-            finally:
-                del self._raise_action_gate.is_allowed
+            with self._account_lock:
+                if abandoned.is_set() or (is_cancelled and is_cancelled()):
+                    return False
+                self._raise_action_gate.is_allowed = lambda: (
+                    not abandoned.is_set() and (is_cancelled is None or not is_cancelled())
+                )
+                try:
+                    self.account.raise_lots(game_id)
+                except _AutobumpActionCancelled:
+                    return False
+                finally:
+                    del self._raise_action_gate.is_allowed
             return True
 
         def _prepare_profile():
-            self.account.get()
-            user_profile = self.account.get_user(user_id)
-            sorted_lots = user_profile.get_sorted_lots(2)
-            return sorted_lots
+            with self._account_lock:
+                self.account.get()
+                user_profile = self.account.get_user(user_id)
+                return user_profile.get_sorted_lots(2)
 
         try:
             sorted_lots = await asyncio.to_thread(_prepare_profile)
         except Exception as e:
-            logger.warning(f"Ошибка чтения профиля (парсинг лотов): {e}")
+            logger.warning(f"Ошибка чтения профиля (парсинг лотов): {type(e).__name__}.")
             return False, "Ошибка получения данных профиля.", 600
 
         raised_cats = []
@@ -475,12 +493,12 @@ class FunPayClient:
                 # ничего не делает, хотя он честно ставил лоты на кулдаун.
                 # Это обычная штатная работа, а не ошибка - поэтому bump(),
                 # а не warning()/error().
-                logger.bump(f"[{display_name}] на кулдауне. Ответ: '{error_msg}' (~{wait_time} сек)")
+                logger.bump(f"[{display_name}] на кулдауне (~{wait_time} сек)")
 
             except Exception as e:
                 # Сетевые/непредвиденные ошибки - короткий повтор, а не 2 часа простоя
                 wait_time = random.randint(30, 60)
-                logger.error(f"[{display_name}] непредвиденная ошибка при поднятии: {e} (~{wait_time} сек)")
+                logger.error(f"[{display_name}] непредвиденная ошибка при поднятии: {type(e).__name__} (~{wait_time} сек)")
                 next_time = time.time() + wait_time
                 self.raise_time[game_id] = next_time
                 min_wait = min(min_wait, wait_time)
@@ -524,6 +542,12 @@ class FunPayClient:
     # продиагностировать и поправить одну строчку.
 
     def init_runner(self):
+        with self._account_lock:
+            if self._runner_stop.is_set():
+                raise _RunnerStopRequested()
+            self._init_runner_locked()
+
+    def _init_runner_locked(self):
         """
         Инициализирует аккаунт (если еще не инициализирован) и создает Runner.
 
@@ -756,8 +780,9 @@ class FunPayClient:
         consecutive_errors = 0
         while not is_cancelled():
             try:
-                updates = self.runner.get_updates()
-                events = self.runner.parse_updates(updates)
+                with self._account_lock:
+                    updates = self.runner.get_updates()
+                    events = self.runner.parse_updates(updates)
                 for event in events:
                     with self._runner_publish_lock:
                         if is_cancelled():
@@ -997,6 +1022,6 @@ class FunPayClient:
             # FunPayAPI называет поля чуть иначе. Быстрая диагностика:
             # print(vars(event)) и print(vars(event.message)) / print(vars(event.order))
             # покажут реальные имена полей - останется поправить строчку выше.
-            logger.error(f"Ошибка разбора события {getattr(event, 'type', '?')}: {e}")
+            logger.error(f"Ошибка разбора события: {type(e).__name__}.")
 
         return results

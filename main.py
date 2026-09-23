@@ -160,7 +160,7 @@ async def auto_bump_loop(bot: Bot, client: FunPayClient):
                             await bot.send_message(recipient_id, "🛑 Автоподнятие лотов полностью выключено.")
                     except Exception as e:
                         if not _is_ignorable_send_error(e):
-                            logger.bump(f"Не удалось отправить уведомление пользователю {recipient_id}: {e}")
+                            logger.bump(f"Не удалось отправить уведомление: {type(e).__name__}.")
             last_state = current_state
 
         # 2. Если тумблер включен - запускаем работу
@@ -189,7 +189,7 @@ async def auto_bump_loop(bot: Bot, client: FunPayClient):
                             await bot.send_message(recipient_id, message_text, parse_mode="HTML")
                         except Exception as e:
                             if not _is_ignorable_send_error(e):
-                                logger.bump(f"Не удалось отправить отчет пользователю {recipient_id}: {e}")
+                                logger.bump(f"Не удалось отправить отчет: {type(e).__name__}.")
 
             # Сон с ежесекундной проверкой кнопки выключения
             for _ in range(int(wait_time)):
@@ -218,7 +218,7 @@ async def _fetch_and_send_review(
         review = None
         full_order = None
         for attempt in range(3):
-            full_order = await asyncio.to_thread(client.account.get_order, order_id)
+            full_order, account_id = await asyncio.to_thread(client.get_order_snapshot, order_id)
             review = getattr(full_order, "review", None)
             if review is not None:
                 break
@@ -233,7 +233,6 @@ async def _fetch_and_send_review(
             logger.notify("Отзыв пропущен: несоответствие ID заказа и отзыва.")
             return
 
-        account_id = getattr(client.account, "id", None)
         seller_id = getattr(full_order, "seller_id", None)
         buyer_id = getattr(full_order, "buyer_id", None)
         author_id = getattr(review, "author_id", None)
@@ -350,7 +349,7 @@ async def notifications_loop(bot: Bot, client: FunPayClient):
                     await bot.send_message(recipient_id, text, parse_mode="HTML")
                 except Exception as e:
                     if not _is_ignorable_send_error(e):
-                        logger.notify(f"Не удалось отправить уведомление пользователю {recipient_id}: {e}")
+                        logger.notify(f"Не удалось отправить уведомление: {type(e).__name__}.")
 
 
 async def session_refresh_loop(client: FunPayClient):
@@ -362,10 +361,26 @@ async def session_refresh_loop(client: FunPayClient):
     while True:
         await asyncio.sleep(3600)
         try:
-            await asyncio.to_thread(client.account.get, True)  # update_phpsessid=True
+            await asyncio.to_thread(client.refresh_session)  # update_phpsessid=True
             logger.info("Сессия FunPay обновлена (PHPSESSID установлен).")
         except Exception as e:
-            logger.warning(f"Не удалось обновить сессию FunPay: {e}")
+            logger.warning(f"Не удалось обновить сессию FunPay: {type(e).__name__}.")
+
+
+async def _send_runtime_notice(bot: Bot, message: str) -> None:
+    """Одна попытка отправки каждому авторизованному получателю."""
+    try:
+        recipients = get_all_recipients()
+    except Exception as e:
+        logger.warning(f"Не удалось получить получателей системного уведомления: {type(e).__name__}.")
+        return
+    for recipient_id in recipients:
+        try:
+            await asyncio.wait_for(bot.send_message(recipient_id, message), timeout=5.0)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning(f"Не удалось отправить системное уведомление: {type(e).__name__}.")
 
 
 async def _supervise_tasks(bot: Bot, client: FunPayClient):
@@ -455,7 +470,7 @@ async def main():
     # самым первым запросом (до того как обычная сессия вообще установлена),
     # похоже, это и приводит к "Необходимая cookie отсутствует или устарела".
     try:
-        await asyncio.to_thread(client.account.get)
+        await asyncio.to_thread(client.initialize_account)
     except Exception:
         logger.error("Не удалось инициализировать сессию FunPay.")
         raise RuntimeError("Начальная сессия FunPay не инициализирована.") from None
@@ -471,17 +486,34 @@ async def main():
     bot = Bot(token=_require_env("BOT_TOKEN"))
     logger.success("Бот подключен к Telegram. Запуск фоновых процессов...")
 
+    runtime_ready = False
     try:
+        await _send_runtime_notice(bot, "🟢 Бот запущен.")
+        runtime_ready = True
         await _supervise_tasks(bot, client)
     finally:
-        unwinding_exception = sys.exc_info()[0] is not None
+        primary_type = sys.exc_info()[0]
+        unwinding_exception = primary_type is not None
         try:
-            await bot.session.close()
-        except asyncio.CancelledError:
-            if not unwinding_exception:
-                raise
-        except Exception as e:
-            logger.error(f"Не удалось закрыть сессию Telegram: {type(e).__name__}.")
+            if runtime_ready:
+                message = ("⚠️ Бот остановлен из-за критической ошибки."
+                           if primary_type is not None and not issubclass(primary_type, asyncio.CancelledError)
+                           else "🔴 Бот остановлен.")
+                try:
+                    await _send_runtime_notice(bot, message)
+                except asyncio.CancelledError:
+                    if not unwinding_exception:
+                        raise
+                except Exception as e:
+                    logger.error(f"Не удалось отправить системное уведомление: {type(e).__name__}.")
+        finally:
+            try:
+                await bot.session.close()
+            except asyncio.CancelledError:
+                if not unwinding_exception:
+                    raise
+            except Exception as e:
+                logger.error(f"Не удалось закрыть сессию Telegram: {type(e).__name__}.")
 
 
 def run():
