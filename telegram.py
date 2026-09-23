@@ -1,3 +1,4 @@
+import asyncio
 import hmac
 import os
 import json
@@ -7,6 +8,7 @@ from aiogram import Dispatcher
 from aiogram.filters import Command
 from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, ReplyKeyboardMarkup, KeyboardButton
 from funpay import FunPayClient
+from state import StateError
 import logger
 
 dp = Dispatcher()
@@ -399,6 +401,32 @@ async def cmd_status(message: Message):
         logger.warning(f"Status unavailable: {type(e).__name__}.")
         status_text = "🩺 Состояние бота\nRuntime: недоступно"
     await message.answer(status_text)
+
+
+@dp.message(Command("stats"))
+async def cmd_stats(message: Message):
+    if not is_authorized(message.from_user.id):
+        await message.answer("⛔ Доступ запрещен!")
+        return
+    try:
+        store = _runtime_client.review_state if _runtime_client is not None else None
+        if store is None:
+            raise StateError("Persistent state unavailable.")
+        stats = await asyncio.to_thread(store.get_order_statistics)
+        lines = ["📊 Статистика заказов", "Первое наблюдение ботом (UTC)",
+                 "Статусы — по последнему полученному событию"]
+        for title, key in (("Сегодня", "today"), ("7 дней", "7_days"),
+                           ("30 дней", "30_days"), ("Всё время", "all_time")):
+            period = stats[key]
+            lines.append(
+                f"\n{title}:\nЗаказов: {period['orders']}\n"
+                f"Завершено: {period['closed']}\nВозвратов: {period['refunded']}"
+            )
+    except Exception as e:
+        logger.warning(f"Order statistics unavailable: {type(e).__name__}.")
+        await message.answer("📊 Статистика недоступна")
+        return
+    await message.answer("\n".join(lines))
 
 
 @dp.callback_query()
