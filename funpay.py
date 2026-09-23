@@ -31,6 +31,8 @@ class _EventQueueOverflow(Exception):
 
 # Буфер для короткого всплеска Runner; переполнение завершает runtime, а не растит память.
 EVENT_QUEUE_CAPACITY = 256
+NIGHT_MODE_MESSAGE_TEXT = "😴 Продавец спит, как только проснется сразу ответит Вам"
+NIGHT_MODE_ORDER_TEXT = "😴 Продавец спит, как проснётся — сразу приступит"
 
 # ---------------------------------------------------------------------------
 # ФИКС ДЛЯ 400 "Необходимая cookie отсутствует или устарела" на runner/
@@ -291,7 +293,7 @@ class FunPayClient:
         # Отзыв теперь пытаются поймать ДВА независимых пути (через чат и
         # через закрытие заказа) - без этого набора один и тот же отзыв мог
         # бы улететь в Telegram дважды.
-        self._notified_reviews: set[str] = set()
+        self._notified_reviews: dict[str, str] = {}
         self._review_notification_lock = asyncio.Lock()
         self._runner_thread: threading.Thread | None = None
         self._runner_start_lock = threading.Lock()
@@ -526,7 +528,10 @@ class FunPayClient:
                 time_str = _format_seconds(w_time)
                 logger.success(f"Лот поднят: {g_name}")
                 msg_lines.append(f"🎮 <b>{escape(str(g_name))}</b>")
-                msg_lines.append(f"⏰ Следующий подъём через {time_str}")
+                msg_lines.append("✅ Лоты подняты")
+                msg_lines.append(f"⏳ Повтор для этой игры: через {time_str}")
+            msg_lines.append("")
+            msg_lines.append(f"🔄 Следующая общая проверка: через {_format_seconds(min_wait_final)}")
             summary_text = "\n".join(msg_lines)
         else:
             summary_text = ""  # Всё на кулдауне — уведомление не нужно
@@ -924,6 +929,19 @@ class FunPayClient:
                         # Остальные системные сообщения игнорируем
                         return results
 
+                # LAST_CHAT_MESSAGE_CHANGED содержит ChatShortcut без author_id.
+                # Подавляем эхо собственных ночных автоответов до нового маркера:
+                # unread сам по себе не доказывает направление сообщения.
+                author_id = getattr(chat, "last_message_author_id", None)
+                account_id = getattr(self.account, "id", None)
+                if (type(author_id) is int and type(account_id) is int
+                        and author_id == account_id):
+                    return results
+                if getattr(chat, "last_message_text", None) in (
+                    NIGHT_MODE_MESSAGE_TEXT, NIGHT_MODE_ORDER_TEXT,
+                ):
+                    return results
+
                 # Системное событие отзыва не обязано делать чат непрочитанным.
                 # Дедуп обычных сообщений не должен скрывать NEW_FEEDBACK.
                 if not getattr(chat, "unread", False):
@@ -952,6 +970,8 @@ class FunPayClient:
                     f"{who_line}"
                 )
                 results.append(("notify_message", text))
+                if chat_id is not None:
+                    results.append(("_night_mode_reply_message", str(chat_id)))
 
             elif event.type is event_types.NEW_ORDER:
                 order = event.order
@@ -966,6 +986,9 @@ class FunPayClient:
                     f"Описание: {escape(str(descr))}"
                 )
                 results.append(("notify_order", text))
+                direct_chat_id = getattr(order, "chat_id", None)
+                if (isinstance(buyer, str) and buyer != "—") or type(direct_chat_id) is int:
+                    results.append(("_night_mode_reply_order", (buyer, direct_chat_id)))
 
             elif event.type is event_types.ORDER_STATUS_CHANGED:
                 order = event.order

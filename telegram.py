@@ -3,16 +3,38 @@ import hmac
 import os
 import json
 import math
+import re
+import threading
 import time
 import tempfile
+from datetime import datetime, timedelta
 from aiogram import Dispatcher, F
 from aiogram.filters import Command
-from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, ReplyKeyboardMarkup, KeyboardButton
+from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, ReplyKeyboardMarkup, KeyboardButton, FSInputFile
 from funpay import FunPayClient
 from state import StateError
 import logger
 
 dp = Dispatcher()
+LOGS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+
+
+async def _send_log_file(target: Message | CallbackQuery, date_str: str) -> None:
+    """Отправляет существующий файл лога за проверенную дату."""
+    answer = target.message.answer if isinstance(target, CallbackQuery) else target.answer
+    answer_document = (target.message.answer_document if isinstance(target, CallbackQuery)
+                       else target.answer_document)
+    log_path = os.path.join(LOGS_DIR, f"bot_{date_str}.log")
+    try:
+        if not os.path.isfile(log_path):
+            await answer(f"Лог за {date_str} не найден.")
+        elif os.path.getsize(log_path) == 0:
+            await answer(f"Лог за {date_str} пустой.")
+        else:
+            await answer_document(FSInputFile(log_path, filename=f"bot_{date_str}.log"))
+    except Exception as e:
+        logger.warning(f"Не удалось отправить файл лога: {type(e).__name__}.")
+        await answer("Не удалось отправить файл лога.")
 
 _runtime_client: FunPayClient | None = None
 _runtime_started_at: float | None = None
@@ -156,6 +178,7 @@ SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot_se
 # Глобальные настройки — общие для всего бота
 _DEFAULT_GLOBAL_SETTINGS: dict = {
     "auto_bump": False,
+    "night_mode": False,
     "authorized_user_ids": [],
 }
 
@@ -170,6 +193,7 @@ _DEFAULT_USER_SETTINGS: dict = {
 
 # Глобальные настройки бота (авто-подъём, список авторизованных)
 bot_settings: dict = dict(_DEFAULT_GLOBAL_SETTINGS)
+_night_mode_state_lock = threading.Lock()
 
 # Персональные настройки: {user_id (int): {notify_*, notifications_enabled}}
 _user_settings: dict[int, dict] = {}
@@ -217,7 +241,9 @@ def load_settings() -> None:
             saved = json.load(f)
 
         # Проверяем до изменения глобального состояния: строка "false" truthy.
-        if not isinstance(saved, dict) or type(saved.get("auto_bump", False)) is not bool:
+        if (not isinstance(saved, dict)
+                or type(saved.get("auto_bump", False)) is not bool
+                or type(saved.get("night_mode", False)) is not bool):
             raise ValueError("Invalid global settings.")
         user_ids = saved.get("authorized_user_ids", [])
         if (not isinstance(user_ids, list)
@@ -281,6 +307,7 @@ def save_settings(*, required: bool = False) -> None:
     try:
         data = {
             "auto_bump": bot_settings["auto_bump"],
+            "night_mode": bot_settings["night_mode"],
             "authorized_user_ids": bot_settings["authorized_user_ids"],
             "user_settings": {
                 str(uid): sett for uid, sett in _user_settings.items()
@@ -304,6 +331,24 @@ def save_settings(*, required: bool = False) -> None:
         if required:
             raise RuntimeError("Не удалось сохранить настройки автоподнятия.") from None
         print(f"[SETTINGS] Не удалось сохранить настройки: {type(e).__name__}.")
+
+
+def is_night_mode_enabled() -> bool:
+    with _night_mode_state_lock:
+        return bot_settings.get("night_mode", False)
+
+
+def toggle_night_mode_saved() -> bool:
+    """Фиксирует состояние и required-save независимо от Account RLock."""
+    with _night_mode_state_lock:
+        previous = bot_settings["night_mode"]
+        bot_settings["night_mode"] = not previous
+        try:
+            save_settings(required=True)
+        except Exception:
+            bot_settings["night_mode"] = previous
+            raise RuntimeError("Не удалось сохранить ночной режим.") from None
+        return bot_settings["night_mode"]
 
 
 def disable_autobump() -> None:
@@ -397,11 +442,32 @@ def get_reply_keyboard():
 # Кнопка уведомлений ведёт в персональные настройки.
 def get_main_keyboard(user_id: int):
     bump_status = on_icon(bot_settings["auto_bump"])
+    night_status = on_icon(bot_settings["night_mode"])
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=f"🚀 Автоподнятие лотов: {bump_status}", callback_data="toggle_bump")],
+        [InlineKeyboardButton(text="📊 Статистика", callback_data="menu_stats")],
         [InlineKeyboardButton(text="🔔 Мои уведомления", callback_data="menu_notifications")],
+        [InlineKeyboardButton(text=f"😴 Ночной режим: {night_status}", callback_data="toggle_night_mode")],
+        [InlineKeyboardButton(text="📄 Лог", callback_data="menu_logs")],
     ])
     return keyboard
+
+
+def get_logs_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📄 Сегодня", callback_data="log_today")],
+        [InlineKeyboardButton(text="📄 Вчера", callback_data="log_yesterday")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="menu_main")],
+    ])
+
+
+def get_stats_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📅 Сегодня", callback_data="stats_today")],
+        [InlineKeyboardButton(text="🗓 Неделя", callback_data="stats_week")],
+        [InlineKeyboardButton(text="🗓 Месяц", callback_data="stats_month")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="menu_main")],
+    ])
 
 
 # Подменю уведомлений — полностью персональное для каждого пользователя.
@@ -426,10 +492,9 @@ NOTIFICATIONS_MENU_TEXT = "🔔 <b>Мои настройки уведомлен�
 async def cmd_start(message: Message):
     user_id = message.from_user.id
     if is_authorized(user_id):
-        await message.answer("Клавиатура управления активирована 👇", reply_markup=get_reply_keyboard())
         await message.answer(
             MAIN_MENU_TEXT,
-            reply_markup=get_main_keyboard(user_id),
+            reply_markup=get_reply_keyboard(),
             parse_mode="HTML"
         )
     else:
@@ -448,29 +513,46 @@ async def _send_status(message: Message):
     await message.answer(status_text)
 
 
+async def _read_order_stats() -> dict[str, dict[str, int]]:
+    store = _runtime_client.review_state if _runtime_client is not None else None
+    if store is None:
+        raise StateError("Persistent state unavailable.")
+    return await asyncio.to_thread(store.get_order_statistics)
+
+
+_STAT_PERIODS = (("Сегодня", "today"), ("7 дней", "7_days"),
+                 ("30 дней", "30_days"), ("За всё время", "all_time"))
+
+
+def _format_order_stats(stats: dict[str, dict[str, int]], period_key: str | None = None) -> str:
+    lines = ["📊 Статистика"]
+    for title, key in _STAT_PERIODS:
+        if period_key is not None and key != period_key:
+            continue
+        period = stats[key]
+        lines.extend((
+            "",
+            title,
+            f"🛒 Заказов: {period['orders']}",
+            f"✅ Завершено: {period['closed']}",
+            f"↩️ Возвратов: {period['refunded']}",
+        ))
+    lines.extend(("", "Учитываются заказы, полученные ботом."))
+    return "\n".join(lines)
+
+
 async def _send_stats(message: Message):
     if not is_authorized(message.from_user.id):
         await message.answer("⛔ Доступ запрещен!")
         return
     try:
-        store = _runtime_client.review_state if _runtime_client is not None else None
-        if store is None:
-            raise StateError("Persistent state unavailable.")
-        stats = await asyncio.to_thread(store.get_order_statistics)
-        lines = ["📊 Статистика заказов", "Первое наблюдение ботом (UTC)",
-                 "Статусы — по последнему полученному событию"]
-        for title, key in (("Сегодня", "today"), ("7 дней", "7_days"),
-                           ("30 дней", "30_days"), ("Всё время", "all_time")):
-            period = stats[key]
-            lines.append(
-                f"\n{title}:\nЗаказов: {period['orders']}\n"
-                f"Завершено: {period['closed']}\nВозвратов: {period['refunded']}"
-            )
+        stats = await _read_order_stats()
+        text = _format_order_stats(stats)
     except Exception as e:
         logger.warning(f"Order statistics unavailable: {type(e).__name__}.")
         await message.answer("📊 Статистика недоступна")
         return
-    await message.answer("\n".join(lines))
+    await message.answer(text)
 
 
 @dp.message(Command("status"))
@@ -491,6 +573,26 @@ async def text_status(message: Message):
 @dp.message(F.text == "📊 Статистика")
 async def text_stats(message: Message):
     await _send_stats(message)
+
+
+@dp.message(Command("log"))
+async def cmd_log(message: Message):
+    if not is_authorized(message.from_user.id):
+        await message.answer("⛔ Доступ запрещен!")
+        return
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2:
+        await message.answer("Укажите дату: /log ГГГГ-ММ-ДД. Сегодня и вчера доступны в меню «Лог».")
+        return
+    date_str = parts[1].strip()
+    try:
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date_str):
+            raise ValueError("Invalid log date")
+        datetime.strptime(date_str, "%Y-%m-%d")
+    except ValueError:
+        await message.answer("Неверный формат даты. Нужно: ГГГГ-ММ-ДД.")
+        return
+    await _send_log_file(message, date_str)
 
 
 @dp.callback_query()
@@ -522,6 +624,7 @@ async def callback_handler(callback: CallbackQuery):
 
     # Переход в персональное подменю уведомлений
     elif action == "menu_notifications":
+        await callback.answer()
         try:
             await callback.message.edit_text(
                 NOTIFICATIONS_MENU_TEXT,
@@ -531,13 +634,63 @@ async def callback_handler(callback: CallbackQuery):
         except Exception:
             pass
 
+    elif action == "toggle_night_mode":
+        try:
+            enabled = toggle_night_mode_saved()
+        except RuntimeError:
+            await callback.answer("Не удалось сохранить ночной режим.", show_alert=True)
+            return
+        await callback.answer("Ночной режим включен 😴" if enabled
+                              else "Ночной режим выключен")
+        try:
+            await callback.message.edit_reply_markup(reply_markup=get_main_keyboard(user_id))
+        except Exception:
+            pass
+
+    elif action == "menu_logs":
+        await callback.answer()
+        try:
+            await callback.message.edit_text(
+                "📄 <b>Лог бота</b>\nВыберите дату или отправьте /log ГГГГ-ММ-ДД:",
+                reply_markup=get_logs_keyboard(), parse_mode="HTML"
+            )
+        except Exception:
+            pass
+
+    elif action in ("log_today", "log_yesterday"):
+        date = datetime.now() if action == "log_today" else datetime.now() - timedelta(days=1)
+        await callback.answer("Отправляю файл...")
+        await _send_log_file(callback, date.strftime("%Y-%m-%d"))
+
+    elif action == "menu_stats":
+        await callback.answer()
+        try:
+            await callback.message.edit_text(
+                "📊 <b>Статистика</b>\nВыберите период:",
+                reply_markup=get_stats_keyboard(), parse_mode="HTML"
+            )
+        except Exception:
+            pass
+
+    elif action in ("stats_today", "stats_week", "stats_month"):
+        period = {"stats_today": "today", "stats_week": "7_days",
+                  "stats_month": "30_days"}[action]
+        try:
+            stats = await _read_order_stats()
+            text = _format_order_stats(stats, period)
+        except Exception as e:
+            logger.warning(f"Order statistics unavailable: {type(e).__name__}.")
+            await callback.answer("Статистика недоступна.", show_alert=True)
+            return
+        await callback.answer()
+        try:
+            await callback.message.edit_text(text, reply_markup=get_stats_keyboard())
+        except Exception:
+            pass
+
     # Возврат в главное меню
     elif action == "menu_main":
         await callback.answer()
-        await callback.message.answer(
-            "Клавиатура управления активирована 👇",
-            reply_markup=get_reply_keyboard(),
-        )
         try:
             await callback.message.edit_text(
                 MAIN_MENU_TEXT,

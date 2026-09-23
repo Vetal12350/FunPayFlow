@@ -17,11 +17,17 @@ logger.py — Красивый консольный логгер в стиле F
     logger.notify("Новое сообщение от buyer123")
     logger.warning("Кулдаун, повтор через 7200 сек")
     logger.error("Ошибка соединения")
-    logger.debug("Тело ответа: ...")  # только при DEBUG=1
+    logger.debug("Ошибка запроса: RuntimeError")  # только при DEBUG=1
+
+Файл logs/bot_ГГГГ-ММ-ДД.log создаётся при первой записи за день. В него
+попадают только сообщения, выведенные application logger в консоль; скрытые
+debug-сообщения туда не копируются.
 """
 
-import os
 import logging
+import os
+import re
+import threading
 from datetime import datetime
 
 
@@ -71,6 +77,37 @@ _GR = "\033[90m"  # dark gray
 _W  = "\033[97m"  # bright white
 # ─────────────────────────────────────────────────────────────────────────────
 
+LOGS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+_file_lock = threading.Lock()
+_ansi_escape = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+_credential_label = re.compile(
+    r"(?i)\b(?:golden_key|funpay_golden_key|bot_token|password|api_key|"
+    r"cookie|phpsessid|csrf|csrf_token|authorization|proxy_password)\s*[:=]"
+)
+_telegram_token = re.compile(r"\b\d{8,12}:[A-Za-z0-9_-]{20,}\b")
+
+
+def _write_to_file(tag: str, msg: str) -> None:
+    """Дублирует разрешённое консольное сообщение без ANSI и секретных значений."""
+    try:
+        if type(msg) is not str:
+            msg = "[нестроковое сообщение]"
+        clean = _ansi_escape.sub("", msg)
+        clean = " ".join("".join(ch if ch.isprintable() else " " for ch in clean).split())
+        secret = _credential_label.search(clean)
+        if secret:
+            clean = clean[:secret.start()] + "[секрет скрыт]"
+        clean = _telegram_token.sub("[секрет скрыт]", clean)
+        with _file_lock:
+            os.makedirs(LOGS_DIR, exist_ok=True)
+            now = datetime.now()
+            path = os.path.join(LOGS_DIR, f"bot_{now.strftime('%Y-%m-%d')}.log")
+            with open(path, "a", encoding="utf-8") as stream:
+                stream.write(f"[{now.strftime('%H:%M:%S')}] {tag}  {clean}\n")
+    except Exception:
+        # Ошибка файловой системы не должна прерывать консольный лог или runtime.
+        pass
+
 
 def _ts() -> str:
     return datetime.now().strftime("%H:%M:%S")
@@ -78,6 +115,7 @@ def _ts() -> str:
 
 def _line(color: str, icon: str, tag: str, msg: str) -> None:
     print(f"{_GR}[{_ts()}]{_R} {color}{_B}{icon} {tag}{_R}  {msg}")
+    _write_to_file(tag, msg)
 
 
 # ── Публичный API ─────────────────────────────────────────────────────────────
@@ -128,3 +166,4 @@ def banner(username: str = "") -> None:
     if acc_line:
         print(f"{_C}{_B}  ║{_R}{acc_line}{' ' * pad}{_C}{_B}║{_R}")
     print(f"{_C}{_B}  ╚══════════════════════════════════════╝{_R}\n")
+    _write_to_file("START", f"=== Запуск бота (аккаунт: {username or '?'}) ===")
