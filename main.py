@@ -298,58 +298,95 @@ async def notifications_loop(bot: Bot, client: FunPayClient):
     с ошибками - именно это давало частые "Произошла ошибка при получении
     событий" в логах.
     """
+    # Каждая review task может ждать 5 секунд и ещё три snapshot attempts.
+    # Один полный burst очереди допустим, но backlog после dequeue не растёт бесконечно.
+    max_review_tasks = 256
+    review_tasks: set[asyncio.Task] = set()
+    review_failed = False
+
+    def review_done(task: asyncio.Task) -> None:
+        nonlocal review_failed
+        review_tasks.discard(task)
+        if task.cancelled():
+            return
+        error = task.exception()
+        if error is not None:
+            logger.error(f"Review task failed: {type(error).__name__}.")
+            review_failed = True
+
+    def start_review_check(order_id: str, delay: float) -> None:
+        if len(review_tasks) >= max_review_tasks:
+            raise RuntimeError("Review task capacity exceeded.")
+        task = asyncio.create_task(_fetch_and_send_review(bot, client, order_id, delay=delay))
+        review_tasks.add(task)
+        task.add_done_callback(review_done)
+
     client.start_runner()
-
-    while True:
-        if client.runner_stop_requested():
-            return
-        if client.runner_failed():
-            raise RuntimeError("Runner producer неожиданно завершился.") from None
-        # Забираем следующее событие из очереди, не блокируя asyncio-цикл
-        try:
-            event = await asyncio.to_thread(client.event_queue.get, True, 1.0)
-        except queue.Empty:
-            continue
-        if client.runner_stop_requested():
-            return
-        if client.runner_failed():
-            raise RuntimeError("Runner producer неожиданно завершился.") from None
-
-        for setting_key, text in client.describe_event(event):
-            # _review_check_immediate — отзыв поймали через NEW_FEEDBACK в чате, сразу проверяем
-            if setting_key == "_review_check_immediate":
-                asyncio.create_task(
-                    _fetch_and_send_review(bot, client, text, delay=0)
-                )
+    try:
+        while True:
+            if client.runner_stop_requested():
+                return
+            if client.runner_failed():
+                raise RuntimeError("Runner producer неожиданно завершился.") from None
+            if review_failed:
+                raise RuntimeError("Review task unexpectedly failed.") from None
+            # Забираем следующее событие из очереди, не блокируя asyncio-цикл
+            try:
+                event = await asyncio.to_thread(client.event_queue.get, True, 1.0)
+            except queue.Empty:
                 continue
-            # _review_check — заказ закрыт, ждём 5 сек (покупатель мог оставить отзыв
-            # чуть позже закрытия), затем 3 попытки — точно как у Кардинала
-            if setting_key == "_review_check":
-                asyncio.create_task(
-                    _fetch_and_send_review(bot, client, text, delay=5)
-                )
-                continue
+            if client.runner_stop_requested():
+                return
+            if client.runner_failed():
+                raise RuntimeError("Runner producer неожиданно завершился.") from None
+            if review_failed:
+                raise RuntimeError("Review task unexpectedly failed.") from None
 
-            # Раньше здесь не было НИКАКОГО вывода в консоль - Telegram получал
-            # уведомление, а в CMD было тихо. Теперь то же самое, что летит в
-            # Telegram, сразу видно и в консоли (без HTML-тегов, одной строкой).
-            logger.notify(_strip_html(text))
+            for setting_key, text in client.describe_event(event):
+                # _review_check_immediate — отзыв поймали через NEW_FEEDBACK в чате, сразу проверяем
+                if setting_key == "_review_check_immediate":
+                    start_review_check(text, delay=0)
+                    continue
+                # _review_check — заказ закрыт, ждём 5 сек (покупатель мог оставить отзыв
+                # чуть позже закрытия), затем 3 попытки — точно как у Кардинала
+                if setting_key == "_review_check":
+                    start_review_check(text, delay=5)
+                    continue
 
-            # Рассылаем каждому авторизованному пользователю согласно его
-            # персональным настройкам уведомлений
-            for recipient_id in get_all_recipients():
-                u = get_user_settings(recipient_id)
-                # Проверяем главный рубильник пользователя
-                if not u.get("notifications_enabled", True):
-                    continue
-                # Проверяем конкретный тип уведомления
-                if not u.get(setting_key, True):
-                    continue
-                try:
-                    await bot.send_message(recipient_id, text, parse_mode="HTML")
-                except Exception as e:
-                    if not _is_ignorable_send_error(e):
-                        logger.notify(f"Не удалось отправить уведомление: {type(e).__name__}.")
+                # Раньше здесь не было НИКАКОГО вывода в консоль - Telegram получал
+                # уведомление, а в CMD было тихо. Теперь то же самое, что летит в
+                # Telegram, сразу видно и в консоли (без HTML-тегов, одной строкой).
+                logger.notify(_strip_html(text))
+
+                # Рассылаем каждому авторизованному пользователю согласно его
+                # персональным настройкам уведомлений
+                for recipient_id in get_all_recipients():
+                    u = get_user_settings(recipient_id)
+                    # Проверяем главный рубильник пользователя
+                    if not u.get("notifications_enabled", True):
+                        continue
+                    # Проверяем конкретный тип уведомления
+                    if not u.get(setting_key, True):
+                        continue
+                    try:
+                        await bot.send_message(recipient_id, text, parse_mode="HTML")
+                    except Exception as e:
+                        if not _is_ignorable_send_error(e):
+                            logger.notify(f"Не удалось отправить уведомление: {type(e).__name__}.")
+    finally:
+        for task in tuple(review_tasks):
+            task.cancel()
+        if review_tasks:
+            _, pending = await asyncio.wait(tuple(review_tasks), timeout=10.0)
+            if pending:
+                logger.error("Review task cleanup failed.")
+                primary_type = sys.exc_info()[0]
+                if primary_type is None or issubclass(primary_type, asyncio.CancelledError):
+                    raise RuntimeError("Review task cleanup failed.") from None
+        if review_failed:
+            primary_type = sys.exc_info()[0]
+            if primary_type is None or issubclass(primary_type, asyncio.CancelledError):
+                raise RuntimeError("Review task unexpectedly failed.") from None
 
 
 async def session_refresh_loop(client: FunPayClient):
