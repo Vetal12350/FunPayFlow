@@ -10,7 +10,8 @@ from aiogram import Bot
 
 load_dotenv()
 
-from telegram import dp, bot_settings, get_user_settings, get_all_recipients
+from telegram import (dp, bot_settings, get_user_settings, get_all_recipients,
+                      set_runtime_status_context, clear_runtime_status_context)
 from funpay import FunPayClient
 from state import ReviewReceiptStore, StateError
 import logger
@@ -561,8 +562,10 @@ async def main():
     try:
         await _send_runtime_notice(bot, "🟢 Бот запущен.")
         runtime_ready = True
+        set_runtime_status_context(client)
         await _supervise_tasks(bot, client)
     finally:
+        clear_runtime_status_context()
         primary_type = sys.exc_info()[0]
         unwinding_exception = primary_type is not None
         try:

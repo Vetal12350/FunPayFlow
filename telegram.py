@@ -1,13 +1,144 @@
 import hmac
 import os
 import json
+import math
 import time
 from aiogram import Dispatcher
 from aiogram.filters import Command
 from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, ReplyKeyboardMarkup, KeyboardButton
 from funpay import FunPayClient
+import logger
 
 dp = Dispatcher()
+
+_runtime_client: FunPayClient | None = None
+_runtime_started_at: float | None = None
+_SAFE_RUNNER_FAILURE_TYPES = frozenset({
+    "UnexpectedStop", "_EventQueueOverflow", "RequestFailedError", "UnauthorizedError",
+    "Timeout", "ConnectTimeout", "ReadTimeout", "ConnectionError", "SSLError",
+    "ProxyError", "ChunkedEncodingError", "ValueError", "TypeError", "KeyError",
+    "AttributeError", "AssertionError", "RuntimeError",
+})
+
+
+def set_runtime_status_context(client: FunPayClient) -> None:
+    """Вызывается один раз после успешного startup приложения."""
+    global _runtime_client, _runtime_started_at
+    _runtime_client = client
+    _runtime_started_at = time.monotonic()
+
+
+def clear_runtime_status_context() -> None:
+    global _runtime_client, _runtime_started_at
+    _runtime_client = None
+    _runtime_started_at = None
+
+
+def _format_duration(seconds: float) -> str:
+    total = max(0, int(seconds))
+    days, remainder = divmod(total, 86400)
+    hours, remainder = divmod(remainder, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    if days:
+        return f"{days} д {hours} ч" if hours else f"{days} д"
+    if hours:
+        return f"{hours} ч {minutes} мин" if minutes else f"{hours} ч"
+    if minutes:
+        return f"{minutes} мин"
+    return f"{seconds} сек"
+
+
+def _elapsed_since(value: float | None, now: float) -> str:
+    if value is None:
+        return "ещё не было"
+    if type(value) not in (int, float) or not math.isfinite(value):
+        return "недоступно"
+    return f"{_format_duration(max(0, now - value))} назад"
+
+
+def get_runtime_status_text() -> str:
+    """Только локальный snapshot; сетевых и SQLite операций здесь нет."""
+    client = _runtime_client
+    now = time.monotonic()
+    if client is None or _runtime_started_at is None:
+        return "🩺 Состояние бота\nRuntime: не запущен"
+
+    uptime = _elapsed_since(_runtime_started_at, now).removesuffix(" назад")
+    health_available = True
+    try:
+        health = client.get_runner_health()
+        if not isinstance(health, dict):
+            raise TypeError("Invalid runner snapshot")
+    except Exception as e:
+        logger.warning(f"Status runner snapshot unavailable: {type(e).__name__}.")
+        health = {}
+        health_available = False
+
+    runner_states = {
+        "starting": "starting",
+        "healthy": "running",
+        "backoff": "backoff",
+        "failed": "failed",
+        "stopped": "stopped",
+    }
+    state = health.get("state")
+    runner = runner_states.get(state, "недоступно") if isinstance(state, str) else "недоступно"
+    errors = health.get("consecutive_errors")
+    errors_text = str(errors) if type(errors) is int and errors >= 0 else "недоступно"
+    last_success = (
+        _elapsed_since(health.get("last_success_monotonic"), now)
+        if health_available else "недоступно"
+    )
+
+    try:
+        size = client.event_queue.qsize()
+        capacity = client.event_queue.maxsize
+        if type(size) is not int or type(capacity) is not int or size < 0 or capacity <= 0:
+            raise ValueError("Invalid queue snapshot")
+        queue_text = f"{size} / {capacity}"
+    except Exception as e:
+        logger.warning(f"Status queue snapshot unavailable: {type(e).__name__}.")
+        queue_text = "недоступно"
+
+    try:
+        if getattr(client, "_review_state_failed", False):
+            persistent = "недоступно"
+        elif getattr(client, "review_state", None) is not None:
+            persistent = "инициализировано при запуске"
+        else:
+            persistent = "недоступно"
+    except Exception as e:
+        logger.warning(f"Status persistent state unavailable: {type(e).__name__}.")
+        persistent = "недоступно"
+
+    try:
+        bump = bot_settings["auto_bump"]
+        bump_text = "включено" if bump is True else "выключено" if bump is False else "недоступно"
+    except Exception as e:
+        logger.warning(f"Status autobump setting unavailable: {type(e).__name__}.")
+        bump_text = "недоступно"
+
+    lines = [
+        "🩺 Состояние бота",
+        "Runtime: 🟢 работает",
+        f"Uptime: {uptime}",
+        f"Runner: {runner}",
+        f"Последний успешный poll: {last_success}",
+        f"Ошибок подряд: {errors_text}",
+        f"Очередь событий: {queue_text}",
+        f"Persistent state: {persistent}",
+        f"Автоподнятие: {bump_text}",
+    ]
+    category = health.get("last_failure_category")
+    failure_type = health.get("last_failure_type")
+    if category is not None or failure_type is not None:
+        safe_category = category if category in ("AUTH", "RECOVERABLE", "FATAL", "UNKNOWN") else "недоступно"
+        safe_type = (
+            failure_type if isinstance(failure_type, str)
+            and failure_type in _SAFE_RUNNER_FAILURE_TYPES else "недоступно"
+        )
+        lines.append(f"Последний сбой: {safe_category} / {safe_type}")
+    return "\n".join(lines)
 
 # ---------------------------------------------------------------------------
 # Сохранение настроек между перезапусками
@@ -255,6 +386,19 @@ async def cmd_start(message: Message):
         )
     else:
         await message.answer("🔒 <b>Доступ закрыт.</b>\nВведите пароль:", parse_mode="HTML")
+
+
+@dp.message(Command("status"))
+async def cmd_status(message: Message):
+    if not is_authorized(message.from_user.id):
+        await message.answer("⛔ Доступ запрещен!")
+        return
+    try:
+        status_text = get_runtime_status_text()
+    except Exception as e:
+        logger.warning(f"Status unavailable: {type(e).__name__}.")
+        status_text = "🩺 Состояние бота\nRuntime: недоступно"
+    await message.answer(status_text)
 
 
 @dp.callback_query()
