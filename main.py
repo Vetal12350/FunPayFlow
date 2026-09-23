@@ -2,9 +2,9 @@ import asyncio
 import os
 import queue
 import re
-import subprocess
 import sys
 import atexit
+from html import escape
 from dotenv import load_dotenv
 from aiogram import Bot
 
@@ -12,8 +12,9 @@ load_dotenv()
 
 import FunPayAPI
 from telegram import (dp, bot_settings, get_user_settings, get_all_recipients,
-                      set_runtime_status_context, clear_runtime_status_context)
-from funpay import FunPayClient
+                      set_runtime_status_context, clear_runtime_status_context,
+                      disable_autobump)
+from funpay import FunPayClient, _AmbiguousRaiseOutcome
 from state import ReviewReceiptStore, StateError
 import logger
 
@@ -68,75 +69,46 @@ def _require_env(name: str) -> str:
 # не запущен ли уже другой процесс этого же бота, и если да - сразу выходим
 # с понятным сообщением, вместо непонятных 409/ошибок сессии.
 LOCK_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot.lock")
-
-
-def _is_process_running(pid: int) -> bool:
-    """Проверяет, жив ли процесс с указанным PID (кроссплатформенно)."""
-    if os.name == "nt":
-        try:
-            # FIX: shell=True убран — pid валидируется выше как int,
-            # но shell=True + данные из файла = потенциальная shell injection.
-            # Аргументы передаём списком, никакого shell-интерпретатора.
-            output = subprocess.check_output(
-                ["tasklist", "/FI", f"PID eq {pid}"],
-                text=True,
-                stderr=subprocess.DEVNULL,
-            )
-            return str(pid) in output
-        except Exception:
-            return False
-    else:
-        try:
-            os.kill(pid, 0)
-            return True
-        except ProcessLookupError:
-            return False
-        except PermissionError:
-            return True  # процесс есть, просто нет прав - считаем, что жив
-        except Exception:
-            return False
+_lock_handle = None
 
 
 def acquire_lock():
-    """
-    Создает bot.lock с PID текущего процесса.
-    Если файл уже есть и процесс из него жив - завершает работу.
-    Если файл есть, но процесс мертв (бот упал/был убит без очистки) -
-    считаем lock "зависшим" и спокойно перезаписываем его.
-    """
-    if os.path.exists(LOCK_FILE):
-        old_pid: int | None = None
-        try:
-            with open(LOCK_FILE, "r", encoding="utf-8") as f:
-                raw = f.read().strip()
-            # Явная валидация: PID должен быть целым положительным числом.
-            # Защищает от ситуации, когда кто-то записал в файл произвольный текст.
-            if raw.isdigit():
-                old_pid = int(raw)
-        except Exception:
-            pass
-
-        if old_pid and _is_process_running(old_pid):
-            logger.error(f"Бот уже запущен (PID {old_pid}). Останови тот процесс, прежде чем запускать новый.")
-            sys.exit(1)
+    """Атомарная блокировка ОС; PID в файле — только справочная информация."""
+    global _lock_handle
+    if _lock_handle is not None:
+        raise RuntimeError("Process lock already acquired.")
+    handle = open(LOCK_FILE, "a+b")
+    try:
+        handle.seek(0)
+        if os.name == "nt":
+            import msvcrt
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
         else:
-            logger.info("Обнаружен зависший bot.lock от завершенного процесса - перезаписываю.")
-
-    with open(LOCK_FILE, "w", encoding="utf-8") as f:
-        f.write(str(os.getpid()))
-
+            import fcntl
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        handle.seek(0)
+        handle.truncate()
+        handle.write(str(os.getpid()).encode("ascii"))
+        handle.flush()
+    except OSError:
+        handle.close()
+        logger.error("Не удалось получить bot.lock: другой экземпляр или ошибка файловой системы.")
+        raise SystemExit(1) from None
+    _lock_handle = handle
     atexit.register(release_lock)
 
 
 def release_lock():
-    try:
-        if os.path.exists(LOCK_FILE):
-            with open(LOCK_FILE, "r", encoding="utf-8") as f:
-                saved_pid = f.read().strip()
-            if saved_pid == str(os.getpid()):
-                os.remove(LOCK_FILE)
-    except Exception:
-        pass
+    global _lock_handle
+    if _lock_handle is not None:
+        # Close освобождает блокировку и при аварийном завершении процесса.
+        # Файл не удаляем: unlink позволил бы заблокировать другой inode на Linux.
+        try:
+            _lock_handle.close()
+        except OSError as e:
+            logger.error(f"Не удалось закрыть bot.lock: {type(e).__name__}.")
+        finally:
+            _lock_handle = None
 
 
 async def auto_bump_loop(bot: Bot, client: FunPayClient):
@@ -171,10 +143,38 @@ async def auto_bump_loop(bot: Bot, client: FunPayClient):
             logger.bump("Запуск цикла сканирования и поднятия лотов...")
 
             # Передаем статус тумблера для мгновенной остановки внутри funpay.py
-            success, message_text, wait_time = await client.bump_lots(
-                user_id,
-                is_cancelled=lambda: not bot_settings["auto_bump"]
-            )
+            try:
+                success, message_text, wait_time = await client.bump_lots(
+                    user_id,
+                    is_cancelled=lambda: not bot_settings["auto_bump"],
+                )
+            except _AmbiguousRaiseOutcome:
+                persistence_failed = False
+                try:
+                    disable_autobump()
+                except RuntimeError:
+                    persistence_failed = True
+                if asyncio.current_task().cancelling():
+                    if persistence_failed:
+                        raise RuntimeError("Не удалось надёжно отключить автоподнятие.") from None
+                    raise asyncio.CancelledError
+                notice = (
+                    "⚠️ Автоподнятие остановлено: не удалось сохранить безопасное "
+                    "состояние. Проверьте FunPay и настройку до перезапуска."
+                    if persistence_failed else
+                    "⚠️ Автоподнятие отключено. Результат последнего запроса "
+                    "поднятия неизвестен. Проверьте FunPay и включите "
+                    "автоподнятие вручную."
+                )
+                for recipient_id in get_all_recipients():
+                    try:
+                        await bot.send_message(recipient_id, notice)
+                    except Exception as e:
+                        logger.error(f"Не удалось отправить предупреждение об автоподнятии: {type(e).__name__}.")
+                if persistence_failed:
+                    raise RuntimeError("Не удалось надёжно отключить автоподнятие.") from None
+                last_state = False
+                continue
 
             if wait_time == 0:  # Прервано пользователем во время перебора
                 continue
@@ -268,9 +268,9 @@ async def _fetch_and_send_review(
         stars_str = "⭐" * stars if type(stars) is int and 1 <= stars <= 5 else ""
         review_text = (
             "🌟 <b>Новый отзыв</b>\n"
-            f"Покупатель: <b>{buyer}</b>\n"
+            f"Покупатель: <b>{escape(str(buyer))}</b>\n"
             + (f"Оценка: {stars_str}\n" if stars_str else "")
-            + f"Текст: {text_content}"
+            + f"Текст: {escape(text_content)}"
         )
 
         # Два пути обнаружения могут дойти сюда одновременно.
@@ -493,11 +493,15 @@ async def _supervise_tasks(bot: Bot, client: FunPayClient):
     }
     polling = tasks["telegram_polling"]
     failed = False
+    primary_error = None
     try:
         done, _ = await asyncio.wait(tasks.values(), return_when=asyncio.FIRST_COMPLETED)
         for name, task in tasks.items():
-            if task in done and task is not polling:
-                if task.cancelled() or task.exception() is None:
+            if task in done:
+                if not task.cancelled() and task.exception() is not None:
+                    if primary_error is None:
+                        primary_error = task.exception()
+                elif task is not polling:
                     logger.error(f"Критическая задача {name} неожиданно завершилась.")
                     failed = True
     finally:
@@ -524,6 +528,8 @@ async def _supervise_tasks(bot: Bot, client: FunPayClient):
                     if isinstance(result, BaseException):
                         # Текст исключения и traceback могут содержать credentials.
                         logger.error(f"Ошибка задачи {name}: {type(result).__name__}.")
+                        if primary_error is None:
+                            primary_error = result
                         failed = True
         finally:
             try:
@@ -534,6 +540,8 @@ async def _supervise_tasks(bot: Bot, client: FunPayClient):
                 logger.error(f"Не удалось дождаться Runner producer: {type(e).__name__}.")
                 failed = True
 
+    if primary_error is not None:
+        raise primary_error
     if failed:
         raise RuntimeError("Runtime остановлен из-за завершения критической задачи.") from None
 
@@ -556,6 +564,14 @@ def _validate_funpay_user_id(client: FunPayClient) -> None:
 async def main():
 
     golden_key = _require_env("FUNPAY_GOLDEN_KEY")
+    bot_token = _require_env("BOT_TOKEN")
+    try:
+        if int(_require_env("ADMIN_ID")) <= 0 or int(_require_env("FUNPAY_USER_ID")) <= 0:
+            raise ValueError
+    except ValueError:
+        raise RuntimeError("ADMIN_ID и FUNPAY_USER_ID должны быть положительными числовыми ID.") from None
+    # Каждый новый process lifecycle требует явного ручного включения.
+    disable_autobump()
     # ОДИН общий клиент/аккаунт на весь бот - и для поднятия лотов, и для уведомлений.
     client = FunPayClient(golden_key)
 
@@ -586,13 +602,13 @@ async def main():
     if os.name == "nt":
         # Обновляем заголовок окна cmd, если бот запущен через .bat на Windows.
         # На сервере (Linux) os.name == "posix", эта строка просто не выполнится.
-        os.system(f"title FunPay Bot - {client.account.username}")
+        os.system("title FunPay Bot")
 
-    bot = Bot(token=_require_env("BOT_TOKEN"))
-    logger.success("Бот подключен к Telegram. Запуск фоновых процессов...")
+    bot = Bot(token=bot_token)
 
     runtime_ready = False
     try:
+        logger.success("Бот подключен к Telegram. Запуск фоновых процессов...")
         await _send_runtime_notice(bot, "🟢 Бот запущен.")
         runtime_ready = True
         set_runtime_status_context(client)
@@ -625,8 +641,16 @@ async def main():
 
 def run():
     """Точка входа для `uv run funpay-bot` (project.scripts)."""
-    acquire_lock()
-    asyncio.run(main())
+    try:
+        acquire_lock()
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
+    except Exception as e:
+        logger.error(f"Бот завершён с ошибкой: {type(e).__name__}.")
+        raise SystemExit(1) from None
+    finally:
+        release_lock()
 
 
 if __name__ == "__main__":

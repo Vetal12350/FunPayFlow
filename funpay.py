@@ -5,6 +5,7 @@ import random
 import re
 import queue
 import threading
+from html import escape
 import requests
 from bs4 import BeautifulSoup
 import FunPayAPI
@@ -14,6 +15,10 @@ import logger
 
 class _AutobumpActionCancelled(Exception):
     """Отмена поднятия до отправки запроса."""
+
+
+class _AmbiguousRaiseOutcome(Exception):
+    """Результат modifying lots/raise неизвестен; автоподнятие приостановлено."""
 
 
 class _RunnerStopRequested(BaseException):
@@ -348,12 +353,22 @@ class FunPayClient:
     # событий" в Runner'е. Поэтому поднятие лотов теперь идет через официальный
     # self.account.raise_lots(...) - он использует ТУ ЖЕ сессию, что и Runner,
     # и сам поднимает все разделы (node_id), относящиеся к переданной категории.
-    # Он же кидает FunPayAPI.exceptions.RaiseError с уже готовым wait_time в
-    # секундах - больше не нужно парсить текст ошибки регулярками (что раньше
-    # ломалось на ответах вида "Подождите 4 секунды" и ставило кулдаун 7200 сек).
+    # RaiseError библиотеки приходит после ответа сервера, но не доказывает,
+    # что modifying action не успело выполниться; такой исход приостанавливает
+    # автоподнятие до явного включения пользователем.
 
     async def bump_lots(self, user_id: int, is_cancelled=None):
         abandoned = threading.Event()
+        transport_started = threading.Event()
+        boundary_lock = threading.Lock()
+
+        def _allow_raise():
+            # Синхронизируем late gate с отменой ожидающей coroutine.
+            with boundary_lock:
+                if abandoned.is_set() or (is_cancelled and is_cancelled()):
+                    return False
+                transport_started.set()
+                return True
 
         def _raise_if_active(game_id):
             # to_thread может начать работу уже после отмены ожидающей coroutine.
@@ -362,9 +377,7 @@ class FunPayClient:
             with self._account_lock:
                 if abandoned.is_set() or (is_cancelled and is_cancelled()):
                     return False
-                self._raise_action_gate.is_allowed = lambda: (
-                    not abandoned.is_set() and (is_cancelled is None or not is_cancelled())
-                )
+                self._raise_action_gate.is_allowed = _allow_raise
                 try:
                     self.account.raise_lots(game_id)
                 except _AutobumpActionCancelled:
@@ -437,80 +450,37 @@ class FunPayClient:
             try:
                 # account.raise_lots сам поднимает ВСЕ разделы (node_id) данной
                 # категории через уже авторизованную сессию self.account.
-                if not await asyncio.to_thread(_raise_if_active, game_id):
-                    return False, "Автоподнятие остановлено.", 0
-
-                wait_time = 7200
-                next_time = time.time() + wait_time
-                self.raise_time[game_id] = next_time
-                # Храним кортеж: (имя игры, кол-во разделов, время кулдауна) — для красивого Telegram-сообщения
-                raised_cats.append((game_name, node_count, wait_time))
-                logger.success(f"[BUMP] ✅ {display_name}: поднята")
+                performed = await asyncio.to_thread(_raise_if_active, game_id)
 
             except asyncio.CancelledError:
-                abandoned.set()
+                with boundary_lock:
+                    abandoned.set()
+                    uncertain = transport_started.is_set()
+                if uncertain:
+                    raise _AmbiguousRaiseOutcome() from None
                 raise
 
-            except FunPayAPI.exceptions.RaiseError as e:
-                # У этой версии библиотеки error_message часто пустой, а str(e) -
-                # некрасивый полный дамп запроса/ответа вместо человеческого текста.
-                # Достаем настоящее сообщение FunPay напрямую из тела ответа.
-                raw_msg = None
-                for attr in ("error_message", "msg", "message"):
-                    val = getattr(e, attr, None)
-                    if val:
-                        raw_msg = str(val)
-                        break
-                if not raw_msg:
-                    resp = getattr(e, "response", None)
-                    if resp is not None:
-                        try:
-                            raw_msg = resp.json().get("msg")
-                        except Exception:
-                            pass
-                error_msg = raw_msg or "Кулдаун (сервер не прислал текст ошибки)"
-
-                # wait_time от библиотеки тоже не всегда парсится верно (иногда None
-                # даже когда текст ошибки содержит конкретное время) - на этот случай
-                # парсим сами: часы/минуты/секунды в тексте FunPay.
-                wait_time = None
-                lib_wait = getattr(e, "wait_time", None)
-                if lib_wait:
-                    wait_time = int(lib_wait)
-                else:
-                    text_lower = error_msg.lower()
-                    num_match = re.search(r'(\d+)', text_lower)
-                    if num_match:
-                        if "час" in text_lower:
-                            wait_time = int(num_match.group(1)) * 3600
-                        elif "минут" in text_lower:
-                            wait_time = int(num_match.group(1)) * 60
-                        elif "секунд" in text_lower:
-                            wait_time = int(num_match.group(1)) + 2
-
-                if not wait_time:
-                    wait_time = 7200
-                wait_time = max(wait_time, 1)
-
-                next_time = time.time() + wait_time
-                self.raise_time[game_id] = next_time
-                min_wait = min(min_wait, wait_time)
-                cooldown_count += 1
-                # Было logger.debug() - без DEBUG=1 в .env эта строка не
-                # печаталась ВООБЩЕ, из-за чего снаружи казалось, что бот
-                # ничего не делает, хотя он честно ставил лоты на кулдаун.
-                # Это обычная штатная работа, а не ошибка - поэтому bump(),
-                # а не warning()/error().
-                logger.bump(f"[{display_name}] на кулдауне (~{wait_time} сек)")
-
             except Exception as e:
-                # Сетевые/непредвиденные ошибки - короткий повтор, а не 2 часа простоя
-                wait_time = random.randint(30, 60)
-                logger.error(f"[{display_name}] непредвиденная ошибка при поднятии: {type(e).__name__} (~{wait_time} сек)")
-                next_time = time.time() + wait_time
-                self.raise_time[game_id] = next_time
-                min_wait = min(min_wait, wait_time)
-                cooldown_count += 1
+                if not transport_started.is_set():
+                    # Ошибка возникла до Account.method("lots/raise");
+                    # modifying transport ещё не начинался.
+                    logger.error(f"Не удалось подготовить lots/raise: {type(e).__name__}.")
+                    return False, "Не удалось подготовить поднятие лотов.", 600
+                # Даже RaiseError после ответа сервера не доказывает, что
+                # modifying request не имел побочных эффектов.
+                logger.error(f"Результат lots/raise неизвестен: {type(e).__name__}.")
+                raise _AmbiguousRaiseOutcome() from None
+
+            if not performed:
+                return False, "Автоподнятие остановлено.", 0
+
+            transport_started.clear()
+            wait_time = 7200
+            next_time = time.time() + wait_time
+            self.raise_time[game_id] = next_time
+            # Храним кортеж: (имя игры, кол-во разделов, время кулдауна) — для красивого Telegram-сообщения
+            raised_cats.append((game_name, node_count, wait_time))
+            logger.success(f"[BUMP] ✅ {display_name}: поднята")
 
         min_wait_final = max(min_wait, 60)
 
@@ -522,7 +492,7 @@ class FunPayClient:
                 msg_lines.append("")
                 time_str = _format_seconds(w_time)
                 logger.success(f"Лот поднят: {g_name}")
-                msg_lines.append(f"🎮 <b>{g_name}</b>")
+                msg_lines.append(f"🎮 <b>{escape(str(g_name))}</b>")
                 msg_lines.append(f"⏰ Следующий подъём через {time_str}")
             summary_text = "\n".join(msg_lines)
         else:
@@ -947,7 +917,7 @@ class FunPayClient:
                         # Остальные системные сообщения игнорируем
                         return results
 
-                author = getattr(chat, "name", None) or "Покупатель"
+                author = escape(str(getattr(chat, "name", None) or "Покупатель"))
                 chat_link = f"https://funpay.com/chat/?node={chat_id}" if chat_id is not None else None
 
                 if chat_link:
@@ -959,7 +929,7 @@ class FunPayClient:
                     self._notified_unread_chats[chat_id] = now
 
                 text = (
-                    f"На аккаунте {self.account.username} есть непрочитанные сообщения.\n"
+                    f"На аккаунте {escape(str(self.account.username))} есть непрочитанные сообщения.\n"
                     f"{who_line}"
                 )
                 results.append(("notify_message", text))
@@ -972,9 +942,9 @@ class FunPayClient:
 
                 text = (
                     "💰 <b>Оплачен новый заказ</b>\n"
-                    f"Покупатель: <b>{buyer}</b>\n"
-                    f"Сумма: {amount}\n"
-                    f"Описание: {descr}"
+                    f"Покупатель: <b>{escape(str(buyer))}</b>\n"
+                    f"Сумма: {escape(str(amount))}\n"
+                    f"Описание: {escape(str(descr))}"
                 )
                 results.append(("notify_order", text))
 
@@ -990,8 +960,8 @@ class FunPayClient:
                 if closed_status is not None and status == closed_status:
                     text = (
                         "✅ <b>Заказ закрыт покупателем</b>\n"
-                        f"Покупатель: <b>{buyer}</b>\n"
-                        f"№ заказа: {order_id}"
+                        f"Покупатель: <b>{escape(str(buyer))}</b>\n"
+                        f"№ заказа: {escape(str(order_id))}"
                     )
                     results.append(("notify_order", text))
 
@@ -1014,8 +984,8 @@ class FunPayClient:
                 elif refunded_status is not None and status == refunded_status:
                     text = (
                         "↩️ <b>Оформлен возврат по заказу</b>\n"
-                        f"Покупатель: <b>{buyer}</b>\n"
-                        f"№ заказа: {order_id}"
+                        f"Покупатель: <b>{escape(str(buyer))}</b>\n"
+                        f"№ заказа: {escape(str(order_id))}"
                     )
                     results.append(("notify_order", text))
 
