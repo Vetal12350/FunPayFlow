@@ -425,9 +425,22 @@ async def _supervise_tasks(bot: Bot, client: FunPayClient):
         raise RuntimeError("Runtime остановлен из-за завершения критической задачи.") from None
 
 
-async def main():
+def _validate_funpay_user_id(client: FunPayClient) -> None:
+    """Разрешает runtime только для ID инициализированного Account."""
+    try:
+        configured_id = int(_require_env("FUNPAY_USER_ID"))
+    except ValueError:
+        logger.error("FUNPAY_USER_ID должен быть положительным числовым ID.")
+        raise RuntimeError("Невалидный FUNPAY_USER_ID.") from None
 
-    bot = Bot(token=_require_env("BOT_TOKEN"))
+    account_id = client.account.id if client.account.is_initiated else None
+    if (type(account_id) is not int or account_id <= 0
+            or configured_id <= 0 or configured_id != account_id):
+        logger.error("FUNPAY_USER_ID не соответствует авторизованному аккаунту FunPay.")
+        raise RuntimeError("FUNPAY_USER_ID не соответствует авторизованному аккаунту FunPay.") from None
+
+
+async def main():
 
     golden_key = _require_env("FUNPAY_GOLDEN_KEY")
     # ОДИН общий клиент/аккаунт на весь бот - и для поднятия лотов, и для уведомлений.
@@ -443,15 +456,19 @@ async def main():
     # похоже, это и приводит к "Необходимая cookie отсутствует или устарела".
     try:
         await asyncio.to_thread(client.account.get)
-        logger.banner(client.account.username)
-        logger.success(f"Сессия FunPay инициализирована (аккаунт: {client.account.username}).")
-        if os.name == "nt":
-            # Обновляем заголовок окна cmd, если бот запущен через .bat на Windows.
-            # На сервере (Linux) os.name == "posix", эта строка просто не выполнится.
-            os.system(f"title FunPay Bot - {client.account.username}")
-    except Exception as e:
-        logger.error(f"Не удалось получить начальную сессию FunPay: {e}")
+    except Exception:
+        logger.error("Не удалось инициализировать сессию FunPay.")
+        raise RuntimeError("Начальная сессия FunPay не инициализирована.") from None
 
+    _validate_funpay_user_id(client)
+    logger.banner(client.account.username)
+    logger.success(f"Сессия FunPay инициализирована (аккаунт: {client.account.username}).")
+    if os.name == "nt":
+        # Обновляем заголовок окна cmd, если бот запущен через .bat на Windows.
+        # На сервере (Linux) os.name == "posix", эта строка просто не выполнится.
+        os.system(f"title FunPay Bot - {client.account.username}")
+
+    bot = Bot(token=_require_env("BOT_TOKEN"))
     logger.success("Бот подключен к Telegram. Запуск фоновых процессов...")
 
     try:
