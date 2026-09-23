@@ -10,6 +10,7 @@ from aiogram import Bot
 
 load_dotenv()
 
+import FunPayAPI
 from telegram import (dp, bot_settings, get_user_settings, get_all_recipients,
                       set_runtime_status_context, clear_runtime_status_context)
 from funpay import FunPayClient
@@ -308,6 +309,25 @@ async def _fetch_and_send_review(
         logger.notify(f"Не удалось проверить отзыв: {type(e).__name__}.")
 
 
+def _order_observation(event) -> tuple[str, str] | None:
+    """Извлекает только ID и проверенный статус уже полученного события продажи."""
+    if event.type not in (FunPayAPI.enums.EventTypes.NEW_ORDER,
+                          FunPayAPI.enums.EventTypes.ORDER_STATUS_CHANGED):
+        return None
+    order = getattr(event, "order", None)
+    order_id = getattr(order, "id", None)
+    status = getattr(order, "status", None)
+    status_names = (
+        (FunPayAPI.types.OrderStatuses.PAID, "PAID"),
+        (FunPayAPI.types.OrderStatuses.CLOSED, "CLOSED"),
+        (FunPayAPI.types.OrderStatuses.REFUNDED, "REFUNDED"),
+    )
+    for known_status, name in status_names:
+        if status == known_status:
+            return order_id, name
+    raise StateError("Order event status unavailable.")
+
+
 async def notifications_loop(bot: Bot, client: FunPayClient):
     """
     Слушает события FunPay (новые сообщения, заказы, закрытие заказа, отзывы)
@@ -369,6 +389,19 @@ async def notifications_loop(bot: Bot, client: FunPayClient):
                 raise RuntimeError("Runner producer неожиданно завершился.") from None
             if review_failed:
                 raise RuntimeError("Review task unexpectedly failed.") from None
+
+            observation = _order_observation(event)
+            if observation is not None:
+                try:
+                    await asyncio.to_thread(
+                        client.review_state.record_order_observation, *observation
+                    )
+                except StateError:
+                    logger.error("Order statistics write failed: StateError.")
+                    raise
+                except Exception as e:
+                    logger.error(f"Order statistics write failed: {type(e).__name__}.")
+                    raise StateError("Persistent order write failed.") from None
 
             for setting_key, text in client.describe_event(event):
                 # _review_check_immediate — отзыв поймали через NEW_FEEDBACK в чате, сразу проверяем
