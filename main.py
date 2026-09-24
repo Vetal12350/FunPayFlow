@@ -18,6 +18,8 @@ import FunPayAPI
 from telegram import (dp, bot_settings, get_user_settings, get_all_recipients,
                       set_runtime_status_context, clear_runtime_status_context,
                       disable_autobump, get_reply_keyboard, is_night_mode_enabled,
+                      is_safe_mode_enabled, record_withdrawal_poll,
+                      set_telegram_polling_state, _set_problem, _audit_action,
                       get_night_mode_reply_text, match_autoresponder, _expand_template,
                       expand_review_request_text, is_review_request_enabled)
 from funpay import FunPayClient, _AmbiguousRaiseOutcome
@@ -145,6 +147,9 @@ async def auto_bump_loop(bot: Bot, client: FunPayClient):
             last_state = current_state
 
         # 2. Если тумблер включен - запускаем работу
+        if current_state and is_safe_mode_enabled():
+            await asyncio.sleep(1)
+            continue
         if current_state:
             logger.bump("Запуск цикла сканирования и поднятия лотов...")
 
@@ -152,7 +157,7 @@ async def auto_bump_loop(bot: Bot, client: FunPayClient):
             try:
                 success, message_text, wait_time = await client.bump_lots(
                     user_id,
-                    is_cancelled=lambda: not bot_settings["auto_bump"],
+                    is_cancelled=lambda: not bot_settings["auto_bump"] or is_safe_mode_enabled(),
                 )
             except _AmbiguousRaiseOutcome:
                 persistence_failed = False
@@ -370,12 +375,12 @@ async def _send_night_mode_reply(
     client: FunPayClient, value: str | tuple[str, int | None], kind: str,
 ) -> None:
     """Старый автоответ, с повторной проверкой тумблера под Account RLock."""
-    if not is_night_mode_enabled():
+    if not is_night_mode_enabled() or is_safe_mode_enabled():
         return
 
     def send_if_enabled() -> bool:
         with client._account_lock:
-            if not is_night_mode_enabled():
+            if not is_night_mode_enabled() or is_safe_mode_enabled():
                 return False
             if kind == "message":
                 chat_id = int(value) if value.isdecimal() else None
@@ -392,7 +397,7 @@ async def _send_night_mode_reply(
                     chat_id = fallback_chat_id
             if type(chat_id) is not int or chat_id <= 0:
                 return False
-            if not is_night_mode_enabled():
+            if not is_night_mode_enabled() or is_safe_mode_enabled():
                 return False
             client.account.send_message(
                 chat_id,
@@ -475,9 +480,12 @@ async def _maybe_autorespond(client: FunPayClient, event, seen: dict, cooldowns:
             cooldowns.pop(expired, None)
         while len(cooldowns) > 10000:
             cooldowns.pop(next(iter(cooldowns)))
+    send_attempted = False
     try:
         value = _expand_template(template["text"], chat_name, account_name)
         if not value.strip() or len(value) > 2000:
+            return True
+        if is_safe_mode_enabled():
             return True
         # The verified history message has a stable server ID. Claim before transport:
         # a restart must not repeat an ambiguous or already-started send.
@@ -485,12 +493,19 @@ async def _maybe_autorespond(client: FunPayClient, event, seen: dict, cooldowns:
             client.review_state.claim_autoresponse, chat_id, message_id, rule["id"],
         ):
             return True
-        await asyncio.to_thread(
+        send_attempted = True
+        sent = await asyncio.to_thread(
             client.send_message_once, chat_id, value,
-            enabled_check=lambda: bot_settings["autoresponder_enabled"],
+            enabled_check=lambda: bot_settings["autoresponder_enabled"]
+            and not is_safe_mode_enabled(),
         )
+        await asyncio.to_thread(_audit_action, "automation", "AUTO_RESPONSE_SEND", "chat",
+                                "BLOCKED" if sent is False else "SUCCESS")
     except Exception as e:
         logger.warning(f"Autoresponder result unconfirmed: {type(e).__name__}.")
+        if send_attempted:
+            await asyncio.to_thread(_audit_action, "automation", "AUTO_RESPONSE_SEND", "chat",
+                                    "AMBIGUOUS")
     return True
 
 
@@ -510,60 +525,76 @@ async def _send_scheduled_review_request(
     """Pending survives restart; claim becomes ambiguous before the one send attempt."""
     await asyncio.sleep(max(0, scheduled_at - time.time()))
     store = client.review_state
-    if not is_review_request_enabled():
-        await asyncio.to_thread(store.discard_pending_review_request, order_id)
-        return
-    if await asyncio.to_thread(store.has_review_observation, order_id):
-        await asyncio.to_thread(store.discard_pending_review_request, order_id)
-        return
-    try:
-        order, account_id = await asyncio.to_thread(client.get_order_snapshot, order_id)
-        if (getattr(order, "status", None) is not FunPayAPI.types.OrderStatuses.CLOSED
-                or getattr(order, "buyer_username", None) != buyer
-                or getattr(order, "seller_id", None) != account_id):
+    while True:
+        if not is_review_request_enabled():
             await asyncio.to_thread(store.discard_pending_review_request, order_id)
             return
-        if getattr(order, "review", None) is not None:
-            await asyncio.to_thread(store.record_review_observation, order_id)
+        if await asyncio.to_thread(store.has_review_observation, order_id):
             await asyncio.to_thread(store.discard_pending_review_request, order_id)
             return
-        context = await asyncio.to_thread(_review_chat_context, client, buyer)
-        if context is None:
-            logger.warning("Review request skipped: chat unavailable.")
+        if is_safe_mode_enabled():
+            await asyncio.sleep(1)
+            continue
+        try:
+            order, account_id = await asyncio.to_thread(client.get_order_snapshot, order_id)
+            if (getattr(order, "status", None) is not FunPayAPI.types.OrderStatuses.CLOSED
+                    or getattr(order, "buyer_username", None) != buyer
+                    or getattr(order, "seller_id", None) != account_id):
+                await asyncio.to_thread(store.discard_pending_review_request, order_id)
+                return
+            if getattr(order, "review", None) is not None:
+                await asyncio.to_thread(store.record_review_observation, order_id)
+                await asyncio.to_thread(store.discard_pending_review_request, order_id)
+                return
+            context = await asyncio.to_thread(_review_chat_context, client, buyer)
+            if context is None:
+                logger.warning("Review request skipped: chat unavailable.")
+                return
+            chat_id, account_name = context
+            value = expand_review_request_text(
+                bot_settings["review_request_text"], account_name, buyer, order_id,
+            )
+            if not value.strip() or len(value) > 2000:
+                logger.warning("Review request skipped: invalid text.")
+                return
+        except Exception as e:
+            logger.warning(f"Review request verification unavailable: {type(e).__name__}.")
             return
-        chat_id, account_name = context
-        value = expand_review_request_text(
-            bot_settings["review_request_text"], account_name, buyer, order_id,
-        )
-        if not value.strip() or len(value) > 2000:
-            logger.warning("Review request skipped: invalid text.")
+        if not is_review_request_enabled():
+            await asyncio.to_thread(store.discard_pending_review_request, order_id)
             return
-    except Exception as e:
-        logger.warning(f"Review request verification unavailable: {type(e).__name__}.")
+        if await asyncio.to_thread(store.has_review_observation, order_id):
+            await asyncio.to_thread(store.discard_pending_review_request, order_id)
+            return
+        if is_safe_mode_enabled():
+            continue
+        # Never repeat a send after a crash or ambiguous transport result.
+        if not await asyncio.to_thread(store.claim_review_request, order_id, int(time.time())):
+            return
+        if not is_review_request_enabled():
+            return
+        if is_safe_mode_enabled():
+            await asyncio.to_thread(store.release_unstarted_review_request, order_id)
+            continue
+        try:
+            sent = await asyncio.to_thread(
+                client.send_message_once, chat_id, value,
+                enabled_check=lambda: is_review_request_enabled() and not is_safe_mode_enabled(),
+            )
+        except Exception as e:
+            logger.warning(f"Review request result ambiguous: {type(e).__name__}.")
+            await asyncio.to_thread(_audit_action, "automation", "REVIEW_REQUEST_SEND", "order", "AMBIGUOUS")
+            return
+        if sent is False:
+            if is_safe_mode_enabled() and is_review_request_enabled():
+                await asyncio.to_thread(store.release_unstarted_review_request, order_id)
+                continue
+            await asyncio.to_thread(store.discard_unstarted_review_request, order_id)
+            await asyncio.to_thread(_audit_action, "automation", "REVIEW_REQUEST_SEND", "order", "BLOCKED")
+            return
+        await asyncio.to_thread(store.mark_review_request_sent, order_id, int(time.time()))
+        await asyncio.to_thread(_audit_action, "automation", "REVIEW_REQUEST_SEND", "order", "SUCCESS")
         return
-    if not is_review_request_enabled():
-        await asyncio.to_thread(store.discard_pending_review_request, order_id)
-        return
-    if await asyncio.to_thread(store.has_review_observation, order_id):
-        await asyncio.to_thread(store.discard_pending_review_request, order_id)
-        return
-    # Never repeat a send after a crash or ambiguous transport result.
-    if not await asyncio.to_thread(store.claim_review_request, order_id, int(time.time())):
-        return
-    if not is_review_request_enabled():
-        return
-    try:
-        sent = await asyncio.to_thread(
-            client.send_message_once, chat_id, value,
-            enabled_check=is_review_request_enabled,
-        )
-    except Exception as e:
-        logger.warning(f"Review request result ambiguous: {type(e).__name__}.")
-        return
-    if sent is False:
-        await asyncio.to_thread(store.discard_unstarted_review_request, order_id)
-        return
-    await asyncio.to_thread(store.mark_review_request_sent, order_id, int(time.time()))
 
 
 def _order_observation(event) -> tuple[str, str] | None:
@@ -658,6 +689,7 @@ async def notifications_loop(bot: Bot, client: FunPayClient):
         error = task.exception()
         if error is not None:
             logger.error(f"Review task failed: {type(error).__name__}.")
+            _set_problem("REVIEW_WORKER")
             review_failed = True
 
     def start_review_check(order_id: str, delay: float) -> None:
@@ -681,6 +713,7 @@ async def notifications_loop(bot: Bot, client: FunPayClient):
             request_tasks.pop(order_id, None)
             if not completed.cancelled() and completed.exception() is not None:
                 logger.error(f"Review request task failed: {type(completed.exception()).__name__}.")
+                _set_problem("REVIEW_WORKER")
                 review_failed = True
         task.add_done_callback(done)
 
@@ -805,7 +838,9 @@ async def withdrawals_poll_loop(client: FunPayClient):
             raise
         except Exception as e:
             logger.warning(f"Withdrawal poll failed: {type(e).__name__}.")
+            record_withdrawal_poll(False)
         else:
+            record_withdrawal_poll(True)
             for transaction_id, amount, currency in completed:
                 await asyncio.to_thread(
                     client.review_state.record_withdrawal_observation,
@@ -860,6 +895,7 @@ async def _supervise_tasks(bot: Bot, client: FunPayClient):
         "withdrawals": asyncio.create_task(withdrawals_poll_loop(client), name="withdrawals"),
         "session_refresh": asyncio.create_task(session_refresh_loop(client), name="session_refresh"),
     }
+    set_telegram_polling_state(True)
     polling = tasks["telegram_polling"]
     failed = False
     primary_error = None
@@ -872,6 +908,7 @@ async def _supervise_tasks(bot: Bot, client: FunPayClient):
                         primary_error = task.exception()
                 elif task is not polling:
                     logger.error(f"Критическая задача {name} неожиданно завершилась.")
+                    _set_problem("CRITICAL_TASK")
                     failed = True
     finally:
         client.stop_runner()
@@ -897,6 +934,7 @@ async def _supervise_tasks(bot: Bot, client: FunPayClient):
                     if isinstance(result, BaseException):
                         # Текст исключения и traceback могут содержать credentials.
                         logger.error(f"Ошибка задачи {name}: {type(result).__name__}.")
+                        _set_problem("CRITICAL_TASK")
                         if primary_error is None:
                             primary_error = result
                         failed = True
@@ -910,9 +948,12 @@ async def _supervise_tasks(bot: Bot, client: FunPayClient):
                 failed = True
 
     if primary_error is not None:
+        set_telegram_polling_state(False)
         raise primary_error
     if failed:
+        set_telegram_polling_state(False)
         raise RuntimeError("Runtime остановлен из-за завершения критической задачи.") from None
+    set_telegram_polling_state(False)
 
 
 def _validate_funpay_user_id(client: FunPayClient) -> None:

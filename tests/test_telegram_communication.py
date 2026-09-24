@@ -116,6 +116,7 @@ class CommunicationTests(unittest.IsolatedAsyncioTestCase):
                     and n.name == "_send_night_mode_reply")
         namespace = {"FunPayClient": object, "asyncio": asyncio,
                      "is_night_mode_enabled": ui.is_night_mode_enabled,
+                     "is_safe_mode_enabled": ui.is_safe_mode_enabled,
                      "get_night_mode_reply_text": ui.get_night_mode_reply_text,
                      "logger": SimpleNamespace(notify=lambda *args: None,
                                                warning=lambda *args: None)}
@@ -128,6 +129,39 @@ class CommunicationTests(unittest.IsolatedAsyncioTestCase):
         ui.bot_settings["night_mode"] = False
         await namespace["_send_night_mode_reply"](ui._runtime_client, "2", "message")
         self.assertEqual(len(self.account.sent), 1)
+
+    async def test_safe_mode_blocks_night_mode_auto_send(self):
+        source = Path("main.py").read_text(encoding="utf-8")
+        node = next(n for n in ast.parse(source).body if isinstance(n, ast.AsyncFunctionDef)
+                    and n.name == "_send_night_mode_reply")
+        namespace = {"FunPayClient": object, "asyncio": asyncio,
+                     "is_night_mode_enabled": ui.is_night_mode_enabled,
+                     "is_safe_mode_enabled": ui.is_safe_mode_enabled,
+                     "get_night_mode_reply_text": ui.get_night_mode_reply_text,
+                     "logger": SimpleNamespace(notify=lambda *args: None,
+                                               warning=lambda *args: None)}
+        exec(compile(ast.Module(body=[node], type_ignores=[]), "main.py", "exec"), namespace)
+        ui.bot_settings["night_mode"] = True
+        ui.bot_settings["safe_mode"] = True
+        await namespace["_send_night_mode_reply"](ui._runtime_client, "2", "message")
+        self.assertEqual(self.account.sent, [])
+
+        entered, release = threading.Event(), threading.Event()
+
+        def prepare_chat(name):
+            entered.set()
+            release.wait(2)
+            return SimpleNamespace(id=2)
+
+        self.account.get_chat_by_name = prepare_chat
+        ui.bot_settings["safe_mode"] = False
+        task = asyncio.create_task(namespace["_send_night_mode_reply"](
+            ui._runtime_client, ("Buyer2", 2), "order"))
+        self.assertTrue(await asyncio.to_thread(entered.wait, 2))
+        ui.bot_settings["safe_mode"] = True
+        release.set()
+        await asyncio.wait_for(task, 2)
+        self.assertEqual(self.account.sent, [])
 
     async def test_chats_pagination_and_safe_preview(self):
         self.assertEqual([[b.text for b in row] for row in ui.get_reply_keyboard().keyboard],

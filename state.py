@@ -261,6 +261,16 @@ class ReviewReceiptStore:
                         "CREATE INDEX IF NOT EXISTS idx_review_observed_time "
                         "ON review_observations(observed_at, order_id)"
                     )
+                    connection.execute(
+                        "CREATE TABLE IF NOT EXISTS audit_events ("
+                        "id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, "
+                        "actor TEXT NOT NULL, action TEXT NOT NULL, target TEXT NOT NULL, "
+                        "result TEXT NOT NULL, details_safe TEXT)"
+                    )
+                    connection.execute(
+                        "CREATE INDEX IF NOT EXISTS idx_audit_events_recent "
+                        "ON audit_events(ts DESC, id DESC)"
+                    )
                     if connection.execute("PRAGMA quick_check").fetchone() != ("ok",):
                         raise StateError("Persistent state integrity check failed.")
         except (sqlite3.Error, OSError):
@@ -459,6 +469,20 @@ class ReviewReceiptStore:
                     connection.execute(
                         "DELETE FROM review_requests WHERE order_id = ? "
                         "AND state = 'ambiguous' AND sent_at IS NULL", (order_id,),
+                    )
+        except (sqlite3.Error, OSError):
+            raise StateError("Persistent review request write failed.") from None
+
+    def release_unstarted_review_request(self, order_id: str) -> None:
+        """Return a claimed request to pending only when a send gate denied transport."""
+        self._require_order_id(order_id)
+        try:
+            with closing(self._connect()) as connection:
+                with connection:
+                    connection.execute(
+                        "UPDATE review_requests SET state = 'pending' "
+                        "WHERE order_id = ? AND state = 'ambiguous' AND sent_at IS NULL",
+                        (order_id,),
                     )
         except (sqlite3.Error, OSError):
             raise StateError("Persistent review request write failed.") from None
@@ -898,6 +922,72 @@ class ReviewReceiptStore:
                 }
         except (sqlite3.Error, OSError, InvalidOperation):
             raise StateError("Sales analytics read failed.") from None
+
+    def record_audit_event(self, actor: str, action: str, target: str,
+                           result: str, details_safe: str | None = None) -> None:
+        """Only fixed action metadata is accepted; never persist message bodies."""
+        allowed_actions = {
+            "AUTOBUMP", "NIGHT_MODE", "AUTORESPONDER", "REVIEW_REQUEST",
+            "SAFE_MODE", "TEMPLATE", "RULE", "MANUAL_SEND", "AUTO_RESPONSE_SEND",
+            "REVIEW_REQUEST_SEND", "SETTINGS",
+        }
+        allowed_results = {"ON", "OFF", "CREATED", "UPDATED", "DELETED",
+                           "SUCCESS", "FAILED", "BLOCKED", "AMBIGUOUS"}
+        allowed_targets = {"global", "chat", "template", "rule", "order", "settings"}
+        if (not (actor in ("system", "automation") or
+                 (type(actor) is str and re.fullmatch(r"telegram:[1-9][0-9]{0,19}", actor)))
+                or action not in allowed_actions or target not in allowed_targets
+                or result not in allowed_results or details_safe is not None):
+            raise StateError("Invalid audit metadata.")
+        try:
+            with closing(self._connect()) as connection:
+                with connection:
+                    connection.execute(
+                        "INSERT INTO audit_events (ts, actor, action, target, result, details_safe) "
+                        "VALUES (?, ?, ?, ?, ?, NULL)",
+                        (int(time.time()), actor, action, target, result),
+                    )
+        except (sqlite3.Error, OSError):
+            raise StateError("Audit write failed.") from None
+
+    def list_audit_events(self, page: int = 0) -> tuple[int, list[dict]]:
+        if type(page) is not int or page < 0 or page > 100000:
+            raise StateError("Invalid audit page.")
+        try:
+            with closing(self._connect()) as connection:
+                connection.row_factory = sqlite3.Row
+                count = connection.execute("SELECT COUNT(*) FROM audit_events").fetchone()[0]
+                rows = connection.execute(
+                    "SELECT id, ts, actor, action, target, result, details_safe "
+                    "FROM audit_events ORDER BY ts DESC, id DESC LIMIT 20 OFFSET ?",
+                    (page * 20,),
+                ).fetchall()
+                return count, [dict(row) for row in rows]
+        except (sqlite3.Error, OSError):
+            raise StateError("Audit read failed.") from None
+
+    def get_audit_event(self, event_id: int) -> dict | None:
+        if type(event_id) is not int or event_id <= 0:
+            raise StateError("Invalid audit ID.")
+        try:
+            with closing(self._connect()) as connection:
+                connection.row_factory = sqlite3.Row
+                row = connection.execute(
+                    "SELECT id, ts, actor, action, target, result, details_safe "
+                    "FROM audit_events WHERE id = ?", (event_id,),
+                ).fetchone()
+                return dict(row) if row else None
+        except (sqlite3.Error, OSError):
+            raise StateError("Audit read failed.") from None
+
+    def count_pending_review_requests(self) -> int:
+        try:
+            with closing(self._connect()) as connection:
+                return connection.execute(
+                    "SELECT COUNT(*) FROM review_requests WHERE state = 'pending'"
+                ).fetchone()[0]
+        except (sqlite3.Error, OSError):
+            raise StateError("Persistent review request read failed.") from None
 
     def get_order_statistics(self, now_utc: int | None = None) -> dict[str, dict[str, int]]:
         """Считает только впервые увиденные ботом заказы, по UTC."""

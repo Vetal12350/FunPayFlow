@@ -46,6 +46,102 @@ async def _send_log_file(target: Message | CallbackQuery, date_str: str) -> None
 
 _runtime_client: FunPayClient | None = None
 _runtime_started_at: float | None = None
+_telegram_polling_active: bool | None = None
+_withdrawal_failures = 0
+_last_withdrawal_success_monotonic: float | None = None
+_problems_lock = threading.Lock()
+_active_problems: dict[str, dict] = {}
+_PROBLEM_TYPES = {
+    "RUNNER_STOPPED": ("ERROR", "FunPay Runner остановлен."),
+    "RUNNER_RETRYING": ("WARNING", "Повторяются ошибки FunPay Runner."),
+    "QUEUE_PRESSURE": ("WARNING", "Очередь событий близка к заполнению."),
+    "DB_UNAVAILABLE": ("ERROR", "Persistent SQLite недоступна."),
+    "WITHDRAWAL_REPEATED": ("WARNING", "Повторяются ошибки проверки выводов."),
+    "REVIEW_WORKER": ("ERROR", "Задача проверки отзывов остановилась с ошибкой."),
+    "SETTINGS_PERSISTENCE": ("ERROR", "Не удалось сохранить настройки."),
+    "AUDIT_UNAVAILABLE": ("WARNING", "Журнал действий временно недоступен."),
+    "CRITICAL_TASK": ("ERROR", "Критическая фоновая задача остановилась."),
+}
+
+
+def _set_problem(code: str) -> bool:
+    if code not in _PROBLEM_TYPES:
+        raise ValueError("Invalid problem code.")
+    now = int(time.time())
+    severity, description = _PROBLEM_TYPES[code]
+    with _problems_lock:
+        previous = _active_problems.get(code)
+        _active_problems[code] = {
+            "code": code, "severity": severity, "description": description,
+            "first_seen": previous["first_seen"] if previous else now,
+            "last_seen": now,
+        }
+        return previous is None
+
+
+def _clear_problem(code: str) -> None:
+    with _problems_lock:
+        _active_problems.pop(code, None)
+
+
+def set_telegram_polling_state(active: bool | None) -> None:
+    global _telegram_polling_active
+    _telegram_polling_active = active
+
+
+def record_withdrawal_poll(success: bool) -> None:
+    global _withdrawal_failures, _last_withdrawal_success_monotonic
+    if success:
+        _withdrawal_failures = 0
+        _last_withdrawal_success_monotonic = time.monotonic()
+        _clear_problem("WITHDRAWAL_REPEATED")
+    else:
+        _withdrawal_failures += 1
+        if _withdrawal_failures >= 3:
+            _set_problem("WITHDRAWAL_REPEATED")
+
+
+def _sync_runtime_problems() -> None:
+    client = _runtime_client
+    if client is None:
+        return
+    try:
+        health = client.get_runner_health()
+        if health.get("state") in ("failed", "stopped"):
+            _set_problem("RUNNER_STOPPED")
+        else:
+            _clear_problem("RUNNER_STOPPED")
+        if (health.get("state") == "backoff"
+                and type(health.get("consecutive_errors")) is int
+                and health["consecutive_errors"] >= 3):
+            _set_problem("RUNNER_RETRYING")
+        else:
+            _clear_problem("RUNNER_RETRYING")
+    except Exception:
+        pass
+    try:
+        size, capacity = client.event_queue.qsize(), client.event_queue.maxsize
+        if type(size) is int and type(capacity) is int and capacity > 0 and size >= capacity * 0.8:
+            _set_problem("QUEUE_PRESSURE")
+        else:
+            _clear_problem("QUEUE_PRESSURE")
+    except Exception:
+        pass
+    try:
+        if getattr(client, "_review_state_failed", False):
+            raise StateError("Persistent state unavailable.")
+        client.review_state.count_pending_review_requests()
+    except Exception:
+        _set_problem("DB_UNAVAILABLE")
+    else:
+        _clear_problem("DB_UNAVAILABLE")
+
+
+def get_active_problems() -> list[dict]:
+    _sync_runtime_problems()
+    with _problems_lock:
+        return sorted((dict(item) for item in _active_problems.values()),
+                      key=lambda item: (item["severity"] != "ERROR", item["first_seen"], item["code"]))
 _SAFE_RUNNER_FAILURE_TYPES = frozenset({
     "UnexpectedStop", "_EventQueueOverflow", "RequestFailedError", "UnauthorizedError",
     "Timeout", "ConnectTimeout", "ReadTimeout", "ConnectionError", "SSLError",
@@ -62,9 +158,10 @@ def set_runtime_status_context(client: FunPayClient) -> None:
 
 
 def clear_runtime_status_context() -> None:
-    global _runtime_client, _runtime_started_at
+    global _runtime_client, _runtime_started_at, _telegram_polling_active
     _runtime_client = None
     _runtime_started_at = None
+    _telegram_polling_active = None
 
 
 def _format_duration(seconds: float) -> str:
@@ -90,11 +187,12 @@ def _elapsed_since(value: float | None, now: float) -> str:
 
 
 def get_runtime_status_text() -> str:
-    """Только локальный snapshot; сетевых и SQLite операций здесь нет."""
+    """Local runtime snapshot and one bounded SQLite count; no network calls."""
     client = _runtime_client
     now = time.monotonic()
     if client is None or _runtime_started_at is None:
-        return "🩺 Состояние бота\nRuntime: не запущен"
+        return ("🩺 Состояние бота\nRuntime: не запущен\n"
+                f"SAFE_MODE: {'включён' if is_safe_mode_enabled() else 'выключен'}")
 
     uptime = _elapsed_since(_runtime_started_at, now).removesuffix(" назад")
     health_available = True
@@ -135,14 +233,14 @@ def get_runtime_status_text() -> str:
 
     try:
         if getattr(client, "_review_state_failed", False):
-            persistent = "недоступно"
-        elif getattr(client, "review_state", None) is not None:
-            persistent = "инициализировано при запуске"
-        else:
-            persistent = "недоступно"
-    except Exception as e:
-        logger.warning(f"Status persistent state unavailable: {type(e).__name__}.")
+            raise StateError("Persistent state unavailable.")
+        pending = client.review_state.count_pending_review_requests()
+        persistent = "доступно"
+        _clear_problem("DB_UNAVAILABLE")
+    except Exception:
+        pending = None
         persistent = "недоступно"
+        _set_problem("DB_UNAVAILABLE")
 
     try:
         bump = bot_settings["auto_bump"]
@@ -155,13 +253,27 @@ def get_runtime_status_text() -> str:
         "🩺 Состояние бота",
         "Runtime: 🟢 работает",
         f"Uptime: {uptime}",
-        f"Runner: {runner}",
+        f"FunPay Runner: {runner}",
+        "Telegram: " + ("polling task запущена" if _telegram_polling_active is True
+                        else "polling task остановлена" if _telegram_polling_active is False
+                        else "недоступно"),
         f"Последний успешный poll: {last_success}",
         f"Ошибок подряд: {errors_text}",
         f"Очередь событий: {queue_text}",
-        f"Persistent state: {persistent}",
+        f"SQLite: {persistent}",
+        f"Ожидающих запросов отзыва: {pending if pending is not None else 'недоступно'}",
         f"Автоподнятие: {bump_text}",
+        f"Night Mode: {'включён' if is_night_mode_enabled() else 'выключен'}",
+        f"Автоответчик: {'включён' if bot_settings.get('autoresponder_enabled') else 'выключен'}",
+        f"SAFE_MODE: {'включён' if is_safe_mode_enabled() else 'выключен'}",
+        "Withdrawal polling: " + ("ошибок подряд " + str(_withdrawal_failures)
+                                 if _withdrawal_failures else "последняя проверка успешна"
+                                 if _last_withdrawal_success_monotonic is not None
+                                 else "ещё не проверялось"),
     ]
+    if _last_withdrawal_success_monotonic is not None:
+        lines.append("Последняя успешная проверка выводов: " +
+                     _elapsed_since(_last_withdrawal_success_monotonic, now))
     category = health.get("last_failure_category")
     failure_type = health.get("last_failure_type")
     if category is not None or failure_type is not None:
@@ -188,6 +300,7 @@ DEFAULT_REVIEW_REQUEST_TEXT = "Спасибо за покупку! Если вс
 _DEFAULT_GLOBAL_SETTINGS: dict = {
     "auto_bump": False,
     "night_mode": False,
+    "safe_mode": False,
     "authorized_user_ids": [],
     # OLD production-аккаунт был USD; это явная account-level настройка статистики.
     "stats_currency": "USD",
@@ -207,6 +320,7 @@ _DEFAULT_USER_SETTINGS: dict = {
     "notify_message": True,
     "notify_order": True,
     "notify_review": True,
+    "notify_system": True,
 }
 
 # Глобальные настройки бота (авто-подъём, список авторизованных)
@@ -215,6 +329,7 @@ _night_mode_state_lock = threading.Lock()
 _night_reply_echoes = deque([NIGHT_MODE_MESSAGE_TEXT, NIGHT_MODE_ORDER_TEXT], maxlen=8)
 _interaction_state: dict[int, dict] = {}
 _chat_pages: dict[int, list[tuple[int, str, bool]]] = {}
+_notification_parent: dict[int, str] = {}
 
 # Персональные настройки: {user_id (int): {notify_*, notifications_enabled}}
 _user_settings: dict[int, dict] = {}
@@ -265,6 +380,7 @@ def load_settings() -> None:
         if (not isinstance(saved, dict)
                 or type(saved.get("auto_bump", False)) is not bool
                 or type(saved.get("night_mode", False)) is not bool
+                or type(saved.get("safe_mode", False)) is not bool
                 or type(saved.get("autoresponder_enabled", False)) is not bool
                 or type(saved.get("review_request_enabled", False)) is not bool):
             raise ValueError("Invalid global settings.")
@@ -333,6 +449,7 @@ def load_settings() -> None:
         for key in _DEFAULT_GLOBAL_SETTINGS:
             if key in saved:
                 bot_settings[key] = saved[key]
+        bot_settings["safe_mode"] = saved.get("safe_mode", False)
         configured_currency = bot_settings.get("stats_currency")
         if (type(configured_currency) is not str
                 or not re.fullmatch(r"[A-Z]{3}", configured_currency)):
@@ -366,6 +483,7 @@ def save_settings(*, required: bool = False) -> None:
         data = {
             "auto_bump": bot_settings["auto_bump"],
             "night_mode": bot_settings["night_mode"],
+            "safe_mode": bot_settings["safe_mode"],
             "authorized_user_ids": bot_settings["authorized_user_ids"],
             "stats_currency": bot_settings["stats_currency"],
             "night_mode_reply": bot_settings["night_mode_reply"],
@@ -388,6 +506,7 @@ def save_settings(*, required: bool = False) -> None:
             os.fsync(f.fileno())
         os.replace(temporary_path, SETTINGS_FILE)
         temporary_path = None
+        _clear_problem("SETTINGS_PERSISTENCE")
     except Exception as e:
         if temporary_path is not None:
             try:
@@ -395,13 +514,35 @@ def save_settings(*, required: bool = False) -> None:
             except OSError:
                 pass
         if required:
+            _set_problem("SETTINGS_PERSISTENCE")
             raise RuntimeError("Не удалось сохранить настройки.") from None
+        _set_problem("SETTINGS_PERSISTENCE")
         print(f"[SETTINGS] Не удалось сохранить настройки: {type(e).__name__}.")
 
 
 def is_night_mode_enabled() -> bool:
     with _night_mode_state_lock:
         return bot_settings.get("night_mode", False)
+
+
+def is_safe_mode_enabled() -> bool:
+    with _night_mode_state_lock:
+        return bot_settings.get("safe_mode", False)
+
+
+def toggle_safe_mode_saved(*, actor: str = "system") -> bool:
+    """Persist the emergency gate before returning its new state."""
+    with _night_mode_state_lock:
+        previous = bot_settings["safe_mode"]
+        bot_settings["safe_mode"] = not previous
+        try:
+            save_settings(required=True)
+        except Exception:
+            bot_settings["safe_mode"] = previous
+            raise RuntimeError("Не удалось сохранить SAFE_MODE.") from None
+        enabled = bot_settings["safe_mode"]
+    _audit_action(actor, "SAFE_MODE", "global", "ON" if enabled else "OFF")
+    return enabled
 
 
 def is_review_request_enabled() -> bool:
@@ -423,7 +564,18 @@ def is_night_mode_reply_text(value: str | None) -> bool:
         )
 
 
-def _save_global_setting(key: str, value) -> None:
+def _audit_action(actor: str, action: str, target: str, result: str) -> None:
+    store = getattr(_runtime_client, "review_state", None)
+    if store is None:
+        return
+    try:
+        store.record_audit_event(actor, action, target, result)
+        _clear_problem("AUDIT_UNAVAILABLE")
+    except Exception:
+        _set_problem("AUDIT_UNAVAILABLE")
+
+
+def _save_global_setting(key: str, value, *, actor: str = "system") -> None:
     with _night_mode_state_lock:
         previous = bot_settings[key]
         bot_settings[key] = value
@@ -437,9 +589,20 @@ def _save_global_setting(key: str, value) -> None:
                 _night_reply_echoes.append(previous)
             if value:
                 _night_reply_echoes.append(value)
+    action = {"autoresponder_enabled": "AUTORESPONDER",
+              "review_request_enabled": "REVIEW_REQUEST",
+              "reply_templates": "TEMPLATE", "autoresponder_rules": "RULE"}.get(key, "SETTINGS")
+    if key in ("autoresponder_enabled", "review_request_enabled"):
+        result = "ON" if value else "OFF"
+    elif key in ("reply_templates", "autoresponder_rules") and len(value) != len(previous):
+        result = "CREATED" if len(value) > len(previous) else "DELETED"
+    else:
+        result = "UPDATED"
+    target = "template" if action == "TEMPLATE" else "rule" if action == "RULE" else "global"
+    _audit_action(actor, action, target, result)
 
 
-def toggle_night_mode_saved() -> bool:
+def toggle_night_mode_saved(*, actor: str = "system") -> bool:
     """Фиксирует состояние и required-save независимо от Account RLock."""
     with _night_mode_state_lock:
         previous = bot_settings["night_mode"]
@@ -449,7 +612,9 @@ def toggle_night_mode_saved() -> bool:
         except Exception:
             bot_settings["night_mode"] = previous
             raise RuntimeError("Не удалось сохранить ночной режим.") from None
-        return bot_settings["night_mode"]
+        enabled = bot_settings["night_mode"]
+    _audit_action(actor, "NIGHT_MODE", "global", "ON" if enabled else "OFF")
+    return enabled
 
 
 def disable_autobump() -> None:
@@ -546,6 +711,7 @@ def get_main_keyboard(user_id: int):
         [InlineKeyboardButton(text="📊 Статистика", callback_data="menu_stats")],
         [InlineKeyboardButton(text="📦 Заказы", callback_data="orders")],
         [InlineKeyboardButton(text="🩺 Статус", callback_data="menu_status")],
+        [InlineKeyboardButton(text="⚙️ Система", callback_data="system")],
         [InlineKeyboardButton(text="🔔 Мои уведомления", callback_data="menu_notifications")],
         [InlineKeyboardButton(text=f"😴 Ночной режим: {night_status}", callback_data="menu_night_mode")],
         [InlineKeyboardButton(text="💬 Чаты", callback_data="chats:0")],
@@ -582,7 +748,10 @@ def get_notifications_keyboard(user_id: int):
         [InlineKeyboardButton(text=f"💬 Новые сообщения: {on_icon(u['notify_message'])}", callback_data="notif_message")],
         [InlineKeyboardButton(text=f"💰 Оплата заказов: {on_icon(u['notify_order'])}", callback_data="notif_order")],
         [InlineKeyboardButton(text=f"🌟 Отзывы: {on_icon(u['notify_review'])}", callback_data="notif_review")],
-        [InlineKeyboardButton(text="🔙 Назад", callback_data="menu_main")],
+        [InlineKeyboardButton(text=f"⚠️ Системные события: {on_icon(u['notify_system'])}",
+                              callback_data="notif_system")],
+        [InlineKeyboardButton(text="🔙 Назад",
+                              callback_data=_notification_parent.get(user_id, "menu_main"))],
     ])
     return keyboard
 
@@ -724,10 +893,10 @@ def _rule(rule_id: str) -> dict | None:
                  if rule["id"] == rule_id), None)
 
 
-def _save_rule(replacement: dict | None, rule_id: str) -> None:
+def _save_rule(replacement: dict | None, rule_id: str, *, actor: str = "system") -> None:
     updated = [replacement if rule["id"] == rule_id else rule
                for rule in bot_settings["autoresponder_rules"] if replacement is not None or rule["id"] != rule_id]
-    _save_global_setting("autoresponder_rules", updated)
+    _save_global_setting("autoresponder_rules", updated, actor=actor)
 
 
 def _auto_screen() -> tuple[str, InlineKeyboardMarkup]:
@@ -802,7 +971,7 @@ async def _automation_callback(callback: CallbackQuery, action: str, user_id: in
         if prefix == "auto_menu":
             text, markup = _auto_screen()
         elif prefix == "auto_toggle":
-            _save_global_setting("autoresponder_enabled", not bot_settings["autoresponder_enabled"])
+            _save_global_setting("autoresponder_enabled", not bot_settings["autoresponder_enabled"], actor=f"telegram:{user_id}")
             text, markup = _auto_screen()
         elif prefix == "auto_rules":
             text, markup = _rules_screen()
@@ -830,7 +999,7 @@ async def _automation_callback(callback: CallbackQuery, action: str, user_id: in
                 rule_id = secrets.token_hex(4)
             rule = {"id": rule_id, "trigger": pending["trigger"], "template_id": parts[1],
                     "match_mode": pending["match_mode"], "enabled": True}
-            _save_global_setting("autoresponder_rules", [*bot_settings["autoresponder_rules"], rule])
+            _save_global_setting("autoresponder_rules", [*bot_settings["autoresponder_rules"], rule], actor=f"telegram:{user_id}")
             text, markup = _rule_screen(rule)
         elif prefix in {"auto_rule", "auto_rule_toggle", "auto_rule_trigger", "auto_rule_mode",
                         "auto_rule_template", "auto_rule_delete"}:
@@ -839,17 +1008,17 @@ async def _automation_callback(callback: CallbackQuery, action: str, user_id: in
                 raise ValueError("Правило не найдено.")
             if prefix == "auto_rule_toggle":
                 rule = {**rule, "enabled": not rule["enabled"]}
-                _save_rule(rule, rule["id"])
+                _save_rule(rule, rule["id"], actor=f"telegram:{user_id}")
             elif prefix == "auto_rule_mode":
                 rule = {**rule, "match_mode": "CONTAINS" if rule["match_mode"] == "EXACT" else "EXACT"}
-                _save_rule(rule, rule["id"])
+                _save_rule(rule, rule["id"], actor=f"telegram:{user_id}")
             elif prefix == "auto_rule_trigger":
                 _interaction_state[user_id] = {"action": "auto_edit_trigger", "id": rule["id"]}
                 text, markup = "✏️ Отправьте новый триггер (до 200 символов).", _cancel_keyboard("menu")
             elif prefix == "auto_rule_template":
                 text, markup = _choose_rule_template("auto_rules", f"auto_select:{rule['id']}")
             elif prefix == "auto_rule_delete":
-                _save_rule(None, rule["id"])
+                _save_rule(None, rule["id"], actor=f"telegram:{user_id}")
                 text, markup = _rules_screen()
             if prefix in {"auto_rule", "auto_rule_toggle", "auto_rule_mode"}:
                 text, markup = _rule_screen(rule)
@@ -858,12 +1027,12 @@ async def _automation_callback(callback: CallbackQuery, action: str, user_id: in
             if rule is None or _template(parts[2]) is None:
                 raise ValueError("Правило или шаблон не найден.")
             rule = {**rule, "template_id": parts[2]}
-            _save_rule(rule, rule["id"])
+            _save_rule(rule, rule["id"], actor=f"telegram:{user_id}")
             text, markup = _rule_screen(rule)
         elif prefix == "review_menu":
             text, markup = _review_request_screen()
         elif prefix == "review_toggle":
-            _save_global_setting("review_request_enabled", not bot_settings["review_request_enabled"])
+            _save_global_setting("review_request_enabled", not bot_settings["review_request_enabled"], actor=f"telegram:{user_id}")
             text, markup = _review_request_screen()
         elif prefix == "review_edit":
             _interaction_state[user_id] = {"action": "review_edit"}
@@ -872,7 +1041,7 @@ async def _automation_callback(callback: CallbackQuery, action: str, user_id: in
             _interaction_state[user_id] = {"action": "review_delay"}
             text, markup = "⏱ Отправьте задержку от 0 до 1440 минут.", _cancel_keyboard("menu")
         else:
-            _save_global_setting("review_request_text", DEFAULT_REVIEW_REQUEST_TEXT)
+            _save_global_setting("review_request_text", DEFAULT_REVIEW_REQUEST_TEXT, actor=f"telegram:{user_id}")
             text, markup = _review_request_screen()
         await callback.answer()
         answered = True
@@ -905,7 +1074,7 @@ async def _automation_pending(message: Message, pending: dict) -> bool:
             value = _clean_text(message.text, 4)
             if not value.isdecimal() or not 0 <= int(value) <= 1440:
                 raise ValueError("Введите целое число от 0 до 1440.")
-            _save_global_setting("review_request_delay", int(value))
+            _save_global_setting("review_request_delay", int(value), actor=f"telegram:{user_id}")
             text, markup = _review_request_screen()
         else:
             limit = 200 if action.endswith("trigger") else 1000
@@ -922,11 +1091,11 @@ async def _automation_pending(message: Message, pending: dict) -> bool:
                 if rule is None:
                     raise ValueError("Правило не найдено.")
                 rule = {**rule, "trigger": value}
-                _save_rule(rule, rule["id"])
+                _save_rule(rule, rule["id"], actor=f"telegram:{user_id}")
                 text, markup = _rule_screen(rule)
             else:
                 _validate_review_text(value)
-                _save_global_setting("review_request_text", value)
+                _save_global_setting("review_request_text", value, actor=f"telegram:{user_id}")
                 text, markup = _review_request_screen()
     except ValueError as e:
         await message.answer(escape(str(e)), parse_mode="HTML")
@@ -1379,6 +1548,145 @@ async def _analytics_callback(callback: CallbackQuery, action: str) -> bool:
     return True
 
 
+def _system_screen() -> tuple[str, InlineKeyboardMarkup]:
+    safe = "✅" if is_safe_mode_enabled() else "⛔"
+    return "⚙️ <b>Система</b>\nУправление и диагностика:", _menu([
+        [_button("⚠️ Проблемы", "sys_problems")],
+        [_button("📜 Журнал действий", "sys_audit:0")],
+        [_button(f"🛡 SAFE_MODE: {safe}", "sys_safe_toggle")],
+        [_button("🔔 Уведомления", "sys_notifications")],
+        [_button("🔙 Назад", "menu_main")],
+    ])
+
+
+def _problems_screen() -> tuple[str, InlineKeyboardMarkup]:
+    problems = get_active_problems()
+    lines = [f"⚠️ <b>Активные проблемы: {len(problems)}</b>"]
+    if not problems:
+        lines += ["", "✅ Активных проблем нет."]
+    for problem in problems:
+        icon = "🔴" if problem["severity"] == "ERROR" else "🟡"
+        first = datetime.fromtimestamp(problem["first_seen"], timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        last = datetime.fromtimestamp(problem["last_seen"], timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        lines += ["", f"{icon} <b>{problem['code']}</b> · {problem['severity']}",
+                  problem["description"], f"Первое: {first}", f"Последнее: {last}"]
+    return "\n".join(lines), _menu([[_button("🔄 Обновить", "sys_problems")],
+                                     [_button("🔙 Назад", "system")]])
+
+
+def _audit_screen(page: int, count: int, events: list[dict]):
+    pages = max(1, (count + 19) // 20)
+    rows = []
+    for event in events:
+        stamp = datetime.fromtimestamp(event["ts"], timezone.utc).strftime("%d.%m %H:%M")
+        rows.append([_button(f"{stamp} · {event['action']} · {event['result']}",
+                             f"sys_audit_view:{event['id']}:{page}")])
+    if not rows:
+        rows.append([_button("Записей пока нет", "system")])
+    navigation = []
+    if page > 0:
+        navigation.append(_button("◀️", f"sys_audit:{page - 1}"))
+    if page + 1 < pages:
+        navigation.append(_button("▶️", f"sys_audit:{page + 1}"))
+    if navigation:
+        rows.append(navigation)
+    rows.append([_button("🔙 Назад", "system")])
+    return f"📜 <b>Журнал действий</b> · {page + 1}/{pages}", _menu(rows)
+
+
+def _audit_detail_screen(event: dict, page: int):
+    stamp = datetime.fromtimestamp(event["ts"], timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    text = (f"📜 <b>Действие #{event['id']}</b>\n\n"
+            f"Время: {stamp}\n"
+            f"Кто: {escape(event['actor'])}\n"
+            f"Действие: {escape(event['action'])}\n"
+            f"Цель: {escape(event['target'])}\n"
+            f"Результат: {escape(event['result'])}")
+    return text, _menu([[_button("🔙 К журналу", f"sys_audit:{page}")]])
+
+
+async def _notify_safe_mode_activated(callback: CallbackQuery, actor_id: int) -> None:
+    try:
+        bot = getattr(callback, "bot", None)
+        recipients = get_all_recipients() if bot is not None else []
+    except Exception:
+        return
+    for recipient in recipients:
+        if recipient == actor_id:
+            continue
+        try:
+            settings = get_user_settings(recipient)
+            if not settings.get("notifications_enabled", True) or not settings.get("notify_system", True):
+                continue
+            await asyncio.wait_for(bot.send_message(
+                recipient, "🛡 SAFE_MODE включён. Автоматические действия приостановлены."), timeout=5)
+        except Exception as e:
+            logger.warning(f"System notification unavailable: {type(e).__name__}.")
+
+
+async def _operations_callback(callback: CallbackQuery, action: str, user_id: int) -> bool:
+    prefix = action.split(":", 1)[0]
+    if prefix not in {"system", "sys_problems", "sys_audit", "sys_audit_view",
+                      "sys_safe_toggle", "sys_safe_off", "sys_safe_cancel",
+                      "sys_notifications"}:
+        return False
+    answered = False
+    try:
+        parts = action.split(":")
+        if action == "system" or action == "sys_safe_cancel":
+            text, markup = _system_screen()
+        elif action == "sys_problems":
+            text, markup = _problems_screen()
+        elif prefix == "sys_audit" and len(parts) == 2:
+            page = int(parts[1])
+            count, events = await asyncio.to_thread(_orders_store().list_audit_events, page)
+            _clear_problem("AUDIT_UNAVAILABLE")
+            text, markup = _audit_screen(page, count, events)
+        elif prefix == "sys_audit_view" and len(parts) == 3:
+            event_id, page = int(parts[1]), int(parts[2])
+            if page < 0 or page > 100000:
+                raise ValueError("Invalid audit page.")
+            event = await asyncio.to_thread(_orders_store().get_audit_event, event_id)
+            _clear_problem("AUDIT_UNAVAILABLE")
+            if event is None:
+                raise ValueError("Audit event unavailable.")
+            text, markup = _audit_detail_screen(event, page)
+        elif action == "sys_safe_toggle":
+            if is_safe_mode_enabled():
+                text = "⚠️ Разрешить автоматические действия?"
+                markup = _menu([[_button("✅ Да", "sys_safe_off")],
+                                [_button("❌ Отмена", "sys_safe_cancel")]])
+            else:
+                toggle_safe_mode_saved(actor=f"telegram:{user_id}")
+                text, markup = _system_screen()
+                await callback.answer("🛡 SAFE_MODE включён. Автоматические действия приостановлены.")
+                answered = True
+        elif action == "sys_safe_off":
+            if not is_safe_mode_enabled():
+                raise ValueError("SAFE_MODE already off.")
+            toggle_safe_mode_saved(actor=f"telegram:{user_id}")
+            text, markup = _system_screen()
+            await callback.answer("🛡 SAFE_MODE выключен.")
+            answered = True
+        elif action == "sys_notifications":
+            _notification_parent[user_id] = "system"
+            text, markup = NOTIFICATIONS_MENU_TEXT, get_notifications_keyboard(user_id)
+        else:
+            raise ValueError("Invalid system action.")
+        if not answered:
+            await callback.answer()
+        await callback.message.edit_text(text, reply_markup=markup, parse_mode="HTML")
+        if action == "sys_safe_toggle" and answered and is_safe_mode_enabled():
+            await _notify_safe_mode_activated(callback, user_id)
+    except Exception as e:
+        if prefix in {"sys_audit", "sys_audit_view"}:
+            _set_problem("AUDIT_UNAVAILABLE")
+        logger.warning(f"System UI unavailable: {type(e).__name__}.")
+        if not answered:
+            await callback.answer("Система недоступна.", show_alert=True)
+    return True
+
+
 def _chat_screen(chat_id: int, name: str, messages: list[tuple[str, str]]) -> tuple[str, InlineKeyboardMarkup]:
     header = f"💬 <b>{escape(name[:100])}</b>\n\n"
     remaining = 3500 - len(header)
@@ -1403,24 +1711,33 @@ def _send_to_chat(chat_id: int, value: str) -> None:
     _runtime_client.send_message_once(chat_id, value)
 
 
-async def _send_one_reply(message: Message, chat_id: int, value: str) -> None:
+async def _send_one_reply(message: Message, chat_id: int, value: str,
+                          *, actor_id: int | None = None) -> None:
+    if actor_id is None and getattr(message, "from_user", None) is not None:
+        actor_id = message.from_user.id
+    actor = f"telegram:{actor_id}" if type(actor_id) is int and actor_id > 0 else "system"
     try:
         await asyncio.to_thread(_send_to_chat, chat_id, value)
     except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
         logger.warning(f"Manual message result ambiguous: {type(e).__name__}.")
+        await asyncio.to_thread(_audit_action, actor, "MANUAL_SEND", "chat", "AMBIGUOUS")
         await message.answer("⚠️ Не удалось подтвердить отправку. Проверьте чат перед повторной попыткой.")
     except FunPayAPI.exceptions.MessageNotDeliveredError as e:
         if type(getattr(e, "error_message", None)) is str and e.error_message:
             logger.warning("Manual message rejected by FunPay.")
+            await asyncio.to_thread(_audit_action, actor, "MANUAL_SEND", "chat", "FAILED")
             await message.answer("⛔ FunPay отклонил сообщение. Отправка не выполнена.")
         else:
             logger.warning("Manual message result ambiguous: MessageNotDeliveredError.")
+            await asyncio.to_thread(_audit_action, actor, "MANUAL_SEND", "chat", "AMBIGUOUS")
             await message.answer("⚠️ Отправка не подтверждена. Проверьте чат перед повторной попыткой.")
     except Exception as e:
         logger.warning(f"Manual message failed: {type(e).__name__}.")
+        await asyncio.to_thread(_audit_action, actor, "MANUAL_SEND", "chat", "AMBIGUOUS")
         # A remote error can occur after transport; do not imply it is safe to retry.
         await message.answer("⚠️ Отправка не подтверждена. Проверьте чат перед повторной попыткой.")
     else:
+        await asyncio.to_thread(_audit_action, actor, "MANUAL_SEND", "chat", "SUCCESS")
         await message.answer("✅ Отправлено")
 
 
@@ -1442,7 +1759,7 @@ async def _communication_callback(callback: CallbackQuery, action: str, user_id:
             _interaction_state[user_id] = {"action": "night_edit"}
             text, markup = "✏️ Отправьте новый автоответ (до 1000 символов).", _cancel_keyboard("night")
         elif prefix == "night_reset":
-            _save_global_setting("night_mode_reply", None)
+            _save_global_setting("night_mode_reply", None, actor=f"telegram:{user_id}")
             text, markup = _night_mode_screen()
         elif prefix in {"chats", "chats_refresh"}:
             page = int(parts[1])
@@ -1498,7 +1815,7 @@ async def _communication_callback(callback: CallbackQuery, action: str, user_id:
             elif prefix == "tpl_delete":
                 if any(rule["template_id"] == template_id for rule in bot_settings["autoresponder_rules"]):
                     raise ValueError("Шаблон используется правилом. Сначала удалите правило.")
-                _save_global_setting("reply_templates", [row for row in _templates() if row["id"] != template_id])
+                _save_global_setting("reply_templates", [row for row in _templates() if row["id"] != template_id], actor=f"telegram:{user_id}")
                 text, markup = _templates_screen(chat_id)
             else:
                 if not chat_id:
@@ -1520,7 +1837,7 @@ async def _communication_callback(callback: CallbackQuery, action: str, user_id:
                 raise ValueError("Подтверждение устарело.")
             await callback.answer()
             answered = True
-            await _send_one_reply(callback.message, chat_id, pending["text"])
+            await _send_one_reply(callback.message, chat_id, pending["text"], actor_id=user_id)
             return True
         else:
             return False
@@ -1645,6 +1962,8 @@ async def callback_handler(callback: CallbackQuery):
         return
     if await _analytics_callback(callback, action):
         return
+    if await _operations_callback(callback, action, user_id):
+        return
 
     # Включение/выключение автоподнятия (глобальная настройка — влияет на всех)
     if action == "toggle_bump":
@@ -1658,6 +1977,8 @@ async def callback_handler(callback: CallbackQuery):
             await callback.answer("Не удалось сохранить настройку. Автоподнятие не включено.", show_alert=True)
             return
         state_text = "включено" if bot_settings["auto_bump"] else "выключено"
+        _audit_action(f"telegram:{user_id}", "AUTOBUMP", "global",
+                      "ON" if bot_settings["auto_bump"] else "OFF")
         await callback.answer(f"Автоподнятие {state_text}!")
         try:
             await callback.message.edit_reply_markup(reply_markup=get_main_keyboard(user_id))
@@ -1666,6 +1987,7 @@ async def callback_handler(callback: CallbackQuery):
 
     # Переход в персональное подменю уведомлений
     elif action == "menu_notifications":
+        _notification_parent[user_id] = "menu_main"
         await callback.answer()
         try:
             await callback.message.edit_text(
@@ -1678,7 +2000,7 @@ async def callback_handler(callback: CallbackQuery):
 
     elif action == "toggle_night_mode":
         try:
-            enabled = toggle_night_mode_saved()
+            enabled = toggle_night_mode_saved(actor=f"telegram:{user_id}")
         except RuntimeError:
             await callback.answer("Не удалось сохранить ночной режим.", show_alert=True)
             return
@@ -1757,8 +2079,15 @@ async def callback_handler(callback: CallbackQuery):
         )
         u = get_user_settings(user_id)  # берём настройки ЭТОГО пользователя
         if key in u:
-            u[key] = not u[key]
-            save_settings()
+            previous = u[key]
+            u[key] = not previous
+            try:
+                save_settings(required=True)
+            except RuntimeError:
+                u[key] = previous
+                await callback.answer("Не удалось сохранить уведомления.", show_alert=True)
+                return
+            _audit_action(f"telegram:{user_id}", "SETTINGS", "settings", "UPDATED")
             await callback.answer("Настройка обновлена!")
             try:
                 await callback.message.edit_reply_markup(reply_markup=get_notifications_keyboard(user_id))
@@ -1816,7 +2145,7 @@ async def text_handler(message: Message):
                 return
             try:
                 if action == "night_edit":
-                    _save_global_setting("night_mode_reply", value)
+                    _save_global_setting("night_mode_reply", value, actor=f"telegram:{user_id}")
                     text, markup = _night_mode_screen()
                 elif action == "tpl_add_text":
                     if len(_templates()) >= 20:
@@ -1825,7 +2154,7 @@ async def text_handler(message: Message):
                     while _template(template_id) is not None:
                         template_id = secrets.token_hex(4)
                     item = {"id": template_id, "title": pending["title"], "text": value}
-                    _save_global_setting("reply_templates", [*_templates(), item])
+                    _save_global_setting("reply_templates", [*_templates(), item], actor=f"telegram:{user_id}")
                     text, markup = _templates_screen(pending["chat_id"])
                 else:
                     item = _template(pending["id"])
@@ -1833,7 +2162,7 @@ async def text_handler(message: Message):
                         raise ValueError("Шаблон не найден.")
                     replacement = {**item, "title" if action == "tpl_title" else "text": value}
                     _save_global_setting("reply_templates", [replacement if row["id"] == item["id"]
-                                                          else row for row in _templates()])
+                                                          else row for row in _templates()], actor=f"telegram:{user_id}")
                     text, markup = _template_screen(replacement, pending["chat_id"])
             except Exception as e:
                 logger.warning(f"Communication settings save failed: {type(e).__name__}.")

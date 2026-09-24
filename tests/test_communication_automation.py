@@ -31,6 +31,8 @@ runtime = {
     "_expand_template": ui._expand_template,
     "expand_review_request_text": ui.expand_review_request_text,
     "is_review_request_enabled": ui.is_review_request_enabled,
+    "is_safe_mode_enabled": ui.is_safe_mode_enabled,
+    "_audit_action": ui._audit_action,
     "logger": SimpleNamespace(warning=lambda *args: None, error=lambda *args: None),
 }
 exec(compile(ast.Module(body=nodes, type_ignores=[]), "main.py", "exec"), runtime)
@@ -261,6 +263,43 @@ class AutomationTests(unittest.IsolatedAsyncioTestCase):
         await runtime["_send_scheduled_review_request"](self.client, "ABC12345", "Buyer", int(time.time()))
         self.assertEqual(len(self.client.sent), 1)
         self.assertEqual(restarted.pending_review_requests(), [])
+
+    async def test_safe_mode_blocks_autoresponse_and_final_send_gate(self):
+        ui.bot_settings["safe_mode"] = True
+        self.assertTrue(await runtime["_maybe_autorespond"](self.client, incoming(), {}, {}))
+        self.assertEqual(self.client.sent, [])
+        ui.bot_settings["safe_mode"] = False
+
+        def safe_before_send(chat_id, value, *, enabled_check=None):
+            ui.bot_settings["safe_mode"] = True
+            return False if not enabled_check() else None
+
+        self.client.send_message_once = safe_before_send
+        self.assertTrue(await runtime["_maybe_autorespond"](self.client, incoming(), {}, {}))
+        self.assertEqual(self.client.sent, [])
+
+    async def test_safe_mode_pauses_review_request_without_retry_after_transport(self):
+        self.store.record_order_observation("ABC12345", "CLOSED")
+        self.store.schedule_review_request("ABC12345", "Buyer", int(time.time()))
+        ui.bot_settings["review_request_enabled"] = True
+        ui.bot_settings["safe_mode"] = True
+        task = asyncio.create_task(runtime["_send_scheduled_review_request"](
+            self.client, "ABC12345", "Buyer", int(time.time())))
+        await asyncio.sleep(0.05)
+        self.assertEqual(self.client.sent, [])
+        self.assertEqual(self.status()[0], "pending")
+        ui.bot_settings["safe_mode"] = False
+        await asyncio.wait_for(task, 2)
+        self.assertEqual(len(self.client.sent), 1)
+        self.assertEqual(self.status()[0], "sent")
+
+        self.store.record_order_observation("DEF12345", "CLOSED")
+        self.store.schedule_review_request("DEF12345", "Buyer", int(time.time()))
+        self.client.send_error = TimeoutError()
+        await runtime["_send_scheduled_review_request"](
+            self.client, "DEF12345", "Buyer", int(time.time()))
+        self.assertEqual(len(self.client.sent), 2)
+        self.assertEqual(self.store.pending_review_requests(), [])
 
     async def test_crash_after_claim_cannot_resend_after_restart(self):
         self.store.record_order_observation("ABC12345", "CLOSED")
