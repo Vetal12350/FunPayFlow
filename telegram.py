@@ -180,6 +180,8 @@ _DEFAULT_GLOBAL_SETTINGS: dict = {
     "auto_bump": False,
     "night_mode": False,
     "authorized_user_ids": [],
+    # OLD production-аккаунт был USD; это явная account-level настройка статистики.
+    "stats_currency": "USD",
 }
 
 # Дефолтные персональные настройки — используются при первой авторизации нового пользователя
@@ -280,6 +282,11 @@ def load_settings() -> None:
         for key in _DEFAULT_GLOBAL_SETTINGS:
             if key in saved:
                 bot_settings[key] = saved[key]
+        configured_currency = bot_settings.get("stats_currency")
+        if (type(configured_currency) is not str
+                or not re.fullmatch(r"[A-Z]{3}", configured_currency)):
+            # Некорректная явная настройка не должна молча превращаться в USD.
+            bot_settings["stats_currency"] = None
 
         # Загружаем персональные настройки пользователей
         for uid_str, usett in saved.get("user_settings", {}).items():
@@ -309,6 +316,7 @@ def save_settings(*, required: bool = False) -> None:
             "auto_bump": bot_settings["auto_bump"],
             "night_mode": bot_settings["night_mode"],
             "authorized_user_ids": bot_settings["authorized_user_ids"],
+            "stats_currency": bot_settings["stats_currency"],
             "user_settings": {
                 str(uid): sett for uid, sett in _user_settings.items()
             },
@@ -536,7 +544,8 @@ def format_stats_text(period: str, data: dict) -> str:
         f"🛒 Заказов: <b>{data['orders_count']}</b>\n"
         f"🌟 Отзывов: <b>{data['reviews_count']}</b>\n"
         f"💰 Оборот: <b>{data['usd_turnover']:.2f} $</b>\n"
-        f"🏦 Выводов (архив): <b>{data['withdrawals_count']}</b>"
+        f"🏦 Выводов: <b>{data['withdrawals_count']}</b> "
+        f"на сумму <b>{data['usd_withdrawals']:.2f} $</b>"
     )
 
 
