@@ -6,6 +6,7 @@ import queue
 import re
 import sys
 import atexit
+import time
 from html import escape
 from dotenv import load_dotenv
 from aiogram import Bot
@@ -16,7 +17,8 @@ import FunPayAPI
 from telegram import (dp, bot_settings, get_user_settings, get_all_recipients,
                       set_runtime_status_context, clear_runtime_status_context,
                       disable_autobump, get_reply_keyboard, is_night_mode_enabled,
-                      get_night_mode_reply_text)
+                      get_night_mode_reply_text, match_autoresponder, _expand_template,
+                      expand_review_request_text, is_review_request_enabled)
 from funpay import FunPayClient, _AmbiguousRaiseOutcome
 from state import ReviewReceiptStore, StateError
 import logger
@@ -405,6 +407,158 @@ async def _send_night_mode_reply(
         logger.warning(f"Не удалось отправить автоответ: {type(e).__name__}.")
 
 
+def _verified_incoming_message(client: FunPayClient, event):
+    """A chat shortcut alone has no author; verify the newest message explicitly."""
+    if event.type is not FunPayAPI.enums.EventTypes.LAST_CHAT_MESSAGE_CHANGED:
+        return None
+    chat = getattr(event, "chat", None)
+    chat_id = getattr(chat, "id", None)
+    name = getattr(chat, "name", None)
+    preview = getattr(chat, "last_message_text", None)
+    if (type(chat_id) is not int or chat_id <= 0 or type(name) is not str or not name
+            or type(preview) is not str or not preview
+            or not getattr(chat, "unread", False)
+            or getattr(chat, "last_message_type", None) is not FunPayAPI.types.MessageTypes.NON_SYSTEM):
+        return None
+    with client._account_lock:
+        history = getattr(client, "_manual_get_chat_history", None)
+        if history is None:
+            return None
+        messages = history(chat_id, interlocutor_username=name)
+        account_id = getattr(client.account, "id", None)
+        account_name = getattr(client.account, "username", None)
+    if (not messages or type(account_id) is not int
+            or type(account_name) is not str or not account_name):
+        return None
+    newest = max((item for item in messages if type(getattr(item, "id", None)) is int),
+                 key=lambda item: item.id, default=None)
+    if (newest is None or getattr(newest, "text", None) != preview
+            or type(getattr(newest, "author_id", None)) is not int
+            or newest.author_id <= 0 or newest.author_id == account_id
+            or getattr(newest, "author", None) != name
+            or getattr(newest, "by_bot", False)):
+        return None
+    return chat_id, newest.id, name, account_name, newest.text
+
+
+async def _maybe_autorespond(client: FunPayClient, event, seen: dict, cooldowns: dict) -> bool:
+    """True means a specific rule owns this event, so generic Night Mode is skipped."""
+    if not bot_settings["autoresponder_enabled"]:
+        return False
+    try:
+        incoming = await asyncio.to_thread(_verified_incoming_message, client, event)
+    except Exception as e:
+        logger.warning(f"Autoresponder verification unavailable: {type(e).__name__}.")
+        return False
+    if incoming is None:
+        return False
+    chat_id, message_id, chat_name, account_name, body = incoming
+    marker = (chat_id, message_id)
+    if marker in seen:
+        return True
+    matched = match_autoresponder(body)
+    if matched is None:
+        return False
+    rule, template = matched
+    seen[marker] = time.monotonic()
+    if len(seen) > 10000:
+        oldest = next(iter(seen))
+        seen.pop(oldest, None)
+    key = (chat_id, rule["id"])
+    now = time.monotonic()
+    if now - cooldowns.get(key, -float("inf")) < 60:
+        return True
+    cooldowns[key] = now
+    if len(cooldowns) > 10000:
+        for expired in [item for item, used_at in cooldowns.items() if now - used_at >= 60]:
+            cooldowns.pop(expired, None)
+        while len(cooldowns) > 10000:
+            cooldowns.pop(next(iter(cooldowns)))
+    try:
+        value = _expand_template(template["text"], chat_name, account_name)
+        if not value.strip() or len(value) > 2000:
+            return True
+        await asyncio.to_thread(
+            client.send_message_once, chat_id, value,
+            enabled_check=lambda: bot_settings["autoresponder_enabled"],
+        )
+    except Exception as e:
+        logger.warning(f"Autoresponder result unconfirmed: {type(e).__name__}.")
+    return True
+
+
+def _review_chat_context(client: FunPayClient, buyer: str):
+    with client._account_lock:
+        chat = client.account.get_chat_by_name(buyer, make_request=True)
+        chat_id = getattr(chat, "id", None)
+        account_name = getattr(client.account, "username", None)
+    if type(chat_id) is not int or chat_id <= 0 or type(account_name) is not str or not account_name:
+        return None
+    return chat_id, account_name
+
+
+async def _send_scheduled_review_request(
+    client: FunPayClient, order_id: str, buyer: str, scheduled_at: int,
+) -> None:
+    """Pending survives restart; claim becomes ambiguous before the one send attempt."""
+    await asyncio.sleep(max(0, scheduled_at - time.time()))
+    store = client.review_state
+    if not is_review_request_enabled():
+        await asyncio.to_thread(store.discard_pending_review_request, order_id)
+        return
+    if await asyncio.to_thread(store.has_review_observation, order_id):
+        await asyncio.to_thread(store.discard_pending_review_request, order_id)
+        return
+    try:
+        order, account_id = await asyncio.to_thread(client.get_order_snapshot, order_id)
+        if (getattr(order, "status", None) is not FunPayAPI.types.OrderStatuses.CLOSED
+                or getattr(order, "buyer_username", None) != buyer
+                or getattr(order, "seller_id", None) != account_id):
+            await asyncio.to_thread(store.discard_pending_review_request, order_id)
+            return
+        if getattr(order, "review", None) is not None:
+            await asyncio.to_thread(store.record_review_observation, order_id)
+            await asyncio.to_thread(store.discard_pending_review_request, order_id)
+            return
+        context = await asyncio.to_thread(_review_chat_context, client, buyer)
+        if context is None:
+            logger.warning("Review request skipped: chat unavailable.")
+            return
+        chat_id, account_name = context
+        value = expand_review_request_text(
+            bot_settings["review_request_text"], account_name, buyer, order_id,
+        )
+        if not value.strip() or len(value) > 2000:
+            logger.warning("Review request skipped: invalid text.")
+            return
+    except Exception as e:
+        logger.warning(f"Review request verification unavailable: {type(e).__name__}.")
+        return
+    if not is_review_request_enabled():
+        await asyncio.to_thread(store.discard_pending_review_request, order_id)
+        return
+    if await asyncio.to_thread(store.has_review_observation, order_id):
+        await asyncio.to_thread(store.discard_pending_review_request, order_id)
+        return
+    # Never repeat a send after a crash or ambiguous transport result.
+    if not await asyncio.to_thread(store.claim_review_request, order_id, int(time.time())):
+        return
+    if not is_review_request_enabled():
+        return
+    try:
+        sent = await asyncio.to_thread(
+            client.send_message_once, chat_id, value,
+            enabled_check=is_review_request_enabled,
+        )
+    except Exception as e:
+        logger.warning(f"Review request result ambiguous: {type(e).__name__}.")
+        return
+    if sent is False:
+        await asyncio.to_thread(store.discard_unstarted_review_request, order_id)
+        return
+    await asyncio.to_thread(store.mark_review_request_sent, order_id, int(time.time()))
+
+
 def _order_observation(event) -> tuple[str, str] | None:
     """Извлекает только ID и проверенный статус уже полученного события продажи."""
     if event.type not in (FunPayAPI.enums.EventTypes.NEW_ORDER,
@@ -422,6 +576,23 @@ def _order_observation(event) -> tuple[str, str] | None:
         if status == known_status:
             return order_id, name
     raise StateError("Order event status unavailable.")
+
+
+async def _schedule_closed_review_request(client, event, observation, first_closed, start_task) -> None:
+    if (observation is None or observation[1] != "CLOSED" or not first_closed
+            or event.type is not FunPayAPI.enums.EventTypes.ORDER_STATUS_CHANGED
+            or not is_review_request_enabled()):
+        return
+    buyer = getattr(getattr(event, "order", None), "buyer_username", None)
+    if type(buyer) is not str or not buyer.strip():
+        return
+    scheduled_at = int(time.time()) + bot_settings["review_request_delay"] * 60
+    created = await asyncio.to_thread(
+        client.review_state.schedule_review_request,
+        observation[0], buyer, scheduled_at,
+    )
+    if created:
+        start_task(observation[0], buyer, scheduled_at)
 
 
 async def notifications_loop(bot: Bot, client: FunPayClient):
@@ -446,6 +617,9 @@ async def notifications_loop(bot: Bot, client: FunPayClient):
     # Один полный burst очереди допустим, но backlog после dequeue не растёт бесконечно.
     max_review_tasks = 256
     review_tasks: set[asyncio.Task] = set()
+    request_tasks: dict[str, asyncio.Task] = {}
+    seen_autoresponses: dict[tuple[int, int], float] = {}
+    rule_cooldowns: dict[tuple[int, str], float] = {}
     review_failed = False
 
     def review_done(task: asyncio.Task) -> None:
@@ -465,8 +639,29 @@ async def notifications_loop(bot: Bot, client: FunPayClient):
         review_tasks.add(task)
         task.add_done_callback(review_done)
 
+    def start_review_request(order_id: str, buyer: str, scheduled_at: int) -> None:
+        if order_id in request_tasks:
+            return
+        if len(request_tasks) >= max_review_tasks:
+            raise RuntimeError("Review request task capacity exceeded.")
+        task = asyncio.create_task(
+            _send_scheduled_review_request(client, order_id, buyer, scheduled_at)
+        )
+        request_tasks[order_id] = task
+        def done(completed: asyncio.Task) -> None:
+            nonlocal review_failed
+            request_tasks.pop(order_id, None)
+            if not completed.cancelled() and completed.exception() is not None:
+                logger.error(f"Review request task failed: {type(completed.exception()).__name__}.")
+                review_failed = True
+        task.add_done_callback(done)
+
     client.start_runner()
     try:
+        for order_id, buyer, scheduled_at in await asyncio.to_thread(
+            client.review_state.pending_review_requests
+        ):
+            start_review_request(order_id, buyer, scheduled_at)
         while True:
             if client.runner_stop_requested():
                 return
@@ -492,7 +687,7 @@ async def notifications_loop(bot: Bot, client: FunPayClient):
                     order = getattr(event, "order", None)
                     closed = observation[1] == "CLOSED"
                     event_currency = getattr(order, "currency", None) if closed else None
-                    await asyncio.to_thread(
+                    first_closed = await asyncio.to_thread(
                         client.review_state.record_order_observation, *observation,
                         amount=(getattr(order, "price", None) or getattr(order, "sum", None))
                         if closed else None,
@@ -506,9 +701,17 @@ async def notifications_loop(bot: Bot, client: FunPayClient):
                     logger.error(f"Order statistics write failed: {type(e).__name__}.")
                     raise StateError("Persistent order write failed.") from None
 
+                await _schedule_closed_review_request(
+                    client, event, observation, first_closed, start_review_request,
+                )
+
+            handled_by_rule = await _maybe_autorespond(
+                client, event, seen_autoresponses, rule_cooldowns,
+            )
             for setting_key, text in client.describe_event(event):
                 if setting_key == "_night_mode_reply_message":
-                    await _send_night_mode_reply(client, text, "message")
+                    if not handled_by_rule:
+                        await _send_night_mode_reply(client, text, "message")
                     continue
                 if setting_key == "_night_mode_reply_order":
                     await _send_night_mode_reply(client, text, "order")
@@ -543,6 +746,12 @@ async def notifications_loop(bot: Bot, client: FunPayClient):
                         if not _is_ignorable_send_error(e):
                             logger.notify(f"Не удалось отправить уведомление: {type(e).__name__}.")
     finally:
+        for task in tuple(request_tasks.values()):
+            task.cancel()
+        if request_tasks:
+            _, pending_requests = await asyncio.wait(tuple(request_tasks.values()), timeout=10.0)
+            if pending_requests:
+                logger.error("Review request task cleanup failed.")
         for task in tuple(review_tasks):
             task.cancel()
         if review_tasks:
