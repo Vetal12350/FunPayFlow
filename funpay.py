@@ -705,6 +705,8 @@ class FunPayClient:
         # для авто-ответов на конкретные фразы) - эту заплатку нужно будет
         # убрать и разбираться, почему сам запрос к get_chat_history падает.
         if not getattr(self.account, "_history_fetch_disabled", False):
+            # The UI may request history explicitly; Runner polling keeps its no-op.
+            self._manual_get_chat_history = self.account.get_chat_history
             def _no_op_get_chat_history(chat_id, *args, **kwargs):
                 return []
 
@@ -982,9 +984,8 @@ class FunPayClient:
                 if (type(author_id) is int and type(account_id) is int
                         and author_id == account_id):
                     return results
-                if getattr(chat, "last_message_text", None) in (
-                    NIGHT_MODE_MESSAGE_TEXT, NIGHT_MODE_ORDER_TEXT,
-                ):
+                from telegram import is_night_mode_reply_text
+                if is_night_mode_reply_text(getattr(chat, "last_message_text", None)):
                     return results
 
                 # Системное событие отзыва не обязано делать чат непрочитанным.
