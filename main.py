@@ -7,6 +7,7 @@ import re
 import sys
 import atexit
 import time
+from datetime import datetime
 from html import escape
 from dotenv import load_dotenv
 from aiogram import Bot
@@ -478,6 +479,12 @@ async def _maybe_autorespond(client: FunPayClient, event, seen: dict, cooldowns:
         value = _expand_template(template["text"], chat_name, account_name)
         if not value.strip() or len(value) > 2000:
             return True
+        # The verified history message has a stable server ID. Claim before transport:
+        # a restart must not repeat an ambiguous or already-started send.
+        if not await asyncio.to_thread(
+            client.review_state.claim_autoresponse, chat_id, message_id, rule["id"],
+        ):
+            return True
         await asyncio.to_thread(
             client.send_message_once, chat_id, value,
             enabled_check=lambda: bot_settings["autoresponder_enabled"],
@@ -576,6 +583,27 @@ def _order_observation(event) -> tuple[str, str] | None:
         if status == known_status:
             return order_id, name
     raise StateError("Order event status unavailable.")
+
+
+def _order_history_fields(order) -> dict:
+    """Only fields supplied by the installed OrderShortcut; no extra FunPay request."""
+    description = getattr(order, "description", None)
+    order_date = getattr(order, "date", None)
+    return {
+        "buyer_username": getattr(order, "buyer_username", None),
+        "buyer_id": getattr(order, "buyer_id", None),
+        "product_description": description,
+        # FunPayAPI's amount defaults to 1 when no quantity is in the text.
+        "quantity": (getattr(order, "amount", None)
+                     if type(description) is str and re.search(r"\d+ шт\.", description)
+                     else None),
+        "subcategory_name": getattr(order, "subcategory_name", None),
+        # API date is naive/local and can have an inferred year; keep that provenance.
+        "funpay_order_date_local": (order_date.isoformat()
+                                    if isinstance(order_date, datetime) and order_date.tzinfo is None
+                                    else None),
+        "listed_price": getattr(order, "price", None),
+    }
 
 
 async def _schedule_closed_review_request(client, event, observation, first_closed, start_task) -> None:
@@ -693,6 +721,7 @@ async def notifications_loop(bot: Bot, client: FunPayClient):
                         if closed else None,
                         currency=(event_currency if event_currency is not None
                                   else bot_settings.get("stats_currency")) if closed else None,
+                        **_order_history_fields(order),
                     )
                 except StateError:
                     logger.error("Order statistics write failed: StateError.")

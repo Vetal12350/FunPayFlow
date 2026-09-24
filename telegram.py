@@ -14,7 +14,7 @@ import FunPayAPI
 import secrets
 import unicodedata
 from collections import deque
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from aiogram import Dispatcher, F
 from aiogram.filters import Command
 from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, ReplyKeyboardMarkup, KeyboardButton, FSInputFile
@@ -543,6 +543,7 @@ def get_main_keyboard(user_id: int):
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=f"🚀 Автоподнятие лотов: {bump_status}", callback_data="toggle_bump")],
         [InlineKeyboardButton(text="📊 Статистика", callback_data="menu_stats")],
+        [InlineKeyboardButton(text="📦 Заказы", callback_data="orders")],
         [InlineKeyboardButton(text="🩺 Статус", callback_data="menu_status")],
         [InlineKeyboardButton(text="🔔 Мои уведомления", callback_data="menu_notifications")],
         [InlineKeyboardButton(text=f"😴 Ночной режим: {night_status}", callback_data="menu_night_mode")],
@@ -1011,6 +1012,135 @@ def _chats_screen(chats: list[tuple[int, str, bool]], page: int) -> tuple[str, I
     return f"💬 <b>Чаты</b> · {page + 1}/{count}", _menu(rows)
 
 
+_ORDER_KINDS = {"all": (None, "🆕 Последние"),
+                "closed": ("CLOSED", "✅ Завершённые"),
+                "refunded": ("REFUNDED", "↩️ Возвраты")}
+_ORDER_ICONS = {"PAID": "🆕", "CLOSED": "✅", "REFUNDED": "↩️"}
+
+
+def _orders_store():
+    if _runtime_client is None or getattr(_runtime_client, "review_state", None) is None:
+        raise RuntimeError("Order history unavailable.")
+    return _runtime_client.review_state
+
+
+def _orders_screen() -> tuple[str, InlineKeyboardMarkup]:
+    return "📦 <b>Заказы</b>\nВыберите список:", _menu([
+        [_button("🆕 Последние", "ord_list:all:0")],
+        [_button("✅ Завершённые", "ord_list:closed:0")],
+        [_button("↩️ Возвраты", "ord_list:refunded:0")],
+        [_button("🔙 Назад", "menu_main")],
+    ])
+
+
+def _order_list_screen(kind: str, page: int, count: int, orders: list[dict]):
+    if kind not in _ORDER_KINDS or page < 0:
+        raise ValueError("Invalid order page.")
+    total_pages = max(1, (count + 9) // 10)
+    rows = []
+    for order in orders:
+        order_id = order["order_id"]
+        product = order["product_description"]
+        label = f"{_ORDER_ICONS.get(order['current_status'], '📦')} {order_id}"
+        if product:
+            label += " · " + " ".join(product.split())[:32]
+        rows.append([_button(label, f"ord_open:{order_id}:{kind}:{page}")])
+    if not rows:
+        rows.append([_button("Заказов пока нет", "orders")])
+    pages = []
+    if page > 0:
+        pages.append(_button("◀️", f"ord_list:{kind}:{page - 1}"))
+    if page + 1 < total_pages:
+        pages.append(_button("▶️", f"ord_list:{kind}:{page + 1}"))
+    if pages:
+        rows.append(pages)
+    rows.append([_button("🔙 К заказам", "orders")])
+    return (f"📦 <b>{_ORDER_KINDS[kind][1]}</b> · {page + 1}/{total_pages}",
+            _menu(rows))
+
+
+def _order_card_screen(order: dict, kind: str, page: int):
+    status_names = {"PAID": "🆕 Оплачен", "CLOSED": "✅ Завершён",
+                    "REFUNDED": "↩️ Возврат"}
+    lines = [f"📦 <b>Заказ #{escape(order['order_id'])}</b>",
+             f"Статус: {status_names.get(order['current_status'], 'Неизвестен')}"]
+    if order.get("buyer_username"):
+        lines.append("👤 Покупатель: " + _escaped_preview(order["buyer_username"], 100))
+    if order.get("product_description"):
+        lines.append("🛒 Товар: " + _escaped_preview(order["product_description"], 600))
+    if order.get("subcategory_name"):
+        lines.append("🏷 Подкатегория: " + _escaped_preview(order["subcategory_name"], 100))
+    if order.get("quantity") is not None:
+        lines.append(f"🔢 Количество: {order['quantity']}")
+    if order.get("listed_price") is not None:
+        price = escape(order["listed_price"])
+        currency = order.get("confirmed_currency")
+        lines.append("💰 Цена: " + price + (" " + escape(currency) if currency else ""))
+    lines.append("🕒 Впервые получен ботом: " +
+                 datetime.fromtimestamp(order["first_seen_at"], timezone.utc).strftime("%Y-%m-%d %H:%M UTC"))
+    if order.get("funpay_order_date_local"):
+        lines.append("📅 Дата в FunPay (локальная): " +
+                     escape(order["funpay_order_date_local"].replace("T", " ")))
+    status_dates = order.get("observed_statuses", {})
+    for status, label in (("CLOSED", "✅ Завершён замечен"),
+                          ("REFUNDED", "↩️ Возврат замечен")):
+        if status in status_dates:
+            lines.append(label + ": " +
+                         datetime.fromtimestamp(status_dates[status], timezone.utc).strftime("%Y-%m-%d %H:%M UTC"))
+    rows = []
+    chat_id = order.get("chat_id")
+    if type(chat_id) is int and chat_id > 0:
+        rows.append([_button("💬 Открыть чат", f"ord_chat:{order['order_id']}")])
+    rows.append([_button("🔙 К заказам", f"ord_list:{kind}:{page}")])
+    return "\n".join(lines), _menu(rows)
+
+
+async def _orders_callback(callback: CallbackQuery, action: str, user_id: int) -> bool:
+    prefix = action.split(":", 1)[0]
+    if prefix not in {"orders", "ord_list", "ord_open", "ord_chat"}:
+        return False
+    answered = False
+    try:
+        parts = action.split(":")
+        if prefix == "orders" and len(parts) == 1:
+            text, markup = _orders_screen()
+        elif prefix == "ord_list" and len(parts) == 3:
+            kind, page = parts[1], int(parts[2])
+            if kind not in _ORDER_KINDS or page < 0 or page > 100000:
+                raise ValueError("Invalid order page.")
+            count, rows = await asyncio.to_thread(
+                _orders_store().list_order_history, _ORDER_KINDS[kind][0], page,
+            )
+            text, markup = _order_list_screen(kind, page, count, rows)
+        elif prefix == "ord_open" and len(parts) == 4:
+            order_id, kind, page = parts[1], parts[2], int(parts[3])
+            if kind not in _ORDER_KINDS or page < 0 or page > 100000:
+                raise ValueError("Invalid order page.")
+            order = await asyncio.to_thread(_orders_store().get_order_history, order_id)
+            if order is None:
+                raise ValueError("Order unavailable.")
+            text, markup = _order_card_screen(order, kind, page)
+        elif prefix == "ord_chat" and len(parts) == 2:
+            order = await asyncio.to_thread(_orders_store().get_order_history, parts[1])
+            chat_id = order.get("chat_id") if order else None
+            if type(chat_id) is not int or chat_id <= 0:
+                raise ValueError("Chat unavailable.")
+            _chat_pages[user_id] = await asyncio.to_thread(_fetch_chats)
+            if chat_id not in {item[0] for item in _chat_pages[user_id]}:
+                raise ValueError("Chat unavailable.")
+            return await _communication_callback(callback, f"chat:{chat_id}", user_id)
+        else:
+            raise ValueError("Invalid order action.")
+        await callback.answer()
+        answered = True
+        await callback.message.edit_text(text, reply_markup=markup, parse_mode="HTML")
+    except Exception as e:
+        logger.warning(f"Order UI unavailable: {type(e).__name__}.")
+        if not answered:
+            await callback.answer("Заказы недоступны.", show_alert=True)
+    return True
+
+
 def _chat_screen(chat_id: int, name: str, messages: list[tuple[str, str]]) -> tuple[str, InlineKeyboardMarkup]:
     header = f"💬 <b>{escape(name[:100])}</b>\n\n"
     remaining = 3500 - len(header)
@@ -1272,6 +1402,8 @@ async def callback_handler(callback: CallbackQuery):
     if await _communication_callback(callback, action, user_id):
         return
     if await _automation_callback(callback, action, user_id):
+        return
+    if await _orders_callback(callback, action, user_id):
         return
 
     # Включение/выключение автоподнятия (глобальная настройка — влияет на всех)
