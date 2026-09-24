@@ -1,4 +1,5 @@
 """Offline pre-live integration cases for settings and schema migrations."""
+import log_isolation
 import copy
 import ast
 import asyncio
@@ -10,6 +11,7 @@ import tempfile
 import threading
 import unittest
 from contextlib import closing
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -86,11 +88,11 @@ class SettingsCompatibilityTests(unittest.TestCase):
         self.assertTrue(ui.is_safe_mode_enabled())
         self.assertFalse(ui.get_user_settings(2)["notify_order"])
         self.assertIsNone(ui.bot_settings["night_mode_reply"])
-        self.assertEqual(ui.bot_settings["reply_templates"], [])
-        self.assertEqual(ui.bot_settings["autoresponder_rules"], [])
         self.assertFalse(ui.bot_settings["night_mode"])
-        self.assertFalse(ui.bot_settings["autoresponder_enabled"])
+        self.assertNotIn("reply_templates", ui.bot_settings)
+        self.assertNotIn("autoresponder_rules", ui.bot_settings)
         self.assertFalse(ui.bot_settings["review_request_enabled"])
+        self.assertEqual(ui.bot_settings["review_request_delay_seconds"], 300)
         self.assertIsNone(ui.bot_settings["stats_currency"])
 
     def test_invalid_safety_or_auth_state_fails_closed_without_partial_mutation(self):
@@ -276,6 +278,15 @@ class MessageLimitsTests(unittest.IsolatedAsyncioTestCase):
 
 
 class PrivacyTests(unittest.TestCase):
+    def test_offline_logger_does_not_write_runtime_daily_log(self):
+        name = f"bot_{datetime.now():%Y-%m-%d}.log"
+        runtime_log = Path(logger.__file__).resolve().parent / "logs" / name
+        previous_size = runtime_log.stat().st_size if runtime_log.exists() else None
+        logger.warning("synthetic-offline-warning")
+        self.assertEqual(runtime_log.stat().st_size if runtime_log.exists() else None,
+                         previous_size)
+        self.assertTrue((Path(logger.LOGS_DIR) / name).is_file())
+
     def test_console_and_file_logger_scrub_credential_markers(self):
         marker = "synthetic-only-value"
         with patch.object(logger, "_write_to_file") as file_write, patch("builtins.print") as output:
@@ -290,26 +301,17 @@ class PrivacyTests(unittest.TestCase):
 
 class CallbackBoundsTests(unittest.TestCase):
     def test_menu_callbacks_use_bounded_ids_and_pages(self):
-        chat_id = 10**18 - 1
-        template = {"id": "a" * 8, "title": "T" * 40, "text": "&" * 1000}
-        rule = {"id": "b" * 8, "trigger": "BUYER_TEXT" * 20,
-                "template_id": template["id"], "match_mode": "EXACT", "enabled": True}
-        with patch.dict(ui.bot_settings,
-                        {"reply_templates": [template], "autoresponder_rules": [rule]}):
-            menus = [
-                ui.get_main_keyboard(1),
-                ui._chats_screen([(chat_id, "BUYER_TEXT" * 100, True)], 0)[1],
-                ui._templates_screen(chat_id)[1],
-                ui._template_screen(template, chat_id)[1],
-                ui._rules_screen()[1], ui._rule_screen(rule)[1],
-                ui._order_list_screen("all", 100000, 1000001,
-                                      [{"order_id": "ABC12345", "product_description": "&" * 1000,
-                                        "current_status": "PAID"}])[1],
-                ui._analytics_keyboard("30d"),
-                ui._audit_screen(100000, 2000020,
-                                 [{"ts": 1, "action": "SETTINGS", "result": "UPDATED",
-                                   "id": chat_id}])[1],
-            ]
+        menus = [
+            ui.get_main_keyboard(1), ui.get_stats_keyboard(),
+            ui._review_request_screen()[1], ui._review_delay_screen()[1],
+            ui._order_list_screen("all", 100000, 1000001,
+                                  [{"order_id": "ABC12345", "product_description": "&" * 1000,
+                                    "current_status": "PAID"}])[1],
+            ui._analytics_keyboard("30d"),
+            ui._audit_screen(100000, 2000020,
+                             [{"ts": 1, "action": "SETTINGS", "result": "UPDATED",
+                               "id": 10**18 - 1}])[1],
+        ]
         callbacks = [button.callback_data for menu in menus
                      for row in menu.inline_keyboard for button in row]
         self.assertTrue(callbacks)
@@ -330,7 +332,7 @@ class ShutdownGateTests(unittest.IsolatedAsyncioTestCase):
 
         def send_queued():
             entered.set()
-            return FunPayClient.send_message_once(client, 2, "reply")
+            return FunPayClient.send_review_request_once(client, 2, "reply")
 
         with client._account_lock:
             task = asyncio.create_task(asyncio.to_thread(send_queued))

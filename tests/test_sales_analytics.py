@@ -1,4 +1,5 @@
 """Synthetic SQLite sales analytics checks; no bot startup or network."""
+import log_isolation
 import sqlite3
 import tempfile
 import time
@@ -179,7 +180,8 @@ class SalesAnalyticsTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Widget &lt;A&gt;", rendered)
         self.assertNotIn("Widget <A>", rendered)
         self.assertIn("50.0%", rendered)
-        self.assertIn("📈 Аналитика", str(ui.get_stats_keyboard()))
+        self.assertIn("📈 Аналитика", str(ui.get_main_keyboard(1)))
+        self.assertNotIn("📈 Аналитика", str(ui.get_stats_keyboard()))
         top = ui._analytics_top_text("today", "count",
                                      self.store.get_sales_top_products("today", now_utc=self.now))
         self.assertIn("&lt;A&gt;", top)

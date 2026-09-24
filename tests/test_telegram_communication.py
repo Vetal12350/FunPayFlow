@@ -1,4 +1,5 @@
 """Offline checks for Telegram communication; no production bot is started."""
+import log_isolation
 import asyncio
 import ast
 import copy
@@ -69,17 +70,10 @@ class CommunicationTests(unittest.IsolatedAsyncioTestCase):
         ui.bot_settings.clear()
         ui.bot_settings.update(copy.deepcopy(ui._DEFAULT_GLOBAL_SETTINGS))
         ui._interaction_state.clear()
-        ui._chat_pages.clear()
         self.account = FakeAccount()
         ui._runtime_client = SimpleNamespace(
             account=self.account, _account_lock=threading.RLock(),
             runner_stop_requested=lambda: False,
-            send_message_once=lambda chat_id, text: self.account.send_message(
-                chat_id, text, update_last_saved_message=True),
-            _manual_get_chat_history=lambda chat_id, **kwargs: [
-                SimpleNamespace(author_id=10, author="Seller", text="<mine>"),
-                SimpleNamespace(author_id=20, author=f"Buyer{chat_id}", text="<&>"),
-            ],
         )
 
     async def asyncTearDown(self):
@@ -88,7 +82,6 @@ class CommunicationTests(unittest.IsolatedAsyncioTestCase):
         ui.SETTINGS_FILE = self.previous_file
         ui._runtime_client = self.previous_client
         ui._interaction_state.clear()
-        ui._chat_pages.clear()
         self.tmp.cleanup()
 
     async def test_night_mode_save_reset_reload_and_echo(self):
@@ -171,53 +164,8 @@ class CommunicationTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.wait_for(task, 2)
         self.assertEqual(self.account.sent, [])
 
-    async def test_chats_pagination_and_safe_preview(self):
-        self.assertEqual([[b.text for b in row] for row in ui.get_reply_keyboard().keyboard],
-                         [["🛠 Главное меню"]])
-        self.assertIn("chats:0", [b.callback_data for row in ui.get_main_keyboard(1).inline_keyboard
-                                   for b in row])
-        chats = ui._fetch_chats()
-        text, markup = ui._chats_screen(chats, 0)
-        self.assertIn("1/2", text)
-        self.assertEqual(markup.inline_keyboard[0][0].callback_data, "chat:1")
-        self.assertIn("🟠", markup.inline_keyboard[1][0].text)
-        self.assertIn("chats:1", [b.callback_data for row in markup.inline_keyboard for b in row])
-        name, messages = ui._fetch_chat(2)
-        view, markup = ui._chat_screen(2, name, messages)
-        self.assertIn("&lt;mine&gt;", view)
-        self.assertIn("&lt;&amp;&gt;", view)
-        self.assertIn("🧑‍💻 я", view)
-        self.assertIn("👤 собеседник", view)
-        self.assertLess(len(ui._chat_screen(2, "x", [("x", "&" * 10000)] * 10)[0]), 4096)
-        ui._runtime_client._manual_get_chat_history = lambda *args, **kwargs: (_ for _ in ()).throw(
-            RuntimeError("private response"))
-        self.assertEqual(ui._fetch_chat(2)[1], [("Последний фрагмент · история недоступна", "preview")])
 
-    async def test_manual_reply_binding_single_send_and_cancel(self):
-        ui._chat_pages[1] = ui._fetch_chats()
-        await ui._communication_callback(FakeCallback("reply:2"), "reply:2", 1)
-        self.assertEqual(ui._interaction_state[1]["chat_id"], 2)
-        with patch.object(ui, "is_authorized", return_value=True):
-            await ui.text_handler(FakeMessage(text="Hello"))
-            await ui.text_handler(FakeMessage(text="ignored"))
-        self.assertEqual(len(self.account.sent), 1)
-        self.assertEqual(self.account.sent[0][0:2], (2, "Hello"))
-        self.assertEqual(ui._interaction_state, {})
-        await ui._communication_callback(FakeCallback("reply:3"), "reply:3", 1)
-        with patch.object(ui, "is_authorized", return_value=True):
-            await ui.text_handler(FakeMessage(text="❌ Отмена"))
-        self.assertEqual(len(self.account.sent), 1)
 
-    async def test_manual_reply_blocked_during_shutdown(self):
-        message = FakeMessage(text="Hello")
-        audit = []
-        with patch.object(ui, "_send_to_chat", return_value=False), patch.object(
-            ui, "_audit_action", side_effect=lambda *args: audit.append(args)
-        ):
-            await ui._send_one_reply(message, 2, "Hello")
-        self.assertIn("не отправлено", message.sent[0][0])
-        self.assertEqual(audit[0][-1], "BLOCKED")
-        self.assertEqual(self.account.sent, [])
 
     async def test_authorization_and_command_safety(self):
         cb = FakeCallback("reply:2", user_id=900)
@@ -247,80 +195,10 @@ class CommunicationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(ui.bot_settings["authorized_user_ids"], previous_ids)
         self.assertIn("Не удалось сохранить", message.sent[0][0])
 
-    async def test_transport_ambiguity_has_no_retry(self):
-        ui._interaction_state[1] = {"action": "reply", "chat_id": 2}
-        calls = []
-        def timeout(*args, **kwargs):
-            calls.append(1)
-            raise ui.requests.exceptions.Timeout()
-        with patch.object(ui, "is_authorized", return_value=True), patch.object(ui, "_send_to_chat", timeout):
-            msg = FakeMessage(text="Hello")
-            await ui.text_handler(msg)
-        self.assertEqual(calls, [1])
-        self.assertIn("не удалось подтвердить", msg.sent[0][0].lower())
-        self.assertNotIn(1, ui._interaction_state)
 
-    async def test_definite_funpay_rejection_is_safe(self):
-        error = ui.FunPayAPI.exceptions.MessageNotDeliveredError.__new__(
-            ui.FunPayAPI.exceptions.MessageNotDeliveredError)
-        error.error_message = "private server response"
-        def reject(*args, **kwargs):
-            raise error
-        with patch.object(ui, "_send_to_chat", reject):
-            msg = FakeMessage()
-            await ui._send_one_reply(msg, 2, "text")
-        self.assertIn("отклонил", msg.sent[0][0])
-        self.assertNotIn("private", msg.sent[0][0])
 
-    async def test_templates_save_reload_rollback_and_variables(self):
-        template = {"id": "abcdef12", "title": "Hi", "text": "Hi {chat_name} from {account}"}
-        ui._save_global_setting("reply_templates", [template])
-        ui.load_settings()
-        self.assertEqual(ui._template("abcdef12"), template)
-        self.assertEqual(ui._expand_template(template["text"], "Buyer", "Seller"), "Hi Buyer from Seller")
-        with self.assertRaises(ValueError):
-            ui._expand_template("Order {order_id}", "Buyer", "Seller")
-        with self.assertRaises(ValueError):
-            ui._validate_template("{chat_name!r}")
-        self.assertIn("&lt;Buyer&gt;", ui._escaped_preview(
-            ui._expand_template("{chat_name}", "<Buyer>", "Seller"), 100))
-        with patch.object(ui, "save_settings", side_effect=RuntimeError("disk")):
-            with self.assertRaises(RuntimeError):
-                ui._save_global_setting("reply_templates", [])
-        self.assertEqual(ui._templates(), [template])
 
-    async def test_quick_send_requires_confirmation_and_consumes_state(self):
-        ui._chat_pages[1] = ui._fetch_chats()
-        ui._save_global_setting("reply_templates", [{"id": "abcdef12", "title": "Hi",
-                                                      "text": "Hi {chat_name}"}])
-        cb = FakeCallback("quick_preview:abcdef12:2")
-        await ui._communication_callback(cb, cb.data, 1)
-        self.assertEqual(self.account.sent, [])
-        self.assertIn("Hi Buyer2", cb.message.edits[0][0])
-        send = FakeCallback("quick_send:abcdef12:2")
-        await ui._communication_callback(send, send.data, 1)
-        await ui._communication_callback(FakeCallback(send.data), send.data, 1)
-        self.assertEqual(len(self.account.sent), 1)
 
-    async def test_template_ui_crud_and_pending_isolation(self):
-        ui._chat_pages[1] = ui._fetch_chats()
-        with patch.object(ui, "is_authorized", return_value=True):
-            await ui._communication_callback(FakeCallback("tpl_add:0"), "tpl_add:0", 1)
-            await ui.text_handler(FakeMessage(text="Title"))
-            await ui.text_handler(FakeMessage(text="Text {account}"))
-            self.assertEqual(len(ui._templates()), 1)
-            item_id = ui._templates()[0]["id"]
-            await ui._communication_callback(FakeCallback(f"tpl_title:{item_id}:0"), f"tpl_title:{item_id}:0", 1)
-            await ui.text_handler(FakeMessage(text="Renamed"))
-            self.assertEqual(ui._template(item_id)["title"], "Renamed")
-            await ui._communication_callback(FakeCallback(f"tpl_delete:{item_id}:0"), f"tpl_delete:{item_id}:0", 1)
-            self.assertEqual(ui._templates(), [])
-            ui._interaction_state[1] = {"action": "reply", "chat_id": 2}
-            await ui.text_handler(FakeMessage(text="🛠 Главное меню"))
-            self.assertNotIn(1, ui._interaction_state)
-            ui._interaction_state[1] = {"action": "reply", "chat_id": 2}
-            await ui.callback_handler(FakeCallback("menu_stats"))
-            self.assertNotIn(1, ui._interaction_state)
 
 
 if __name__ == "__main__":

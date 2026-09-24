@@ -1,4 +1,5 @@
 """Offline durability and typed-event checks for the runtime core."""
+import log_isolation
 import ast
 import asyncio
 from contextlib import closing
@@ -216,8 +217,6 @@ class RuntimeCoreTests(unittest.TestCase):
         nodes = [node for node in ast.parse(source).body
                  if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
                  and node.name in wanted]
-        async def no_autoresponse(*args):
-            return False
         async def no_night_reply(*args):
             return None
         async def no_review_check(*args, **kwargs):
@@ -230,7 +229,6 @@ class RuntimeCoreTests(unittest.TestCase):
             "QueuedCriticalEvent": QueuedCriticalEvent, "ReviewCheckEvent": ReviewCheckEvent,
             "bot_settings": {"stats_currency": "USD", "review_request_enabled": False},
             "is_review_request_enabled": lambda: False,
-            "_maybe_autorespond": no_autoresponse,
             "_send_night_mode_reply": no_night_reply,
             "_fetch_and_send_review": no_review_check,
             "_send_scheduled_review_request": no_review_check,
