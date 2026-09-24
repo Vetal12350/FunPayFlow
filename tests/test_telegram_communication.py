@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import telegram as ui
+from runtime_events import ActionEvent, ActionKind
 
 
 class FakeMessage:
@@ -115,6 +116,7 @@ class CommunicationTests(unittest.IsolatedAsyncioTestCase):
         node = next(n for n in ast.parse(source).body if isinstance(n, ast.AsyncFunctionDef)
                     and n.name == "_send_night_mode_reply")
         namespace = {"FunPayClient": object, "asyncio": asyncio,
+                     "ActionEvent": ActionEvent, "ActionKind": ActionKind,
                      "is_night_mode_enabled": ui.is_night_mode_enabled,
                      "is_safe_mode_enabled": ui.is_safe_mode_enabled,
                      "get_night_mode_reply_text": ui.get_night_mode_reply_text,
@@ -123,11 +125,13 @@ class CommunicationTests(unittest.IsolatedAsyncioTestCase):
         exec(compile(ast.Module(body=[node], type_ignores=[]), "main.py", "exec"), namespace)
         ui._save_global_setting("night_mode_reply", "custom")
         ui.bot_settings["night_mode"] = True
-        await namespace["_send_night_mode_reply"](ui._runtime_client, "2", "message")
+        await namespace["_send_night_mode_reply"](
+            ui._runtime_client, ActionEvent(ActionKind.NIGHT_MESSAGE, chat_id=2))
         self.assertEqual(self.account.sent[0][1], "custom")
         self.assertTrue(self.account.sent[0][2]["update_last_saved_message"])
         ui.bot_settings["night_mode"] = False
-        await namespace["_send_night_mode_reply"](ui._runtime_client, "2", "message")
+        await namespace["_send_night_mode_reply"](
+            ui._runtime_client, ActionEvent(ActionKind.NIGHT_MESSAGE, chat_id=2))
         self.assertEqual(len(self.account.sent), 1)
 
     async def test_safe_mode_blocks_night_mode_auto_send(self):
@@ -135,6 +139,7 @@ class CommunicationTests(unittest.IsolatedAsyncioTestCase):
         node = next(n for n in ast.parse(source).body if isinstance(n, ast.AsyncFunctionDef)
                     and n.name == "_send_night_mode_reply")
         namespace = {"FunPayClient": object, "asyncio": asyncio,
+                     "ActionEvent": ActionEvent, "ActionKind": ActionKind,
                      "is_night_mode_enabled": ui.is_night_mode_enabled,
                      "is_safe_mode_enabled": ui.is_safe_mode_enabled,
                      "get_night_mode_reply_text": ui.get_night_mode_reply_text,
@@ -143,7 +148,8 @@ class CommunicationTests(unittest.IsolatedAsyncioTestCase):
         exec(compile(ast.Module(body=[node], type_ignores=[]), "main.py", "exec"), namespace)
         ui.bot_settings["night_mode"] = True
         ui.bot_settings["safe_mode"] = True
-        await namespace["_send_night_mode_reply"](ui._runtime_client, "2", "message")
+        await namespace["_send_night_mode_reply"](
+            ui._runtime_client, ActionEvent(ActionKind.NIGHT_MESSAGE, chat_id=2))
         self.assertEqual(self.account.sent, [])
 
         entered, release = threading.Event(), threading.Event()
@@ -156,7 +162,8 @@ class CommunicationTests(unittest.IsolatedAsyncioTestCase):
         self.account.get_chat_by_name = prepare_chat
         ui.bot_settings["safe_mode"] = False
         task = asyncio.create_task(namespace["_send_night_mode_reply"](
-            ui._runtime_client, ("Buyer2", 2), "order"))
+            ui._runtime_client, ActionEvent(ActionKind.NIGHT_ORDER,
+                                            buyer="Buyer2", chat_id=2)))
         self.assertTrue(await asyncio.to_thread(entered.wait, 2))
         ui.bot_settings["safe_mode"] = True
         release.set()
