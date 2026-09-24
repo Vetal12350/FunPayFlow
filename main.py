@@ -21,7 +21,7 @@ from telegram import (dp, bot_settings, get_user_settings, get_all_recipients,
                       is_safe_mode_enabled, record_withdrawal_poll,
                       set_telegram_polling_state, _set_problem, _clear_problem,
                       _audit_action,
-                      get_night_mode_reply_text, match_autoresponder, _expand_template,
+                      get_night_mode_reply_text,
                       expand_review_request_text, is_review_request_enabled)
 from funpay import FunPayClient, _AmbiguousRaiseOutcome
 from runtime_events import (ActionEvent, ActionKind, QueuedCriticalEvent,
@@ -421,102 +421,6 @@ async def _send_night_mode_reply(
         logger.warning(f"Не удалось отправить автоответ: {type(e).__name__}.")
 
 
-def _verified_incoming_message(client: FunPayClient, event):
-    """A chat shortcut alone has no author; verify the newest message explicitly."""
-    if event.type is not FunPayAPI.enums.EventTypes.LAST_CHAT_MESSAGE_CHANGED:
-        return None
-    chat = getattr(event, "chat", None)
-    chat_id = getattr(chat, "id", None)
-    name = getattr(chat, "name", None)
-    preview = getattr(chat, "last_message_text", None)
-    if (type(chat_id) is not int or chat_id <= 0 or type(name) is not str or not name
-            or type(preview) is not str or not preview
-            or not getattr(chat, "unread", False)
-            or getattr(chat, "last_message_type", None) is not FunPayAPI.types.MessageTypes.NON_SYSTEM):
-        return None
-    with client._account_lock:
-        history = getattr(client, "_manual_get_chat_history", None)
-        if history is None:
-            return None
-        messages = history(chat_id, interlocutor_username=name)
-        account_id = getattr(client.account, "id", None)
-        account_name = getattr(client.account, "username", None)
-    if (not messages or type(account_id) is not int
-            or type(account_name) is not str or not account_name):
-        return None
-    newest = max((item for item in messages if type(getattr(item, "id", None)) is int),
-                 key=lambda item: item.id, default=None)
-    if (newest is None or getattr(newest, "text", None) != preview
-            or type(getattr(newest, "author_id", None)) is not int
-            or newest.author_id <= 0 or newest.author_id == account_id
-            or getattr(newest, "author", None) != name
-            or getattr(newest, "by_bot", False)):
-        return None
-    return chat_id, newest.id, name, account_name, newest.text
-
-
-async def _maybe_autorespond(client: FunPayClient, event, seen: dict, cooldowns: dict) -> bool:
-    """True means a specific rule owns this event, so generic Night Mode is skipped."""
-    if not bot_settings["autoresponder_enabled"]:
-        return False
-    try:
-        incoming = await asyncio.to_thread(_verified_incoming_message, client, event)
-    except Exception as e:
-        logger.warning(f"Autoresponder verification unavailable: {type(e).__name__}.")
-        return False
-    if incoming is None:
-        return False
-    chat_id, message_id, chat_name, account_name, body = incoming
-    marker = (chat_id, message_id)
-    if marker in seen:
-        return True
-    matched = match_autoresponder(body)
-    if matched is None:
-        return False
-    rule, template = matched
-    seen[marker] = time.monotonic()
-    if len(seen) > 10000:
-        oldest = next(iter(seen))
-        seen.pop(oldest, None)
-    key = (chat_id, rule["id"])
-    now = time.monotonic()
-    if now - cooldowns.get(key, -float("inf")) < 60:
-        return True
-    cooldowns[key] = now
-    if len(cooldowns) > 10000:
-        for expired in [item for item, used_at in cooldowns.items() if now - used_at >= 60]:
-            cooldowns.pop(expired, None)
-        while len(cooldowns) > 10000:
-            cooldowns.pop(next(iter(cooldowns)))
-    send_attempted = False
-    try:
-        value = _expand_template(template["text"], chat_name, account_name)
-        if not value.strip() or len(value) > 2000:
-            return True
-        if is_safe_mode_enabled():
-            return True
-        # The verified history message has a stable server ID. Claim before transport:
-        # a restart must not repeat an ambiguous or already-started send.
-        if not await asyncio.to_thread(
-            client.review_state.claim_autoresponse, chat_id, message_id, rule["id"],
-        ):
-            return True
-        send_attempted = True
-        sent = await asyncio.to_thread(
-            client.send_message_once, chat_id, value,
-            enabled_check=lambda: bot_settings["autoresponder_enabled"]
-            and not is_safe_mode_enabled(),
-        )
-        await asyncio.to_thread(_audit_action, "automation", "AUTO_RESPONSE_SEND", "chat",
-                                "BLOCKED" if sent is False else "SUCCESS")
-    except Exception as e:
-        logger.warning(f"Autoresponder result unconfirmed: {type(e).__name__}.")
-        if send_attempted:
-            await asyncio.to_thread(_audit_action, "automation", "AUTO_RESPONSE_SEND", "chat",
-                                    "AMBIGUOUS")
-    return True
-
-
 def _review_chat_context(client: FunPayClient, buyer: str):
     with client._account_lock:
         chat = client.account.get_chat_by_name(buyer, make_request=True)
@@ -588,7 +492,7 @@ async def _send_scheduled_review_request(
             continue
         try:
             sent = await asyncio.to_thread(
-                client.send_message_once, chat_id, value,
+                client.send_review_request_once, chat_id, value,
                 enabled_check=lambda: is_review_request_enabled() and not is_safe_mode_enabled(),
             )
         except Exception as e:
@@ -658,7 +562,7 @@ async def _schedule_closed_review_request(client, event, observation, first_clos
     buyer = getattr(getattr(event, "order", None), "buyer_username", None)
     if type(buyer) is not str or not buyer.strip():
         return
-    scheduled_at = int(time.time()) + bot_settings["review_request_delay"] * 60
+    scheduled_at = int(time.time()) + bot_settings["review_request_delay_seconds"]
     created = await asyncio.to_thread(
         client.review_state.schedule_review_request,
         observation[0], buyer, scheduled_at,
@@ -690,8 +594,6 @@ async def notifications_loop(bot: Bot, client: FunPayClient):
     max_review_tasks = 256
     review_tasks: set[asyncio.Task] = set()
     request_tasks: dict[str, asyncio.Task] = {}
-    seen_autoresponses: dict[tuple[int, int], float] = {}
-    rule_cooldowns: dict[tuple[int, str], float] = {}
     review_failed = False
 
     def review_done(task: asyncio.Task) -> None:
@@ -836,13 +738,9 @@ async def notifications_loop(bot: Bot, client: FunPayClient):
                     start_review_request,
                 )
 
-            handled_by_rule = await _maybe_autorespond(
-                client, event, seen_autoresponses, rule_cooldowns,
-            )
             for action in client.describe_event(event):
                 if action.kind is ActionKind.NIGHT_MESSAGE:
-                    if not handled_by_rule:
-                        await _send_night_mode_reply(client, action)
+                    await _send_night_mode_reply(client, action)
                     continue
                 if action.kind is ActionKind.NIGHT_ORDER:
                     if backlog_id is not None:

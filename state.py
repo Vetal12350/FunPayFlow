@@ -197,12 +197,6 @@ class ReviewReceiptStore:
                         "first_observed_at INTEGER NOT NULL, "
                         "PRIMARY KEY(order_id, status))"
                     )
-                    connection.execute(
-                        "CREATE TABLE IF NOT EXISTS autoresponse_receipts ("
-                        "chat_id INTEGER NOT NULL, message_id INTEGER NOT NULL, "
-                        "rule_id TEXT NOT NULL, claimed_at INTEGER NOT NULL, "
-                        "PRIMARY KEY(chat_id, message_id))"
-                    )
                     # Для уже закрытых заказов последняя запись — лучшее
                     # доступное время закрытия; историю возвратов не выдумываем.
                     connection.execute(
@@ -709,21 +703,6 @@ class ReviewReceiptStore:
         except (sqlite3.Error, OSError):
             raise StateError("Persistent order read failed.") from None
 
-    def claim_autoresponse(self, chat_id: int, message_id: int, rule_id: str) -> bool:
-        if (type(chat_id) is not int or chat_id <= 0 or type(message_id) is not int
-                or message_id <= 0 or type(rule_id) is not str
-                or not re.fullmatch(r"[0-9a-f]{8}", rule_id)):
-            raise StateError("Invalid autoresponse identity.")
-        try:
-            with closing(self._connect()) as connection:
-                with connection:
-                    return connection.execute(
-                        "INSERT OR IGNORE INTO autoresponse_receipts "
-                        "(chat_id, message_id, rule_id, claimed_at) VALUES (?, ?, ?, ?)",
-                        (chat_id, message_id, rule_id, int(time.time())),
-                    ).rowcount == 1
-        except (sqlite3.Error, OSError):
-            raise StateError("Persistent autoresponse write failed.") from None
 
     @staticmethod
     def _analytics_window(period: str, now_utc: int | None):
@@ -947,13 +926,12 @@ class ReviewReceiptStore:
                            result: str, details_safe: str | None = None) -> None:
         """Only fixed action metadata is accepted; never persist message bodies."""
         allowed_actions = {
-            "AUTOBUMP", "NIGHT_MODE", "AUTORESPONDER", "REVIEW_REQUEST",
-            "SAFE_MODE", "TEMPLATE", "RULE", "MANUAL_SEND", "AUTO_RESPONSE_SEND",
+            "AUTOBUMP", "NIGHT_MODE", "REVIEW_REQUEST", "SAFE_MODE",
             "REVIEW_REQUEST_SEND", "SETTINGS",
         }
         allowed_results = {"ON", "OFF", "CREATED", "UPDATED", "DELETED",
                            "SUCCESS", "FAILED", "BLOCKED", "AMBIGUOUS"}
-        allowed_targets = {"global", "chat", "template", "rule", "order", "settings"}
+        allowed_targets = {"global", "order", "settings"}
         if (not (actor in ("system", "automation") or
                  (type(actor) is str and re.fullmatch(r"telegram:[1-9][0-9]{0,19}", actor)))
                 or action not in allowed_actions or target not in allowed_targets

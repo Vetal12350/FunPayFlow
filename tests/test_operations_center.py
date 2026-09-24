@@ -1,4 +1,5 @@
 """Offline Operations Center checks; no production runtime or network."""
+import log_isolation
 import asyncio
 import ast
 import copy
@@ -69,7 +70,7 @@ class OperationsTests(unittest.IsolatedAsyncioTestCase):
     async def test_status_and_problem_lifecycle(self):
         status = ui.get_runtime_status_text()
         for field in ("FunPay Runner:", "Telegram:", "Очередь событий:", "SQLite:",
-                      "Автоподнятие:", "Night Mode:", "Автоответчик:", "SAFE_MODE:",
+                      "Автоподнятие:", "Night Mode:", "Запрос отзыва:", "SAFE_MODE:",
                       "Withdrawal polling:", "Ожидающих запросов отзыва:"):
             self.assertIn(field, status)
         self.assertNotIn("secret-raw-error", status)
@@ -98,14 +99,14 @@ class OperationsTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("DB_UNAVAILABLE", {p["code"] for p in ui.get_active_problems()})
 
     async def test_audit_sanitization_pagination_and_setting(self):
-        ui._save_global_setting("autoresponder_enabled", True, actor="telegram:1")
+        ui._save_global_setting("review_request_enabled", True, actor="telegram:1")
         count, rows = self.store.list_audit_events()
         self.assertEqual((count, rows[0]["action"], rows[0]["result"]),
-                         (1, "AUTORESPONDER", "ON"))
+                         (1, "REVIEW_REQUEST", "ON"))
         self.assertEqual(rows[0]["actor"], "telegram:1")
         self.assertIsNone(rows[0]["details_safe"])
         with self.assertRaises(StateError):
-            self.store.record_audit_event("telegram:1", "MANUAL_SEND", "chat", "SUCCESS",
+            self.store.record_audit_event("telegram:1", "REVIEW_REQUEST_SEND", "order", "SUCCESS",
                                           "secret message body")
         for _ in range(25):
             self.store.record_audit_event("system", "SETTINGS", "global", "UPDATED")
@@ -148,15 +149,6 @@ class OperationsTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(ui.toggle_safe_mode_saved())
         self.assertIn("AUDIT_UNAVAILABLE", {p["code"] for p in ui.get_active_problems()})
 
-    async def test_manual_send_allowed_in_safe_mode(self):
-        sent = []
-        ui.bot_settings["safe_mode"] = True
-        ui._runtime_client.send_message_once = lambda chat_id, value: sent.append((chat_id, value))
-        message = SimpleNamespace(from_user=SimpleNamespace(id=1),
-                                  answer=lambda *args, **kwargs: asyncio.sleep(0))
-        await ui._send_one_reply(message, 2, "body")
-        self.assertEqual(sent, [(2, "body")])
-        self.assertEqual(self.store.list_audit_events()[1][0]["action"], "MANUAL_SEND")
 
     async def test_autobump_safe_gate_and_late_check(self):
         source = Path("main.py").read_text(encoding="utf-8")

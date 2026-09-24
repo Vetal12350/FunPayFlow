@@ -1,4 +1,5 @@
 """Offline checks for persistent order history and its Telegram screens."""
+import log_isolation
 import ast
 import asyncio
 import re
@@ -151,7 +152,7 @@ class OrderHistoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("ord_list:all:1", data)
         self.assertTrue(all(len(item) <= 64 for item in data))
 
-    def test_card_escapes_unknowns_and_chat_button(self):
+    def test_card_escapes_unknowns_without_chat_button(self):
         self.store.record_order_observation("ABC12345", "PAID", 100,
                                             buyer_username="<buyer>",
                                             product_description="<item>&", listed_price=12)
@@ -167,18 +168,8 @@ class OrderHistoryTests(unittest.IsolatedAsyncioTestCase):
         self.store.record_order_observation("ABC12345", "PAID", 101, chat_id=7)
         card = self.store.get_order_history("ABC12345")
         _, markup = ui._order_card_screen(card, "all", 0)
-        self.assertIn("ord_chat:ABC12345", str(markup))
+        self.assertNotIn("ord_chat:", str(markup))
 
-    async def test_order_callback_reuses_chat_view(self):
-        self.store.record_order_observation("ABC12345", "PAID", 100, chat_id=7)
-        callback = Callback("ord_chat:ABC12345")
-        async def existing_chat_path(target, action, user_id):
-            self.assertEqual((action, user_id), ("chat:7", 1))
-            return True
-        with patch.object(ui, "_fetch_chats", return_value=[(7, "Buyer", False)]), \
-             patch.object(ui, "_communication_callback", side_effect=existing_chat_path):
-            self.assertTrue(await ui._orders_callback(callback, callback.data, 1))
-        self.assertEqual(callback.answers, [])
 
     async def test_menu_and_card_callbacks(self):
         self.assertIn("📦 Заказы", str(ui.get_main_keyboard(1)))

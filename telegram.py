@@ -9,9 +9,6 @@ import time
 import tempfile
 from html import escape
 from string import Formatter
-import requests
-import FunPayAPI
-import secrets
 import unicodedata
 from collections import deque
 from datetime import datetime, timedelta, timezone
@@ -266,7 +263,7 @@ def get_runtime_status_text() -> str:
         f"Ожидающих запросов отзыва: {pending if pending is not None else 'недоступно'}",
         f"Автоподнятие: {bump_text}",
         f"Night Mode: {'включён' if is_night_mode_enabled() else 'выключен'}",
-        f"Автоответчик: {'включён' if bot_settings.get('autoresponder_enabled') else 'выключен'}",
+        f"Запрос отзыва: {'включён' if is_review_request_enabled() else 'выключен'}",
         f"SAFE_MODE: {'включён' if is_safe_mode_enabled() else 'выключен'}",
         "Withdrawal polling: " + ("ошибок подряд " + str(_withdrawal_failures)
                                  if _withdrawal_failures else "последняя проверка успешна"
@@ -296,7 +293,9 @@ def get_runtime_status_text() -> str:
 #   2. Персональные (_user_settings) — notify_*, notifications_enabled.
 #      У каждого авторизованного пользователя свои, независимые друг от друга.
 SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot_settings.json")
-DEFAULT_REVIEW_REQUEST_TEXT = "Спасибо за покупку! Если всё понравилось, пожалуйста, оставьте отзыв о заказе."
+OLD_DEFAULT_REVIEW_REQUEST_TEXT = "Спасибо за покупку! Если всё понравилось, пожалуйста, оставьте отзыв о заказе."
+DEFAULT_REVIEW_REQUEST_TEXT = OLD_DEFAULT_REVIEW_REQUEST_TEXT + "\n\n{order_url}"
+DEFAULT_REVIEW_REQUEST_DELAY_SECONDS = 300
 
 # Глобальные настройки — общие для всего бота
 _DEFAULT_GLOBAL_SETTINGS: dict = {
@@ -307,12 +306,9 @@ _DEFAULT_GLOBAL_SETTINGS: dict = {
     # OLD production-аккаунт был USD; это явная account-level настройка статистики.
     "stats_currency": "USD",
     "night_mode_reply": None,
-    "reply_templates": [],
-    "autoresponder_enabled": False,
-    "autoresponder_rules": [],
     "review_request_enabled": False,
     "review_request_text": DEFAULT_REVIEW_REQUEST_TEXT,
-    "review_request_delay": 5,
+    "review_request_delay_seconds": DEFAULT_REVIEW_REQUEST_DELAY_SECONDS,
 }
 
 # Дефолтные персональные настройки — используются при первой авторизации нового пользователя
@@ -330,8 +326,6 @@ bot_settings: dict = dict(_DEFAULT_GLOBAL_SETTINGS)
 _night_mode_state_lock = threading.Lock()
 _night_reply_echoes = deque([NIGHT_MODE_MESSAGE_TEXT, NIGHT_MODE_ORDER_TEXT], maxlen=8)
 _interaction_state: dict[int, dict] = {}
-_chat_pages: dict[int, list[tuple[int, str, bool]]] = {}
-_notification_parent: dict[int, str] = {}
 
 # Персональные настройки: {user_id (int): {notify_*, notifications_enabled}}
 _user_settings: dict[int, dict] = {}
@@ -383,7 +377,6 @@ def load_settings() -> None:
                 or type(saved.get("auto_bump", False)) is not bool
                 or type(saved.get("night_mode", False)) is not bool
                 or type(saved.get("safe_mode", False)) is not bool
-                or type(saved.get("autoresponder_enabled", False)) is not bool
                 or type(saved.get("review_request_enabled", False)) is not bool):
             raise ValueError("Invalid global settings.")
         user_ids = saved.get("authorized_user_ids", [])
@@ -402,46 +395,28 @@ def load_settings() -> None:
         if any(type(saved[key]) is not bool for key in _DEFAULT_USER_SETTINGS if key in saved):
             raise ValueError("Invalid legacy settings.")
         custom_reply = saved.get("night_mode_reply")
-        templates = saved.get("reply_templates", [])
         if (custom_reply is not None and (type(custom_reply) is not str or not custom_reply.strip()
                                           or len(custom_reply) > 1000)):
             saved["night_mode_reply"] = None
             saved["night_mode"] = False
             print("[SETTINGS] Некорректный night_mode_reply пропущен; автоответ выключен.")
-        if (type(templates) is not list or len(templates) > 20
-                or any(type(item) is not dict or set(item) != {"id", "title", "text"}
-                       or type(item["id"]) is not str or not re.fullmatch(r"[0-9a-f]{8}", item["id"])
-                       or type(item["title"]) is not str or not 0 < len(item["title"]) <= 40
-                       or type(item["text"]) is not str or not 0 < len(item["text"]) <= 1000
-                       for item in templates)
-                or len({item["id"] for item in templates}) != len(templates)):
-            saved["reply_templates"] = []
-            saved["autoresponder_enabled"] = False
-            print("[SETTINGS] Некорректные reply_templates пропущены; автоответчик выключен.")
-        rules = saved.get("autoresponder_rules", [])
-        if (type(rules) is not list or len(rules) > 50
-                or any(type(rule) is not dict or set(rule) != {
-                    "id", "trigger", "template_id", "match_mode", "enabled"}
-                    or type(rule["id"]) is not str or not re.fullmatch(r"[0-9a-f]{8}", rule["id"])
-                    or type(rule["trigger"]) is not str or not 0 < len(rule["trigger"].strip()) <= 200
-                    or type(rule["template_id"]) is not str
-                    or not re.fullmatch(r"[0-9a-f]{8}", rule["template_id"])
-                    or rule["match_mode"] not in ("EXACT", "CONTAINS")
-                    or type(rule["enabled"]) is not bool for rule in rules)
-                or len({rule["id"] for rule in rules}) != len(rules)):
-            saved["autoresponder_rules"] = []
-            saved["autoresponder_enabled"] = False
-            print("[SETTINGS] Некорректные autoresponder_rules пропущены; автоответчик выключен.")
         review_text = saved.get("review_request_text", DEFAULT_REVIEW_REQUEST_TEXT)
-        review_delay = saved.get("review_request_delay", 5)
         if type(review_text) is not str or not review_text.strip() or len(review_text) > 1000:
             saved["review_request_text"] = DEFAULT_REVIEW_REQUEST_TEXT
             saved["review_request_enabled"] = False
             print("[SETTINGS] Некорректный review_request_text пропущен; автоотправка выключена.")
-        if type(review_delay) is not int or not 0 <= review_delay <= 1440:
-            saved["review_request_delay"] = 5
+        elif review_text == OLD_DEFAULT_REVIEW_REQUEST_TEXT:
+            saved["review_request_text"] = DEFAULT_REVIEW_REQUEST_TEXT
+        if "review_request_delay_seconds" in saved:
+            review_delay = saved["review_request_delay_seconds"]
+        else:
+            old_minutes = saved.get("review_request_delay", 5)
+            review_delay = old_minutes * 60 if type(old_minutes) is int and 0 <= old_minutes <= 1440 else None
+        if type(review_delay) is not int or not 0 <= review_delay <= 86400:
+            review_delay = DEFAULT_REVIEW_REQUEST_DELAY_SECONDS
             saved["review_request_enabled"] = False
-            print("[SETTINGS] Некорректный review_request_delay пропущен; автоотправка выключена.")
+            print("[SETTINGS] Некорректная задержка запроса отзыва пропущена; автоотправка выключена.")
+        saved["review_request_delay_seconds"] = review_delay
 
         # --- Миграция старого формата (без user_settings) ---
         # Раньше notify_* хранились в корне — теперь они персональные.
@@ -503,12 +478,9 @@ def save_settings(*, required: bool = False) -> None:
             "authorized_user_ids": bot_settings["authorized_user_ids"],
             "stats_currency": bot_settings["stats_currency"],
             "night_mode_reply": bot_settings["night_mode_reply"],
-            "reply_templates": bot_settings["reply_templates"],
-            "autoresponder_enabled": bot_settings["autoresponder_enabled"],
-            "autoresponder_rules": bot_settings["autoresponder_rules"],
             "review_request_enabled": bot_settings["review_request_enabled"],
             "review_request_text": bot_settings["review_request_text"],
-            "review_request_delay": bot_settings["review_request_delay"],
+            "review_request_delay_seconds": bot_settings["review_request_delay_seconds"],
             "user_settings": {
                 str(uid): sett for uid, sett in _user_settings.items()
             },
@@ -605,17 +577,9 @@ def _save_global_setting(key: str, value, *, actor: str = "system") -> None:
                 _night_reply_echoes.append(previous)
             if value:
                 _night_reply_echoes.append(value)
-    action = {"autoresponder_enabled": "AUTORESPONDER",
-              "review_request_enabled": "REVIEW_REQUEST",
-              "reply_templates": "TEMPLATE", "autoresponder_rules": "RULE"}.get(key, "SETTINGS")
-    if key in ("autoresponder_enabled", "review_request_enabled"):
-        result = "ON" if value else "OFF"
-    elif key in ("reply_templates", "autoresponder_rules") and len(value) != len(previous):
-        result = "CREATED" if len(value) > len(previous) else "DELETED"
-    else:
-        result = "UPDATED"
-    target = "template" if action == "TEMPLATE" else "rule" if action == "RULE" else "global"
-    _audit_action(actor, action, target, result)
+    action = "REVIEW_REQUEST" if key == "review_request_enabled" else "SETTINGS"
+    result = ("ON" if value else "OFF") if key == "review_request_enabled" else "UPDATED"
+    _audit_action(actor, action, "global", result)
 
 
 def toggle_night_mode_saved(*, actor: str = "system") -> bool:
@@ -725,13 +689,13 @@ def get_main_keyboard(user_id: int):
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=f"🚀 Автоподнятие лотов: {bump_status}", callback_data="toggle_bump")],
         [InlineKeyboardButton(text="📊 Статистика", callback_data="menu_stats")],
+        [InlineKeyboardButton(text="📈 Аналитика", callback_data="analytics")],
         [InlineKeyboardButton(text="📦 Заказы", callback_data="orders")],
         [InlineKeyboardButton(text="🩺 Статус", callback_data="menu_status")],
         [InlineKeyboardButton(text="⚙️ Система", callback_data="system")],
         [InlineKeyboardButton(text="🔔 Мои уведомления", callback_data="menu_notifications")],
         [InlineKeyboardButton(text=f"😴 Ночной режим: {night_status}", callback_data="menu_night_mode")],
-        [InlineKeyboardButton(text="💬 Чаты", callback_data="chats:0")],
-        [InlineKeyboardButton(text="🤖 Автоответчик", callback_data="auto_menu")],
+        [InlineKeyboardButton(text="⭐ Запрос отзыва", callback_data="review_menu")],
         [InlineKeyboardButton(text="📄 Лог", callback_data="menu_logs")],
     ])
     return keyboard
@@ -750,7 +714,6 @@ def get_stats_keyboard():
         [InlineKeyboardButton(text="📅 Сегодня", callback_data="stats_today")],
         [InlineKeyboardButton(text="🗓 Неделя", callback_data="stats_week")],
         [InlineKeyboardButton(text="🗓 Месяц", callback_data="stats_month")],
-        [InlineKeyboardButton(text="📈 Аналитика", callback_data="analytics")],
         [InlineKeyboardButton(text="🔙 Назад", callback_data="menu_main")],
     ])
 
@@ -767,7 +730,7 @@ def get_notifications_keyboard(user_id: int):
         [InlineKeyboardButton(text=f"⚠️ Системные события: {on_icon(u['notify_system'])}",
                               callback_data="notif_system")],
         [InlineKeyboardButton(text="🔙 Назад",
-                              callback_data=_notification_parent.get(user_id, "menu_main"))],
+                              callback_data="menu_main")],
     ])
     return keyboard
 
@@ -814,392 +777,130 @@ def _escaped_preview(value: str, limit: int) -> str:
     return "".join(pieces)
 
 
-_VARIABLES = frozenset({"chat_name", "account"})
-
-
-def _validate_template(text: str) -> None:
-    for _, field, format_spec, conversion in Formatter().parse(text):
-        if field is not None and (field not in _VARIABLES or format_spec or conversion):
-            raise ValueError("Доступны только {chat_name} и {account}.")
-
-
-def _expand_template(text: str, chat_name: str, account_name: str) -> str:
-    _validate_template(text)
-    return text.format(chat_name=chat_name, account=account_name)
-
-
-def _normalized_trigger(value: str) -> str:
-    return value.replace("\r\n", "\n").replace("\r", "\n").strip().casefold()
-
-
-def match_autoresponder(message: str) -> tuple[dict, dict] | None:
-    if not bot_settings["autoresponder_enabled"] or type(message) is not str:
-        return None
-    normalized = _normalized_trigger(message)
-    if not normalized:
-        return None
-    rules = bot_settings["autoresponder_rules"]
-    for mode in ("EXACT", "CONTAINS"):
-        for rule in rules:
-            if not rule["enabled"] or rule["match_mode"] != mode:
-                continue
-            trigger = _normalized_trigger(rule["trigger"])
-            if not trigger or not (normalized == trigger if mode == "EXACT" else trigger in normalized):
-                continue
-            template = _template(rule["template_id"])
-            if template is None:
-                continue
-            try:
-                _validate_template(template["text"])
-            except ValueError:
-                continue
-            return rule, template
-    return None
-
-
 def _validate_review_text(value: str) -> None:
     for _, field, spec, conversion in Formatter().parse(value):
-        if field is not None and (field not in {"account", "buyer", "order_id"}
+        if field is not None and (field not in {"account", "buyer", "order_id", "order_url"}
                                   or spec or conversion):
-            raise ValueError("Доступны только {account}, {buyer}, {order_id}.")
+            raise ValueError("Доступны только {account}, {buyer}, {order_id}, {order_url}.")
 
 
 def expand_review_request_text(text: str, account: str, buyer: str, order_id: str) -> str:
     _validate_review_text(text)
     if not account or not buyer or not re.fullmatch(r"[A-Z0-9]{8}", order_id):
         raise ValueError("Недостаточно данных заказа.")
-    return text.format(account=account, buyer=buyer, order_id=order_id)
-
-
-def _templates() -> list[dict]:
-    return bot_settings["reply_templates"]
-
-
-def _template(template_id: str) -> dict | None:
-    return next((item for item in _templates() if item["id"] == template_id), None)
-
-
-def _templates_screen(chat_id: int = 0, *, quick: bool = False) -> tuple[str, InlineKeyboardMarkup]:
-    rows = []
-    for item in _templates():
-        action = "quick_preview" if quick else "tpl_view"
-        rows.append([_button(item["title"][:40], f"{action}:{item['id']}:{chat_id}")])
-    if not quick:
-        rows.append([_button("➕ Добавить", f"tpl_add:{chat_id}")])
-    back = f"chat:{chat_id}" if quick else (f"chats:0" if chat_id == 0 else f"chat:{chat_id}")
-    rows.append([_button("🔙 Назад", back)])
-    return ("⚡ <b>Быстрый ответ</b>" if quick else "⚡ <b>Шаблоны</b>"), _menu(rows)
-
-
-def _template_screen(item: dict, chat_id: int) -> tuple[str, InlineKeyboardMarkup]:
-    return (f"⚡ <b>{escape(item['title'])}</b>\n\n{_escaped_preview(item['text'], 3400)}", _menu([
-        [_button("✏️ Название", f"tpl_title:{item['id']}:{chat_id}")],
-        [_button("✏️ Текст", f"tpl_text:{item['id']}:{chat_id}")],
-        [_button("🗑 Удалить", f"tpl_delete:{item['id']}:{chat_id}")],
-        [_button("🔙 Назад", f"tpl_menu:{chat_id}")],
-    ]))
+    return text.format(account=account, buyer=buyer, order_id=order_id,
+                       order_url=f"https://funpay.com/orders/{order_id}/")
 
 
 def _cancel_keyboard(back: str) -> InlineKeyboardMarkup:
     return _menu([[_button("❌ Отмена", f"cancel:{back}")]])
 
 
-def _rule(rule_id: str) -> dict | None:
-    return next((rule for rule in bot_settings["autoresponder_rules"]
-                 if rule["id"] == rule_id), None)
-
-
-def _save_rule(replacement: dict | None, rule_id: str, *, actor: str = "system") -> None:
-    updated = [replacement if rule["id"] == rule_id else rule
-               for rule in bot_settings["autoresponder_rules"] if replacement is not None or rule["id"] != rule_id]
-    _save_global_setting("autoresponder_rules", updated, actor=actor)
-
-
-def _auto_screen() -> tuple[str, InlineKeyboardMarkup]:
-    status = "✅ Включён" if bot_settings["autoresponder_enabled"] else "⛔ Выключен"
-    return f"🤖 <b>Автоответчик</b>\n\nСтатус: {status}", _menu([
-        [_button("⛔ Выключить" if bot_settings["autoresponder_enabled"] else "✅ Включить", "auto_toggle")],
-        [_button("📋 Правила", "auto_rules")],
-        [_button("➕ Добавить правило", "auto_add")],
-        [_button("⭐ Запрос отзыва", "review_menu")],
-        [_button("🔙 Назад", "menu_main")],
-    ])
-
-
-def _rules_screen() -> tuple[str, InlineKeyboardMarkup]:
-    rows = [[_button(("✅ " if rule["enabled"] else "⛔ ") + rule["trigger"].replace("\n", " ⏎ ")[:35],
-                     f"auto_rule:{rule['id']}")]
-            for rule in bot_settings["autoresponder_rules"]]
-    rows.extend([[_button("➕ Добавить правило", "auto_add")],
-                 [_button("🔙 Назад", "auto_menu")]])
-    return "📋 <b>Правила автоответчика</b>", _menu(rows)
-
-
-def _rule_screen(rule: dict) -> tuple[str, InlineKeyboardMarkup]:
-    template = _template(rule["template_id"])
-    name = template["title"] if template else "Недоступен"
-    text = (f"🤖 <b>Правило</b> · {'✅' if rule['enabled'] else '⛔'}\n\n"
-            f"Триггер: {escape(rule['trigger'][:200])}\n"
-            f"Тип: {rule['match_mode']}\nШаблон: {escape(name)}")
-    return text, _menu([
-        [_button("⛔ Выключить" if rule["enabled"] else "✅ Включить", f"auto_rule_toggle:{rule['id']}")],
-        [_button("✏️ Триггер", f"auto_rule_trigger:{rule['id']}")],
-        [_button("🔁 EXACT / CONTAINS", f"auto_rule_mode:{rule['id']}")],
-        [_button("⚡ Шаблон", f"auto_rule_template:{rule['id']}")],
-        [_button("🗑 Удалить", f"auto_rule_delete:{rule['id']}")],
-        [_button("🔙 Назад", "auto_rules")],
-    ])
-
-
-def _choose_rule_template(back: str, action: str) -> tuple[str, InlineKeyboardMarkup]:
-    rows = [[_button(item["title"][:40], f"{action}:{item['id']}")]
-            for item in _templates()]
-    rows.append([_button("🔙 Назад", back)])
-    return "⚡ <b>Выберите шаблон</b>", _menu(rows)
+def _review_delay_label(seconds: int) -> str:
+    if seconds == 0:
+        return "сразу"
+    if seconds < 60:
+        return f"{seconds} сек"
+    return f"{seconds // 60} мин" if seconds % 60 == 0 else f"{seconds // 60} мин {seconds % 60} сек"
 
 
 def _review_request_screen() -> tuple[str, InlineKeyboardMarkup]:
     status = "✅ Включён" if bot_settings["review_request_enabled"] else "⛔ Выключен"
     text = (f"⭐ <b>Запрос отзыва</b>\n\nСтатус: {status}\n"
             f"Текст: {_escaped_preview(bot_settings['review_request_text'], 3400)}\n"
-            f"Задержка: {bot_settings['review_request_delay']} минут")
+            f"Задержка: {_review_delay_label(bot_settings['review_request_delay_seconds'])}")
     return text, _menu([
         [_button("⛔ Выключить" if bot_settings["review_request_enabled"] else "✅ Включить", "review_toggle")],
         [_button("✏️ Изменить текст", "review_edit")],
         [_button("⏱ Изменить задержку", "review_delay")],
         [_button("🔄 Сбросить текст", "review_reset")],
-        [_button("🔙 Назад", "auto_menu")],
+        [_button("🔙 Назад", "menu_main")],
     ])
 
 
-async def _automation_callback(callback: CallbackQuery, action: str, user_id: int) -> bool:
+def _review_delay_screen() -> tuple[str, InlineKeyboardMarkup]:
+    options = ((0, "⚡ Сразу"), (5, "5 сек"), (10, "10 сек"),
+               (30, "30 сек"), (60, "1 мин"), (300, "5 мин"))
+    rows = [[_button(label, f"review_delay:{seconds}")] for seconds, label in options]
+    rows += [[_button("✏️ Своя задержка", "review_delay_custom")],
+             [_button("🔙 Назад", "review_menu")]]
+    return "⏱ <b>Задержка запроса отзыва</b>", _menu(rows)
+
+
+async def _review_callback(callback: CallbackQuery, action: str, user_id: int) -> bool:
     prefix = action.split(":", 1)[0]
-    if prefix not in {"auto_menu", "auto_toggle", "auto_rules", "auto_add", "auto_mode",
-                      "auto_template", "auto_rule", "auto_rule_toggle", "auto_rule_trigger",
-                      "auto_rule_mode", "auto_rule_template", "auto_select", "auto_rule_delete",
-                      "review_menu", "review_toggle", "review_edit", "review_delay", "review_reset"}:
+    if prefix not in {"review_menu", "review_toggle", "review_edit", "review_delay",
+                      "review_delay_custom", "review_reset"}:
         return False
-    if prefix not in {"auto_mode", "auto_template"}:
-        _interaction_state.pop(user_id, None)
+    _interaction_state.pop(user_id, None)
     answered = False
     try:
-        parts = action.split(":")
-        if prefix == "auto_menu":
-            text, markup = _auto_screen()
-        elif prefix == "auto_toggle":
-            _save_global_setting("autoresponder_enabled", not bot_settings["autoresponder_enabled"], actor=f"telegram:{user_id}")
-            text, markup = _auto_screen()
-        elif prefix == "auto_rules":
-            text, markup = _rules_screen()
-        elif prefix == "auto_add":
-            if len(bot_settings["autoresponder_rules"]) >= 50:
-                raise ValueError("Можно сохранить не более 50 правил.")
-            if not _templates():
-                raise ValueError("Сначала добавьте шаблон в разделе «Чаты».")
-            _interaction_state[user_id] = {"action": "auto_add_trigger"}
-            text, markup = "➕ Отправьте триггер (до 200 символов).", _cancel_keyboard("menu")
-        elif prefix == "auto_mode":
-            pending = _interaction_state.get(user_id)
-            if not pending or pending.get("action") != "auto_add_mode" or parts[1] not in ("EXACT", "CONTAINS"):
-                raise ValueError("Редактирование устарело.")
-            _interaction_state[user_id] = {**pending, "action": "auto_add_template", "match_mode": parts[1]}
-            text, markup = _choose_rule_template("auto_rules", "auto_template")
-        elif prefix == "auto_template":
-            pending = _interaction_state.pop(user_id, None)
-            if not pending or pending.get("action") != "auto_add_template" or _template(parts[1]) is None:
-                raise ValueError("Редактирование устарело.")
-            if len(bot_settings["autoresponder_rules"]) >= 50:
-                raise ValueError("Можно сохранить не более 50 правил.")
-            rule_id = secrets.token_hex(4)
-            while _rule(rule_id) is not None:
-                rule_id = secrets.token_hex(4)
-            rule = {"id": rule_id, "trigger": pending["trigger"], "template_id": parts[1],
-                    "match_mode": pending["match_mode"], "enabled": True}
-            _save_global_setting("autoresponder_rules", [*bot_settings["autoresponder_rules"], rule], actor=f"telegram:{user_id}")
-            text, markup = _rule_screen(rule)
-        elif prefix in {"auto_rule", "auto_rule_toggle", "auto_rule_trigger", "auto_rule_mode",
-                        "auto_rule_template", "auto_rule_delete"}:
-            rule = _rule(parts[1])
-            if rule is None:
-                raise ValueError("Правило не найдено.")
-            if prefix == "auto_rule_toggle":
-                rule = {**rule, "enabled": not rule["enabled"]}
-                _save_rule(rule, rule["id"], actor=f"telegram:{user_id}")
-            elif prefix == "auto_rule_mode":
-                rule = {**rule, "match_mode": "CONTAINS" if rule["match_mode"] == "EXACT" else "EXACT"}
-                _save_rule(rule, rule["id"], actor=f"telegram:{user_id}")
-            elif prefix == "auto_rule_trigger":
-                _interaction_state[user_id] = {"action": "auto_edit_trigger", "id": rule["id"]}
-                text, markup = "✏️ Отправьте новый триггер (до 200 символов).", _cancel_keyboard("menu")
-            elif prefix == "auto_rule_template":
-                text, markup = _choose_rule_template("auto_rules", f"auto_select:{rule['id']}")
-            elif prefix == "auto_rule_delete":
-                _save_rule(None, rule["id"], actor=f"telegram:{user_id}")
-                text, markup = _rules_screen()
-            if prefix in {"auto_rule", "auto_rule_toggle", "auto_rule_mode"}:
-                text, markup = _rule_screen(rule)
-        elif prefix == "auto_select":
-            rule = _rule(parts[1])
-            if rule is None or _template(parts[2]) is None:
-                raise ValueError("Правило или шаблон не найден.")
-            rule = {**rule, "template_id": parts[2]}
-            _save_rule(rule, rule["id"], actor=f"telegram:{user_id}")
-            text, markup = _rule_screen(rule)
-        elif prefix == "review_menu":
+        if action == "review_menu":
             text, markup = _review_request_screen()
-        elif prefix == "review_toggle":
-            _save_global_setting("review_request_enabled", not bot_settings["review_request_enabled"], actor=f"telegram:{user_id}")
+        elif action == "review_toggle":
+            _save_global_setting("review_request_enabled", not bot_settings["review_request_enabled"],
+                                 actor=f"telegram:{user_id}")
             text, markup = _review_request_screen()
-        elif prefix == "review_edit":
+        elif action == "review_edit":
             _interaction_state[user_id] = {"action": "review_edit"}
-            text, markup = "✏️ Отправьте текст запроса отзыва (до 1000 символов).", _cancel_keyboard("menu")
-        elif prefix == "review_delay":
-            _interaction_state[user_id] = {"action": "review_delay"}
-            text, markup = "⏱ Отправьте задержку от 0 до 1440 минут.", _cancel_keyboard("menu")
-        else:
-            _save_global_setting("review_request_text", DEFAULT_REVIEW_REQUEST_TEXT, actor=f"telegram:{user_id}")
+            text, markup = "✏️ Отправьте текст запроса отзыва (до 1000 символов).", _cancel_keyboard("review")
+        elif action == "review_delay":
+            text, markup = _review_delay_screen()
+        elif prefix == "review_delay" and len(action.split(":")) == 2:
+            seconds = int(action.split(":", 1)[1])
+            if seconds not in (0, 5, 10, 30, 60, 300):
+                raise ValueError("Invalid review delay.")
+            _save_global_setting("review_request_delay_seconds", seconds, actor=f"telegram:{user_id}")
             text, markup = _review_request_screen()
+        elif action == "review_delay_custom":
+            _interaction_state[user_id] = {"action": "review_delay_custom"}
+            text, markup = "⏱ Отправьте задержку от 0 до 86400 секунд.", _cancel_keyboard("review")
+        elif action == "review_reset":
+            _save_global_setting("review_request_text", DEFAULT_REVIEW_REQUEST_TEXT,
+                                 actor=f"telegram:{user_id}")
+            text, markup = _review_request_screen()
+        else:
+            raise ValueError("Invalid review action.")
         await callback.answer()
         answered = True
         await callback.message.edit_text(text, reply_markup=markup, parse_mode="HTML")
-    except (ValueError, RuntimeError) as e:
-        if not answered:
-            safe_error = str(e) if str(e) in {
-                "Можно сохранить не более 50 правил.",
-                "Сначала добавьте шаблон в разделе «Чаты»."} else None
-            await callback.answer(safe_error or "Не удалось выполнить действие или сохранить настройку.",
-                                  show_alert=True)
     except Exception as e:
-        logger.warning(f"Automation UI unavailable: {type(e).__name__}.")
+        logger.warning(f"Review request UI unavailable: {type(e).__name__}.")
         if not answered:
-            await callback.answer("Данные недоступны.", show_alert=True)
+            await callback.answer("Настройка недоступна.", show_alert=True)
     return True
 
 
-async def _automation_pending(message: Message, pending: dict) -> bool:
-    action = pending["action"]
-    if action not in {"auto_add_trigger", "auto_add_mode", "auto_add_template",
-                      "auto_edit_trigger", "review_edit", "review_delay"}:
+async def _review_pending(message: Message, pending: dict) -> bool:
+    action = pending.get("action")
+    if action not in {"review_edit", "review_delay_custom"}:
         return False
-    user_id = message.from_user.id
-    if action in {"auto_add_mode", "auto_add_template"}:
-        await message.answer("Выберите вариант кнопкой в предыдущем сообщении.")
-        return True
     try:
-        if action == "review_delay":
-            value = _clean_text(message.text, 4)
-            if not value.isdecimal() or not 0 <= int(value) <= 1440:
-                raise ValueError("Введите целое число от 0 до 1440.")
-            _save_global_setting("review_request_delay", int(value), actor=f"telegram:{user_id}")
-            text, markup = _review_request_screen()
+        if action == "review_edit":
+            value = _clean_text(message.text, 1000)
+            _validate_review_text(value)
+            _save_global_setting("review_request_text", value,
+                                 actor=f"telegram:{message.from_user.id}")
         else:
-            limit = 200 if action.endswith("trigger") else 1000
-            value = _clean_text(message.text, limit).replace("\r\n", "\n").replace("\r", "\n")
-            if action == "auto_add_trigger":
-                _interaction_state[user_id] = {"action": "auto_add_mode", "trigger": value}
-                await message.answer("Выберите тип совпадения:", reply_markup=_menu([
-                    [_button("EXACT", "auto_mode:EXACT"), _button("CONTAINS", "auto_mode:CONTAINS")],
-                    [_button("❌ Отмена", "cancel:menu")],
-                ]))
-                return True
-            if action == "auto_edit_trigger":
-                rule = _rule(pending["id"])
-                if rule is None:
-                    raise ValueError("Правило не найдено.")
-                rule = {**rule, "trigger": value}
-                _save_rule(rule, rule["id"], actor=f"telegram:{user_id}")
-                text, markup = _rule_screen(rule)
-            else:
-                _validate_review_text(value)
-                _save_global_setting("review_request_text", value, actor=f"telegram:{user_id}")
-                text, markup = _review_request_screen()
+            value = _clean_text(message.text, 5)
+            if not value.isdecimal() or not 0 <= int(value) <= 86400:
+                raise ValueError("Введите целое число от 0 до 86400 секунд.")
+            _save_global_setting("review_request_delay_seconds", int(value),
+                                 actor=f"telegram:{message.from_user.id}")
     except ValueError as e:
         await message.answer(escape(str(e)), parse_mode="HTML")
         return True
     except Exception as e:
-        logger.warning(f"Automation settings save failed: {type(e).__name__}.")
+        logger.warning(f"Review request setting unavailable: {type(e).__name__}.")
         await message.answer("Не удалось сохранить. Настройка не изменилась.")
         return True
-    _interaction_state.pop(user_id, None)
+    _interaction_state.pop(message.from_user.id, None)
+    text, markup = _review_request_screen()
     await message.answer(text, reply_markup=markup, parse_mode="HTML")
     return True
 
 
-def _chat_snapshot(chat_id: int) -> tuple[str, str]:
-    if _runtime_client is None or type(chat_id) is not int or chat_id <= 0:
-        raise RuntimeError("Chat unavailable.")
-    with _runtime_client._account_lock:
-        account = _runtime_client.account
-        shortcut = account.get_chat_by_id(chat_id)
-        name = getattr(shortcut, "name", None)
-        account_name = getattr(account, "username", None)
-    if type(name) is not str or not name or type(account_name) is not str or not account_name:
-        raise RuntimeError("Chat unavailable.")
-    return name, account_name
-
-
-def _fetch_chats() -> list[tuple[int, str, bool]]:
-    if _runtime_client is None:
-        raise RuntimeError("Account unavailable.")
-    with _runtime_client._account_lock:
-        account = _runtime_client.account
-        chats = account.request_chats()
-        account.add_chats(chats)
-        return [(chat.id, chat.name or "Чат", chat.unread) for chat in chats
-                if type(chat.id) is int and chat.id > 0]
-
-
-def _fetch_chat(chat_id: int) -> tuple[str, list[tuple[str, str]]]:
-    if _runtime_client is None:
-        raise RuntimeError("Account unavailable.")
-    with _runtime_client._account_lock:
-        account = _runtime_client.account
-        shortcut = account.get_chat_by_id(chat_id)
-        if shortcut is None:
-            raise RuntimeError("Chat unavailable.")
-        name = shortcut.name or "Чат"
-        history_method = getattr(_runtime_client, "_manual_get_chat_history", None)
-        if history_method is None:
-            raise RuntimeError("History unavailable.")
-        try:
-            messages = history_method(chat_id, interlocutor_username=name)
-        except Exception as e:
-            logger.warning(f"Chat history unavailable: {type(e).__name__}.")
-            preview = getattr(shortcut, "last_message_text", None)
-            return name, [("Последний фрагмент · история недоступна", preview)] if preview else []
-        account_id = getattr(account, "id", None)
-    display = []
-    for item in messages[-10:]:
-        author_id = getattr(item, "author_id", None)
-        if type(account_id) is int and type(author_id) is int and author_id == account_id:
-            direction = "🧑‍💻 я"
-        elif type(author_id) is int and author_id > 0 and getattr(item, "author", None) == name:
-            direction = "👤 собеседник"
-        else:
-            direction = "Сообщение"
-        display.append((direction, getattr(item, "text", None) or "[без текста]"))
-    return name, display
-
-
-def _chats_screen(chats: list[tuple[int, str, bool]], page: int) -> tuple[str, InlineKeyboardMarkup]:
-    count = max(1, (len(chats) + 9) // 10)
-    page = min(max(0, page), count - 1)
-    rows = [[_button(("🟠 " if unread else "") + name[:45], f"chat:{chat_id}")]
-            for chat_id, name, unread in chats[page * 10:(page + 1) * 10]]
-    pages = []
-    if page > 0:
-        pages.append(_button("◀️", f"chats:{page - 1}"))
-    if page + 1 < count:
-        pages.append(_button("▶️", f"chats:{page + 1}"))
-    if pages:
-        rows.append(pages)
-    rows.extend([[_button("🔄 Обновить", "chats_refresh:0")],
-                 [_button("⚡ Шаблоны", "tpl_menu:0")],
-                 [_button("🔙 Назад", "menu_main")]])
-    return f"💬 <b>Чаты</b> · {page + 1}/{count}", _menu(rows)
-
-
-_ORDER_KINDS = {"all": (None, "🆕 Последние"),
+_ORDER_KINDS = {"all": (None, "🕘 Последние заказы"),
                 "closed": ("CLOSED", "✅ Завершённые"),
                 "refunded": ("REFUNDED", "↩️ Возвраты")}
 _ORDER_ICONS = {"PAID": "🆕", "CLOSED": "✅", "REFUNDED": "↩️"}
@@ -1213,7 +914,7 @@ def _orders_store():
 
 def _orders_screen() -> tuple[str, InlineKeyboardMarkup]:
     return "📦 <b>Заказы</b>\nВыберите список:", _menu([
-        [_button("🆕 Последние", "ord_list:all:0")],
+        [_button("🕘 Последние заказы", "ord_list:all:0")],
         [_button("✅ Завершённые", "ord_list:closed:0")],
         [_button("↩️ Возвраты", "ord_list:refunded:0")],
         [_button("🔙 Назад", "menu_main")],
@@ -1274,17 +975,13 @@ def _order_card_screen(order: dict, kind: str, page: int):
         if status in status_dates:
             lines.append(label + ": " +
                          datetime.fromtimestamp(status_dates[status], timezone.utc).strftime("%Y-%m-%d %H:%M UTC"))
-    rows = []
-    chat_id = order.get("chat_id")
-    if type(chat_id) is int and chat_id > 0:
-        rows.append([_button("💬 Открыть чат", f"ord_chat:{order['order_id']}")])
-    rows.append([_button("🔙 К заказам", f"ord_list:{kind}:{page}")])
+    rows = [[_button("🔙 К заказам", f"ord_list:{kind}:{page}")]]
     return "\n".join(lines), _menu(rows)
 
 
 async def _orders_callback(callback: CallbackQuery, action: str, user_id: int) -> bool:
     prefix = action.split(":", 1)[0]
-    if prefix not in {"orders", "ord_list", "ord_open", "ord_chat"}:
+    if prefix not in {"orders", "ord_list", "ord_open"}:
         return False
     answered = False
     try:
@@ -1307,15 +1004,6 @@ async def _orders_callback(callback: CallbackQuery, action: str, user_id: int) -
             if order is None:
                 raise ValueError("Order unavailable.")
             text, markup = _order_card_screen(order, kind, page)
-        elif prefix == "ord_chat" and len(parts) == 2:
-            order = await asyncio.to_thread(_orders_store().get_order_history, parts[1])
-            chat_id = order.get("chat_id") if order else None
-            if type(chat_id) is not int or chat_id <= 0:
-                raise ValueError("Chat unavailable.")
-            _chat_pages[user_id] = await asyncio.to_thread(_fetch_chats)
-            if chat_id not in {item[0] for item in _chat_pages[user_id]}:
-                raise ValueError("Chat unavailable.")
-            return await _communication_callback(callback, f"chat:{chat_id}", user_id)
         else:
             raise ValueError("Invalid order action.")
         await callback.answer()
@@ -1570,7 +1258,6 @@ def _system_screen() -> tuple[str, InlineKeyboardMarkup]:
         [_button("⚠️ Проблемы", "sys_problems")],
         [_button("📜 Журнал действий", "sys_audit:0")],
         [_button(f"🛡 SAFE_MODE: {safe}", "sys_safe_toggle")],
-        [_button("🔔 Уведомления", "sys_notifications")],
         [_button("🔙 Назад", "menu_main")],
     ])
 
@@ -1643,8 +1330,7 @@ async def _notify_safe_mode_activated(callback: CallbackQuery, actor_id: int) ->
 async def _operations_callback(callback: CallbackQuery, action: str, user_id: int) -> bool:
     prefix = action.split(":", 1)[0]
     if prefix not in {"system", "sys_problems", "sys_audit", "sys_audit_view",
-                      "sys_safe_toggle", "sys_safe_off", "sys_safe_cancel",
-                      "sys_notifications"}:
+                      "sys_safe_toggle", "sys_safe_off", "sys_safe_cancel"}:
         return False
     answered = False
     try:
@@ -1684,9 +1370,6 @@ async def _operations_callback(callback: CallbackQuery, action: str, user_id: in
             text, markup = _system_screen()
             await callback.answer("🛡 SAFE_MODE выключен.")
             answered = True
-        elif action == "sys_notifications":
-            _notification_parent[user_id] = "system"
-            text, markup = NOTIFICATIONS_MENU_TEXT, get_notifications_keyboard(user_id)
         else:
             raise ValueError("Invalid system action.")
         if not answered:
@@ -1703,178 +1386,30 @@ async def _operations_callback(callback: CallbackQuery, action: str, user_id: in
     return True
 
 
-def _chat_screen(chat_id: int, name: str, messages: list[tuple[str, str]]) -> tuple[str, InlineKeyboardMarkup]:
-    header = f"💬 <b>{escape(name[:100])}</b>\n\n"
-    remaining = 3500 - len(header)
-    blocks = []
-    for direction, body in messages:
-        block = f"{direction}: {_escaped_preview(str(body), 600)}"
-        if len(block) > remaining:
-            break
-        blocks.append(block)
-        remaining -= len(block) + 2
-    text = header + ("\n\n".join(blocks) if blocks else "Сообщений нет.")
-    return text, _menu([
-        [_button("✉️ Ответить", f"reply:{chat_id}"), _button("⚡ Быстрый ответ", f"quick_menu:{chat_id}")],
-        [_button("🔄 Обновить", f"chat:{chat_id}")],
-        [_button("🔙 К чатам", "chats:0")],
-    ])
-
-
-def _send_to_chat(chat_id: int, value: str):
-    if _runtime_client is None:
-        raise RuntimeError("Account unavailable.")
-    return _runtime_client.send_message_once(chat_id, value)
-
-
-async def _send_one_reply(message: Message, chat_id: int, value: str,
-                          *, actor_id: int | None = None) -> None:
-    if actor_id is None and getattr(message, "from_user", None) is not None:
-        actor_id = message.from_user.id
-    actor = f"telegram:{actor_id}" if type(actor_id) is int and actor_id > 0 else "system"
-    try:
-        sent = await asyncio.to_thread(_send_to_chat, chat_id, value)
-    except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
-        logger.warning(f"Manual message result ambiguous: {type(e).__name__}.")
-        await asyncio.to_thread(_audit_action, actor, "MANUAL_SEND", "chat", "AMBIGUOUS")
-        await message.answer("⚠️ Не удалось подтвердить отправку. Проверьте чат перед повторной попыткой.")
-    except FunPayAPI.exceptions.MessageNotDeliveredError as e:
-        if type(getattr(e, "error_message", None)) is str and e.error_message:
-            logger.warning("Manual message rejected by FunPay.")
-            await asyncio.to_thread(_audit_action, actor, "MANUAL_SEND", "chat", "FAILED")
-            await message.answer("⛔ FunPay отклонил сообщение. Отправка не выполнена.")
-        else:
-            logger.warning("Manual message result ambiguous: MessageNotDeliveredError.")
-            await asyncio.to_thread(_audit_action, actor, "MANUAL_SEND", "chat", "AMBIGUOUS")
-            await message.answer("⚠️ Отправка не подтверждена. Проверьте чат перед повторной попыткой.")
-    except Exception as e:
-        logger.warning(f"Manual message failed: {type(e).__name__}.")
-        await asyncio.to_thread(_audit_action, actor, "MANUAL_SEND", "chat", "AMBIGUOUS")
-        # A remote error can occur after transport; do not imply it is safe to retry.
-        await message.answer("⚠️ Отправка не подтверждена. Проверьте чат перед повторной попыткой.")
-    else:
-        if sent is False:
-            await asyncio.to_thread(_audit_action, actor, "MANUAL_SEND", "chat", "BLOCKED")
-            await message.answer("⛔ Бот останавливается. Сообщение не отправлено.")
-            return
-        await asyncio.to_thread(_audit_action, actor, "MANUAL_SEND", "chat", "SUCCESS")
-        await message.answer("✅ Отправлено")
-
-
-async def _communication_callback(callback: CallbackQuery, action: str, user_id: int) -> bool:
-    """Handles communication screens; callback values contain IDs, never user text."""
-    prefix = action.split(":", 1)[0]
-    if prefix not in {"menu_night_mode", "night_edit", "night_reset", "chats", "chats_refresh",
-                      "chat", "reply", "tpl_menu", "tpl_view", "tpl_add", "tpl_title",
-                      "tpl_text", "tpl_delete", "quick_menu", "quick_preview", "quick_send", "cancel"}:
+async def _night_callback(callback: CallbackQuery, action: str, user_id: int) -> bool:
+    if action not in {"menu_night_mode", "night_edit", "night_reset", "cancel:night",
+                      "cancel:review"}:
         return False
-    if prefix != "quick_send":
-        _interaction_state.pop(user_id, None)
+    _interaction_state.pop(user_id, None)
     answered = False
     try:
-        parts = action.split(":")
-        if prefix == "menu_night_mode":
-            text, markup = _night_mode_screen()
-        elif prefix == "night_edit":
+        if action == "night_edit":
             _interaction_state[user_id] = {"action": "night_edit"}
             text, markup = "✏️ Отправьте новый автоответ (до 1000 символов).", _cancel_keyboard("night")
-        elif prefix == "night_reset":
+        elif action == "night_reset":
             _save_global_setting("night_mode_reply", None, actor=f"telegram:{user_id}")
             text, markup = _night_mode_screen()
-        elif prefix in {"chats", "chats_refresh"}:
-            page = int(parts[1])
-            if prefix == "chats_refresh" or user_id not in _chat_pages:
-                _chat_pages[user_id] = await asyncio.to_thread(_fetch_chats)
-            text, markup = _chats_screen(_chat_pages[user_id], page)
-        elif prefix == "chat":
-            chat_id = int(parts[1])
-            if chat_id not in {item[0] for item in _chat_pages.get(user_id, [])}:
-                raise ValueError("Chat unavailable.")
-            name, messages = await asyncio.to_thread(_fetch_chat, chat_id)
-            text, markup = _chat_screen(chat_id, name, messages)
-        elif prefix == "reply":
-            chat_id = int(parts[1])
-            if chat_id not in {item[0] for item in _chat_pages.get(user_id, [])}:
-                raise ValueError("Chat unavailable.")
-            _interaction_state[user_id] = {"action": "reply", "chat_id": chat_id}
-            text, markup = "✉️ Отправьте текст ответа.", _cancel_keyboard(f"chat_{chat_id}")
-        elif prefix in {"tpl_menu", "quick_menu"}:
-            chat_id = int(parts[1])
-            if chat_id and chat_id not in {item[0] for item in _chat_pages.get(user_id, [])}:
-                raise ValueError("Chat unavailable.")
-            text, markup = _templates_screen(chat_id, quick=prefix == "quick_menu")
-        elif prefix == "cancel":
-            back = parts[1]
-            if back == "night":
-                text, markup = _night_mode_screen()
-            elif back.startswith("chat_"):
-                chat_id = int(back.removeprefix("chat_"))
-                name, messages = await asyncio.to_thread(_fetch_chat, chat_id)
-                text, markup = _chat_screen(chat_id, name, messages)
-            else:
-                text, markup = MAIN_MENU_TEXT, get_main_keyboard(user_id)
-        elif prefix == "tpl_add":
-            chat_id = int(parts[1])
-            if len(_templates()) >= 20:
-                raise ValueError("Можно сохранить не более 20 шаблонов.")
-            _interaction_state[user_id] = {"action": "tpl_add_title", "chat_id": chat_id}
-            text, markup = "➕ Отправьте название шаблона (до 40 символов).", _cancel_keyboard("menu")
-        elif prefix in {"tpl_view", "tpl_title", "tpl_text", "tpl_delete", "quick_preview"}:
-            template_id, chat_id = parts[1], int(parts[2])
-            item = _template(template_id)
-            if item is None:
-                raise ValueError("Шаблон не найден.")
-            if chat_id and chat_id not in {row[0] for row in _chat_pages.get(user_id, [])}:
-                raise ValueError("Chat unavailable.")
-            if prefix == "tpl_view":
-                text, markup = _template_screen(item, chat_id)
-            elif prefix in {"tpl_title", "tpl_text"}:
-                _interaction_state[user_id] = {"action": prefix, "id": template_id, "chat_id": chat_id}
-                text, markup = ("✏️ Отправьте новое название (до 40 символов)." if prefix == "tpl_title"
-                                else "✏️ Отправьте новый текст (до 1000 символов)."), _cancel_keyboard("menu")
-            elif prefix == "tpl_delete":
-                if any(rule["template_id"] == template_id for rule in bot_settings["autoresponder_rules"]):
-                    raise ValueError("Шаблон используется правилом. Сначала удалите правило.")
-                _save_global_setting("reply_templates", [row for row in _templates() if row["id"] != template_id], actor=f"telegram:{user_id}")
-                text, markup = _templates_screen(chat_id)
-            else:
-                if not chat_id:
-                    raise ValueError("Chat unavailable.")
-                chat_name, account_name = await asyncio.to_thread(_chat_snapshot, chat_id)
-                expanded = _expand_template(item["text"], chat_name, account_name)
-                if len(expanded) > 2000:
-                    raise ValueError("Развёрнутый текст слишком длинный.")
-                _interaction_state[user_id] = {"action": "quick_confirm", "chat_id": chat_id,
-                                               "text": expanded, "id": template_id}
-                text = f"⚡ <b>{escape(item['title'])}</b>\n\n{_escaped_preview(expanded, 3400)}"
-                markup = _menu([[_button("✅ Отправить", f"quick_send:{template_id}:{chat_id}")],
-                                [_button("🔙 Назад", f"quick_menu:{chat_id}")]])
-        elif prefix == "quick_send":
-            template_id, chat_id = parts[1], int(parts[2])
-            pending = _interaction_state.pop(user_id, None)
-            if (not pending or pending.get("action") != "quick_confirm"
-                    or pending.get("id") != template_id or pending.get("chat_id") != chat_id):
-                raise ValueError("Подтверждение устарело.")
-            await callback.answer()
-            answered = True
-            await _send_one_reply(callback.message, chat_id, pending["text"], actor_id=user_id)
-            return True
+        elif action == "cancel:review":
+            text, markup = _review_request_screen()
         else:
-            return False
+            text, markup = _night_mode_screen()
         await callback.answer()
         answered = True
         await callback.message.edit_text(text, reply_markup=markup, parse_mode="HTML")
-    except (ValueError, RuntimeError) as e:
-        if not answered:
-            await callback.answer(str(e) if isinstance(e, ValueError) and str(e) in {
-                "Шаблон не найден.", "Можно сохранить не более 20 шаблонов.",
-                "Шаблон используется правилом. Сначала удалите правило.",
-                "Развёрнутый текст слишком длинный.", "Подтверждение устарело."}
-                else "Данные недоступны или не удалось сохранить.", show_alert=True)
     except Exception as e:
-        logger.warning(f"Communication UI unavailable: {type(e).__name__}.")
+        logger.warning(f"Night Mode UI unavailable: {type(e).__name__}.")
         if not answered:
-            await callback.answer("Данные недоступны или не удалось сохранить.", show_alert=True)
+            await callback.answer("Настройка недоступна.", show_alert=True)
     return True
 
 
@@ -1972,11 +1507,10 @@ async def callback_handler(callback: CallbackQuery):
         return
 
     action = callback.data or ""
-    if not action or not action.startswith(("quick_send:", "auto_mode:", "auto_template:")):
-        _interaction_state.pop(user_id, None)
-    if await _communication_callback(callback, action, user_id):
+    _interaction_state.pop(user_id, None)
+    if await _night_callback(callback, action, user_id):
         return
-    if await _automation_callback(callback, action, user_id):
+    if await _review_callback(callback, action, user_id):
         return
     if await _orders_callback(callback, action, user_id):
         return
@@ -2007,7 +1541,6 @@ async def callback_handler(callback: CallbackQuery):
 
     # Переход в персональное подменю уведомлений
     elif action == "menu_notifications":
-        _notification_parent[user_id] = "menu_main"
         await callback.answer()
         try:
             await callback.message.edit_text(
@@ -2114,6 +1647,9 @@ async def callback_handler(callback: CallbackQuery):
             except Exception:
                 pass
 
+    else:
+        await callback.answer("Действие больше недоступно.")
+
 
 @dp.message()
 async def text_handler(message: Message):
@@ -2139,56 +1675,21 @@ async def text_handler(message: Message):
                 _interaction_state.pop(user_id, None)
                 await message.answer("Действие отменено. Команда не сохранена.")
                 return
-            if await _automation_pending(message, pending):
-                return
-            if pending["action"] == "quick_confirm":
-                await message.answer("Для отправки используйте кнопку «✅ Отправить».")
+            if await _review_pending(message, pending):
                 return
             try:
-                limit = 40 if pending["action"] in {"tpl_add_title", "tpl_title"} else (
-                    2000 if pending["action"] == "reply" else 1000)
-                value = _clean_text(message.text, limit)
-                if pending["action"] in {"tpl_add_text", "tpl_text"}:
-                    _validate_template(value)
-            except ValueError as e:
-                await message.answer(escape(str(e)), parse_mode="HTML")
-                return
-            action = pending["action"]
-            if action == "reply":
-                _interaction_state.pop(user_id, None)
-                await _send_one_reply(message, pending["chat_id"], value)
-                return
-            if action == "tpl_add_title":
-                _interaction_state[user_id] = {**pending, "action": "tpl_add_text", "title": value}
-                await message.answer("✏️ Отправьте текст шаблона (до 1000 символов).",
-                                     reply_markup=_cancel_keyboard("menu"))
-                return
-            try:
-                if action == "night_edit":
-                    _save_global_setting("night_mode_reply", value, actor=f"telegram:{user_id}")
-                    text, markup = _night_mode_screen()
-                elif action == "tpl_add_text":
-                    if len(_templates()) >= 20:
-                        raise ValueError("Можно сохранить не более 20 шаблонов.")
-                    template_id = secrets.token_hex(4)
-                    while _template(template_id) is not None:
-                        template_id = secrets.token_hex(4)
-                    item = {"id": template_id, "title": pending["title"], "text": value}
-                    _save_global_setting("reply_templates", [*_templates(), item], actor=f"telegram:{user_id}")
-                    text, markup = _templates_screen(pending["chat_id"])
-                else:
-                    item = _template(pending["id"])
-                    if item is None:
-                        raise ValueError("Шаблон не найден.")
-                    replacement = {**item, "title" if action == "tpl_title" else "text": value}
-                    _save_global_setting("reply_templates", [replacement if row["id"] == item["id"]
-                                                          else row for row in _templates()], actor=f"telegram:{user_id}")
-                    text, markup = _template_screen(replacement, pending["chat_id"])
+                value = _clean_text(message.text, 1000)
+                if pending.get("action") != "night_edit":
+                    _interaction_state.pop(user_id, None)
+                    await message.answer("Действие устарело.")
+                    return
+                _save_global_setting("night_mode_reply", value, actor=f"telegram:{user_id}")
             except Exception as e:
-                logger.warning(f"Communication settings save failed: {type(e).__name__}.")
+                logger.warning(f"Night Mode setting unavailable: {type(e).__name__}.")
                 await message.answer("Не удалось сохранить. Настройка не изменилась.")
                 return
             _interaction_state.pop(user_id, None)
+            text, markup = _night_mode_screen()
             await message.answer(text, reply_markup=markup, parse_mode="HTML")
         return
 

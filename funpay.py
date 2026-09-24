@@ -224,23 +224,42 @@ class FunPayClient:
             order = self.account.get_order(order_id)
             return order, self.account.id
 
-    def send_message_once(self, chat_id: int, text: str, *, enabled_check=None):
-        """One modifying call under the existing Account lock; callers never retry."""
+
+    def send_review_request_once(self, chat_id: int, text: str, *, enabled_check=None):
+        """Send once and confirm the runner/ ACK without parsing returned message HTML."""
         if type(chat_id) is not int or chat_id <= 0 or type(text) is not str or not text.strip():
             raise ValueError("Invalid outgoing message.")
         with self._account_lock:
-            if self._runner_stop.is_set():
+            if self._runner_stop.is_set() or (enabled_check is not None and not enabled_check()):
                 return False
-            if enabled_check is not None and not enabled_check():
-                return False
+            account = self.account
+            if not account.is_initiated:
+                raise FunPayAPI.exceptions.AccountNotInitiatedError()
             with self._outgoing_echo_lock:
                 self._recent_outgoing_text[chat_id] = (text, time.monotonic())
                 if len(self._recent_outgoing_text) > 10000:
-                    oldest = next(iter(self._recent_outgoing_text))
-                    self._recent_outgoing_text.pop(oldest, None)
-            return self.account.send_message(
-                chat_id, text, update_last_saved_message=True,
+                    self._recent_outgoing_text.pop(next(iter(self._recent_outgoing_text)))
+            request = {"action": "chat_message", "data": {
+                "node": chat_id, "last_message": -1,
+                "content": f"{account.bot_character}{text}",
+            }}
+            objects = [{"type": "chat_node", "id": chat_id, "tag": "00000000",
+                        "data": {"node": chat_id, "last_message": -1, "content": ""}}]
+            response = account.method(
+                "post", "runner/",
+                {"accept": "*/*", "content-type": "application/x-www-form-urlencoded; charset=UTF-8",
+                 "x-requested-with": "XMLHttpRequest"},
+                {"objects": json.dumps(objects), "request": json.dumps(request),
+                 "csrf_token": account.csrf_token},
+                raise_not_200=True,
             )
+            payload = response.json()
+            confirmation = payload.get("response") if type(payload) is dict else None
+            if type(confirmation) is not dict or not confirmation or confirmation.get("error") is not None:
+                raise RuntimeError("Review request delivery was not confirmed.")
+            if account.runner is not None:
+                account.runner.update_last_message(chat_id, text)
+            return True
 
     def _is_recent_outgoing_echo(self, chat_id: int, text: str | None) -> bool:
         with self._outgoing_echo_lock:
@@ -597,12 +616,7 @@ class FunPayClient:
         # просто не происходит. LAST_CHAT_MESSAGE_CHANGED эти методы не
         # использует вообще, поэтому на реальные уведомления это не влияет.
         #
-        # ВНИМАНИЕ: если в будущем понадобится текст сообщения (например,
-        # для авто-ответов на конкретные фразы) - эту заплатку нужно будет
-        # убрать и разбираться, почему сам запрос к get_chat_history падает.
         if not getattr(self.account, "_history_fetch_disabled", False):
-            # The UI may request history explicitly; Runner polling keeps its no-op.
-            self._manual_get_chat_history = self.account.get_chat_history
             def _no_op_get_chat_history(chat_id, *args, **kwargs):
                 return []
 
