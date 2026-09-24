@@ -24,7 +24,8 @@ from telegram import (dp, bot_settings, get_user_settings, get_all_recipients,
                       get_night_mode_reply_text, match_autoresponder, _expand_template,
                       expand_review_request_text, is_review_request_enabled)
 from funpay import FunPayClient, _AmbiguousRaiseOutcome
-from runtime_events import ActionEvent, ActionKind, QueuedCriticalEvent, ReviewCheckEvent
+from runtime_events import (ActionEvent, ActionKind, QueuedCriticalEvent,
+                            ReviewCheckEvent, html_preview)
 from state import ReviewReceiptStore, StateError
 import logger
 
@@ -159,7 +160,9 @@ async def auto_bump_loop(bot: Bot, client: FunPayClient):
             try:
                 success, message_text, wait_time = await client.bump_lots(
                     user_id,
-                    is_cancelled=lambda: not bot_settings["auto_bump"] or is_safe_mode_enabled(),
+                    is_cancelled=lambda: (client.runner_stop_requested()
+                                          or not bot_settings["auto_bump"]
+                                          or is_safe_mode_enabled()),
                 )
             except _AmbiguousRaiseOutcome:
                 persistence_failed = False
@@ -334,9 +337,9 @@ async def _fetch_and_send_review(
             title = "✏️ Отзыв изменён" if exists else "🌟 Новый отзыв"
             review_text = (
                 f"<b>{title}</b>\n"
-                f"Покупатель: <b>{escape(str(buyer))}</b>\n"
+                f"Покупатель: <b>{html_preview(buyer, 120)}</b>\n"
                 + (f"Оценка: {stars_str}\n" if stars_str else "")
-                + f"Текст: {escape(text_content)}"
+                + f"Текст: {html_preview(text_content, 3000)}"
             )
             delivered = False
             for recipient_id in get_all_recipients():
@@ -383,7 +386,7 @@ async def _send_night_mode_reply(
 
     def send_if_enabled() -> bool:
         with client._account_lock:
-            if not is_night_mode_enabled() or is_safe_mode_enabled():
+            if client.runner_stop_requested() or not is_night_mode_enabled() or is_safe_mode_enabled():
                 return False
             if action.kind is ActionKind.NIGHT_MESSAGE:
                 chat_id = action.chat_id
@@ -402,7 +405,7 @@ async def _send_night_mode_reply(
                 return False
             if type(chat_id) is not int or chat_id <= 0:
                 return False
-            if not is_night_mode_enabled() or is_safe_mode_enabled():
+            if client.runner_stop_requested() or not is_night_mode_enabled() or is_safe_mode_enabled():
                 return False
             client.account.send_message(
                 chat_id,
@@ -531,6 +534,8 @@ async def _send_scheduled_review_request(
     await asyncio.sleep(max(0, scheduled_at - time.time()))
     store = client.review_state
     while True:
+        if client.runner_stop_requested():
+            return
         if not is_review_request_enabled():
             await asyncio.to_thread(store.discard_pending_review_request, order_id)
             return
@@ -591,6 +596,9 @@ async def _send_scheduled_review_request(
             await asyncio.to_thread(_audit_action, "automation", "REVIEW_REQUEST_SEND", "order", "AMBIGUOUS")
             return
         if sent is False:
+            if client.runner_stop_requested():
+                await asyncio.to_thread(store.release_unstarted_review_request, order_id)
+                return
             if is_safe_mode_enabled() and is_review_request_enabled():
                 await asyncio.to_thread(store.release_unstarted_review_request, order_id)
                 continue

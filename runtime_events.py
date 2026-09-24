@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from enum import Enum
+from html import escape
 import math
 import re
 import secrets
@@ -73,6 +74,19 @@ class ReviewCheckEvent:
 _ORDER_ID = re.compile(r"[A-Z0-9]{8}\Z")
 _ORDER_FIELDS = ("buyer_username", "buyer_id", "chat_id", "description",
                  "subcategory_name", "price", "sum", "currency", "amount", "date")
+
+
+def html_preview(value, limit: int) -> str:
+    """Bound escaped user/API text before it enters a Telegram HTML message."""
+    pieces, size = [], 0
+    for char in str(value):
+        escaped = escape(char)
+        if size + len(escaped) > limit:
+            pieces.append("…")
+            break
+        pieces.append(escaped)
+        size += len(escaped)
+    return "".join(pieces)
 
 
 def _short_text(value, limit: int) -> str | None:

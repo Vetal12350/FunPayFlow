@@ -73,6 +73,7 @@ class CommunicationTests(unittest.IsolatedAsyncioTestCase):
         self.account = FakeAccount()
         ui._runtime_client = SimpleNamespace(
             account=self.account, _account_lock=threading.RLock(),
+            runner_stop_requested=lambda: False,
             send_message_once=lambda chat_id, text: self.account.send_message(
                 chat_id, text, update_last_saved_message=True),
             _manual_get_chat_history=lambda chat_id, **kwargs: [
@@ -207,6 +208,17 @@ class CommunicationTests(unittest.IsolatedAsyncioTestCase):
             await ui.text_handler(FakeMessage(text="❌ Отмена"))
         self.assertEqual(len(self.account.sent), 1)
 
+    async def test_manual_reply_blocked_during_shutdown(self):
+        message = FakeMessage(text="Hello")
+        audit = []
+        with patch.object(ui, "_send_to_chat", return_value=False), patch.object(
+            ui, "_audit_action", side_effect=lambda *args: audit.append(args)
+        ):
+            await ui._send_one_reply(message, 2, "Hello")
+        self.assertIn("не отправлено", message.sent[0][0])
+        self.assertEqual(audit[0][-1], "BLOCKED")
+        self.assertEqual(self.account.sent, [])
+
     async def test_authorization_and_command_safety(self):
         cb = FakeCallback("reply:2", user_id=900)
         with patch.object(ui, "is_authorized", return_value=False):
@@ -219,6 +231,21 @@ class CommunicationTests(unittest.IsolatedAsyncioTestCase):
             await ui.text_handler(FakeMessage(text="/status"))
         self.assertNotIn(1, ui._interaction_state)
         self.assertIsNone(ui.bot_settings["night_mode_reply"])
+
+    async def test_authorization_save_failure_rolls_back_access(self):
+        user_id = 987654321
+        previous_ids = list(ui.bot_settings["authorized_user_ids"])
+        ui.authorized_users.discard(user_id)
+        ui._user_settings.pop(user_id, None)
+        message = FakeMessage(user_id, "synthetic-password")
+        with patch.dict(ui.os.environ, {"BOT_PASSWORD": "synthetic-password", "ADMIN_ID": "1"}), patch.object(
+            ui, "save_settings", side_effect=RuntimeError("disk")
+        ):
+            await ui.text_handler(message)
+        self.assertNotIn(user_id, ui.authorized_users)
+        self.assertNotIn(user_id, ui._user_settings)
+        self.assertEqual(ui.bot_settings["authorized_user_ids"], previous_ids)
+        self.assertIn("Не удалось сохранить", message.sent[0][0])
 
     async def test_transport_ambiguity_has_no_retry(self):
         ui._interaction_state[1] = {"action": "reply", "chat_id": 2}
