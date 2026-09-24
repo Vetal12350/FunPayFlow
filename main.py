@@ -302,6 +302,9 @@ async def _fetch_and_send_review(
         async with client._review_notification_lock:
             if getattr(client, "_review_state_failed", False):
                 raise StateError("Persistent state unavailable.")
+            await _review_state_operation(
+                client, client.review_state.record_review_observation, verified_order_id
+            )
             if client._notified_reviews.get(verified_order_id) == fingerprint:
                 return
             exists, previous = await _review_state_operation(
@@ -486,8 +489,12 @@ async def notifications_loop(bot: Bot, client: FunPayClient):
             observation = _order_observation(event)
             if observation is not None:
                 try:
+                    order = getattr(event, "order", None)
+                    closed = observation[1] == "CLOSED"
                     await asyncio.to_thread(
-                        client.review_state.record_order_observation, *observation
+                        client.review_state.record_order_observation, *observation,
+                        amount=getattr(order, "price", None) if closed else None,
+                        currency=getattr(order, "currency", None) if closed else None,
                     )
                 except StateError:
                     logger.error("Order statistics write failed: StateError.")

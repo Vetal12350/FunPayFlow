@@ -1,10 +1,12 @@
 """Локальные receipts отзывов и наблюдения заказов одного FunPay-аккаунта."""
 
+import json
 import re
 import sqlite3
 import time
 from contextlib import closing
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 
@@ -16,8 +18,10 @@ class StateError(RuntimeError):
 
 
 class ReviewReceiptStore:
-    def __init__(self, path: Path = DEFAULT_DB_PATH):
+    def __init__(self, path: Path = DEFAULT_DB_PATH, legacy_stats_path: Path | None = None):
         self.path = Path(path)
+        self.legacy_stats_path = (Path(legacy_stats_path) if legacy_stats_path is not None
+                                  else self.path.with_name("stats_log.json"))
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.path, timeout=5.0)
@@ -71,7 +75,8 @@ class ReviewReceiptStore:
                         "first_seen_at INTEGER NOT NULL, "
                         "last_seen_at INTEGER NOT NULL, "
                         "current_status TEXT NOT NULL "
-                        "CHECK (current_status IN ('PAID', 'CLOSED', 'REFUNDED')))"
+                        "CHECK (current_status IN ('PAID', 'CLOSED', 'REFUNDED')), "
+                        "closed_at_utc INTEGER, amount TEXT, currency TEXT)"
                     )
                     order_columns = {
                         row[1]: row for row in connection.execute("PRAGMA table_info(orders)")
@@ -80,14 +85,100 @@ class ReviewReceiptStore:
                             or any(order_columns.get(name, (None,) * 6)[3] != 1
                                    for name in ("first_seen_at", "last_seen_at", "current_status"))):
                         raise StateError("Persistent order schema is incompatible.")
+                    if "closed_at_utc" not in order_columns:
+                        connection.execute("ALTER TABLE orders ADD COLUMN closed_at_utc INTEGER")
+                    elif order_columns["closed_at_utc"][2].upper() != "INTEGER":
+                        raise StateError("Persistent order schema is incompatible.")
+                    for name in ("amount", "currency"):
+                        if name not in order_columns:
+                            connection.execute(f"ALTER TABLE orders ADD COLUMN {name} TEXT")
+                        elif order_columns[name][2].upper() != "TEXT":
+                            raise StateError("Persistent order schema is incompatible.")
+                    # Для уже закрытых заказов последняя запись — лучшее
+                    # доступное время закрытия; историю возвратов не выдумываем.
                     connection.execute(
-                        "SELECT order_id, first_seen_at, last_seen_at, current_status "
+                        "UPDATE orders SET closed_at_utc = last_seen_at "
+                        "WHERE current_status = 'CLOSED' AND closed_at_utc IS NULL"
+                    )
+                    connection.execute(
+                        "SELECT order_id, first_seen_at, last_seen_at, current_status, closed_at_utc "
                         "FROM orders LIMIT 1"
                     ).fetchone()
+                    connection.execute(
+                        "CREATE TABLE IF NOT EXISTS legacy_stats ("
+                        "kind TEXT NOT NULL CHECK(kind IN ('order', 'review', 'withdrawal')), "
+                        "record_key TEXT NOT NULL, recorded_at REAL NOT NULL, "
+                        "amount TEXT, currency TEXT, PRIMARY KEY(kind, record_key))"
+                    )
+                    connection.execute(
+                        "CREATE TABLE IF NOT EXISTS review_observations ("
+                        "order_id TEXT PRIMARY KEY, observed_at INTEGER NOT NULL)"
+                    )
+                    # Уже доставленные отзывы — подтверждённый минимум истории.
+                    connection.execute(
+                        "INSERT OR IGNORE INTO review_observations (order_id, observed_at) "
+                        "SELECT order_id, CAST(strftime('%s', delivered_at) AS INTEGER) "
+                        "FROM review_receipts WHERE strftime('%s', delivered_at) IS NOT NULL"
+                    )
+                    self._import_legacy_stats(connection)
                     if connection.execute("PRAGMA quick_check").fetchone() != ("ok",):
                         raise StateError("Persistent state integrity check failed.")
         except (sqlite3.Error, OSError):
             raise StateError("Persistent state initialization failed.") from None
+
+    def _import_legacy_stats(self, connection: sqlite3.Connection) -> None:
+        """Идемпотентно переносит старый локальный JSON, если он лежит рядом с БД."""
+        if not self.legacy_stats_path.is_file():
+            return
+        try:
+            records = json.loads(self.legacy_stats_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, ValueError):
+            raise StateError("Legacy statistics import failed.") from None
+        if not isinstance(records, list):
+            raise StateError("Legacy statistics import failed.")
+        for record in records:
+            if not isinstance(record, dict) or record.get("type") not in (
+                "order", "review", "withdrawal"
+            ):
+                raise StateError("Legacy statistics import failed.")
+            kind = record["type"]
+            key = record.get("transaction_id" if kind == "withdrawal" else "order_id")
+            if not isinstance(key, str) or not key:
+                raise StateError("Legacy statistics import failed.")
+            if kind != "withdrawal":
+                self._require_order_id(key)
+            try:
+                raw_ts = record["ts"]
+                if isinstance(raw_ts, bool):
+                    raise ValueError
+                ts = Decimal(str(raw_ts))
+                if not ts.is_finite() or ts <= 0:
+                    raise ValueError
+            except (KeyError, InvalidOperation, ValueError):
+                raise StateError("Legacy statistics import failed.") from None
+            amount = None
+            currency = None
+            if kind != "review":
+                try:
+                    raw_amount = record.get("amount")
+                    if not isinstance(raw_amount, bool) and raw_amount is not None:
+                        value = Decimal(str(raw_amount))
+                        if value.is_finite() and value > 0:
+                            amount = str(value)
+                except InvalidOperation:
+                    pass
+                raw_currency = record.get("currency")
+                if isinstance(raw_currency, str):
+                    cleaned = raw_currency.strip()
+                    if cleaned.upper() in ("$", "USD"):
+                        currency = "USD"
+                    elif cleaned in ("₽", "€"):
+                        currency = cleaned
+            connection.execute(
+                "INSERT INTO legacy_stats (kind, record_key, recorded_at, amount, currency) "
+                "VALUES (?, ?, ?, ?, ?) ON CONFLICT(kind, record_key) DO NOTHING",
+                (kind, key, float(ts), amount, currency),
+            )
 
     def has_review_receipt(self, order_id: str) -> bool:
         self._require_order_id(order_id)
@@ -148,8 +239,28 @@ class ReviewReceiptStore:
         except (sqlite3.Error, OSError):
             raise StateError("Persistent state write failed.") from None
 
+    def record_review_observation(
+        self, order_id: str, observed_at_utc: int | None = None,
+    ) -> None:
+        """Факт проверенного buyer review, независимо от Telegram delivery."""
+        self._require_order_id(order_id)
+        if observed_at_utc is None:
+            observed_at_utc = int(time.time())
+        if type(observed_at_utc) is not int or observed_at_utc < 0:
+            raise StateError("Invalid review observation time.")
+        try:
+            with closing(self._connect()) as connection:
+                with connection:
+                    connection.execute(
+                        "INSERT OR IGNORE INTO review_observations (order_id, observed_at) "
+                        "VALUES (?, ?)", (order_id, observed_at_utc),
+                    )
+        except (sqlite3.Error, OSError):
+            raise StateError("Persistent review observation write failed.") from None
+
     def record_order_observation(
-        self, order_id: str, status: str, observed_at_utc: int | None = None
+        self, order_id: str, status: str, observed_at_utc: int | None = None,
+        *, amount=None, currency=None,
     ) -> None:
         """Записывает текущий статус; время — наблюдение ботом, не дата заказа."""
         self._require_order_id(order_id)
@@ -159,17 +270,36 @@ class ReviewReceiptStore:
             observed_at_utc = int(time.time())
         if type(observed_at_utc) is not int or observed_at_utc < 0:
             raise StateError("Invalid observation time.")
+        recorded_amount = None
+        recorded_currency = None
+        if status == "CLOSED":
+            try:
+                if amount is not None and not isinstance(amount, bool):
+                    value = Decimal(str(amount))
+                    if value.is_finite() and value > 0:
+                        recorded_amount = str(value)
+            except InvalidOperation:
+                pass
+            if isinstance(currency, str) and 0 < len(currency.strip()) <= 16:
+                cleaned = currency.strip()
+                recorded_currency = "USD" if cleaned.upper() in ("$", "USD") else cleaned
         try:
             with closing(self._connect()) as connection:
                 with connection:
                     connection.execute(
-                        "INSERT INTO orders (order_id, first_seen_at, last_seen_at, current_status) "
-                        "VALUES (?, ?, ?, ?) "
+                        "INSERT INTO orders (order_id, first_seen_at, last_seen_at, "
+                        "current_status, closed_at_utc, amount, currency) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?) "
                         "ON CONFLICT(order_id) DO UPDATE SET "
                         "last_seen_at = MAX(orders.last_seen_at, excluded.last_seen_at), "
+                        "closed_at_utc = COALESCE(orders.closed_at_utc, excluded.closed_at_utc), "
+                        "amount = COALESCE(orders.amount, excluded.amount), "
+                        "currency = COALESCE(orders.currency, excluded.currency), "
                         "current_status = CASE WHEN excluded.last_seen_at >= orders.last_seen_at "
                         "THEN excluded.current_status ELSE orders.current_status END",
-                        (order_id, observed_at_utc, observed_at_utc, status),
+                        (order_id, observed_at_utc, observed_at_utc, status,
+                         observed_at_utc if status == "CLOSED" else None,
+                         recorded_amount, recorded_currency),
                     )
         except (sqlite3.Error, OSError):
             raise StateError("Persistent order write failed.") from None
@@ -210,3 +340,64 @@ class ReviewReceiptStore:
                 return result
         except (sqlite3.Error, OSError):
             raise StateError("Persistent order read failed.") from None
+
+    def get_legacy_statistics(
+        self, period: str, now_utc: int | None = None,
+    ) -> dict:
+        """Архив старого бота + новые закрытия и проверенные buyer reviews."""
+        if period not in ("today", "week", "month"):
+            raise StateError("Invalid statistics period.")
+        if now_utc is None:
+            now_utc = int(time.time())
+        if type(now_utc) is not int or now_utc < 0:
+            raise StateError("Invalid statistics time.")
+        today_local = int(datetime.fromtimestamp(now_utc)
+                          .replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
+        start = {"today": today_local, "week": now_utc - 7 * 86400,
+                 "month": now_utc - 30 * 86400}[period]
+        try:
+            with closing(self._connect()) as connection:
+                connection.execute("BEGIN")
+                archived_orders = connection.execute(
+                    "SELECT amount, currency FROM legacy_stats "
+                    "WHERE kind = 'order' AND recorded_at BETWEEN ? AND ?",
+                    (start, now_utc),
+                ).fetchall()
+                current_orders = connection.execute(
+                    "SELECT o.amount, o.currency FROM orders AS o "
+                    "WHERE o.closed_at_utc BETWEEN ? AND ? AND NOT EXISTS ("
+                    "SELECT 1 FROM legacy_stats AS l WHERE l.kind = 'order' "
+                    "AND l.record_key = o.order_id)",
+                    (start, now_utc),
+                ).fetchall()
+                archived_reviews = connection.execute(
+                    "SELECT COUNT(*) FROM legacy_stats "
+                    "WHERE kind = 'review' AND recorded_at BETWEEN ? AND ?",
+                    (start, now_utc),
+                ).fetchone()[0]
+                current_reviews = connection.execute(
+                    "SELECT COUNT(*) FROM review_observations AS r "
+                    "WHERE r.observed_at BETWEEN ? AND ? AND NOT EXISTS ("
+                    "SELECT 1 FROM legacy_stats AS l WHERE l.kind = 'review' "
+                    "AND l.record_key = r.order_id)",
+                    (start, now_utc),
+                ).fetchone()[0]
+                withdrawals_count = connection.execute(
+                    "SELECT COUNT(*) FROM legacy_stats "
+                    "WHERE kind = 'withdrawal' AND recorded_at BETWEEN ? AND ?",
+                    (start, now_utc),
+                ).fetchone()[0]
+                # Только подтверждённый USD: не переводим другие/неизвестные валюты.
+                usd_turnover = sum(
+                    (Decimal(amount) for amount, currency in archived_orders + current_orders
+                     if amount is not None and currency in ("USD", "$")),
+                    Decimal(0),
+                )
+                return {
+                    "orders_count": len(archived_orders) + len(current_orders),
+                    "reviews_count": archived_reviews + current_reviews,
+                    "usd_turnover": usd_turnover,
+                    "withdrawals_count": withdrawals_count,
+                }
+        except (sqlite3.Error, OSError):
+            raise StateError("Persistent statistics read failed.") from None
