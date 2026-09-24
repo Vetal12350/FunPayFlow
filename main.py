@@ -491,10 +491,13 @@ async def notifications_loop(bot: Bot, client: FunPayClient):
                 try:
                     order = getattr(event, "order", None)
                     closed = observation[1] == "CLOSED"
+                    event_currency = getattr(order, "currency", None) if closed else None
                     await asyncio.to_thread(
                         client.review_state.record_order_observation, *observation,
-                        amount=getattr(order, "price", None) if closed else None,
-                        currency=getattr(order, "currency", None) if closed else None,
+                        amount=(getattr(order, "price", None) or getattr(order, "sum", None))
+                        if closed else None,
+                        currency=(event_currency if event_currency is not None
+                                  else bot_settings.get("stats_currency")) if closed else None,
                     )
                 except StateError:
                     logger.error("Order statistics write failed: StateError.")
@@ -555,6 +558,24 @@ async def notifications_loop(bot: Bot, client: FunPayClient):
                 raise RuntimeError("Review task unexpectedly failed.") from None
 
 
+async def withdrawals_poll_loop(client: FunPayClient):
+    """OLD interval: сразу, затем каждые 1800 с; только read-only balance GET."""
+    while True:
+        try:
+            completed = await asyncio.to_thread(client.get_completed_withdrawals)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning(f"Withdrawal poll failed: {type(e).__name__}.")
+        else:
+            for transaction_id, amount, currency in completed:
+                await asyncio.to_thread(
+                    client.review_state.record_withdrawal_observation,
+                    transaction_id, amount, currency,
+                )
+        await asyncio.sleep(1800)
+
+
 async def session_refresh_loop(client: FunPayClient):
     """
     Раз в час обновляет PHPSESSID - 1 в 1 как update_session_loop в Кардинале
@@ -598,6 +619,7 @@ async def _supervise_tasks(bot: Bot, client: FunPayClient):
         ),
         "auto_bump": asyncio.create_task(auto_bump_loop(bot, client), name="auto_bump"),
         "notifications": asyncio.create_task(notifications_loop(bot, client), name="notifications"),
+        "withdrawals": asyncio.create_task(withdrawals_poll_loop(client), name="withdrawals"),
         "session_refresh": asyncio.create_task(session_refresh_loop(client), name="session_refresh"),
     }
     polling = tasks["telegram_polling"]

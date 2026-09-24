@@ -5,6 +5,7 @@ import random
 import re
 import queue
 import threading
+from decimal import Decimal, InvalidOperation
 from html import escape
 import requests
 from bs4 import BeautifulSoup
@@ -27,6 +28,10 @@ class _RunnerStopRequested(BaseException):
 
 class _EventQueueOverflow(Exception):
     """Распарсенное событие не удалось передать consumer без потери."""
+
+
+class _WithdrawalParseError(ValueError):
+    """Строка завершённого вывода не содержит проверяемых данных."""
 
 
 # Буфер для короткого всплеска Runner; переполнение завершает runtime, а не растит память.
@@ -345,6 +350,46 @@ class FunPayClient:
         with self._account_lock:
             order = self.account.get_order(order_id)
             return order, self.account.id
+
+    def get_completed_withdrawals(self) -> list[tuple[str, Decimal, str | None]]:
+        """Read-only первая страница Финансов через тот же Account и RLock."""
+        with self._account_lock:
+            response = self.account.method(
+                "get", "account/balance", {"accept": "*/*"}, {}, raise_not_200=True
+            )
+            content = response.content
+        parser = BeautifulSoup(content.decode("utf-8"), "html.parser")
+        withdrawals = []
+        for item in parser.find_all("div", class_="tc-item"):
+            title = item.find("span", class_="tc-title")
+            if title is None or not title.get_text(strip=True).startswith("Вывод"):
+                continue
+            status = item.find("div", class_="tc-status")
+            if status is None or status.get_text(strip=True) != "Завершено":
+                continue
+            transaction_id = item.get("data-transaction")
+            price = item.find("div", class_="tc-price")
+            if (not isinstance(transaction_id, str)
+                    or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", transaction_id)
+                    or price is None):
+                raise _WithdrawalParseError()
+            unit = price.find("span", class_="unit")
+            currency = unit.get_text(strip=True) if unit is not None else None
+            amount_text = price.get_text(" ", strip=True)
+            if currency:
+                amount_text = amount_text.replace(currency, "", 1)
+            amount_text = amount_text.replace("−", "-").replace(",", ".").strip()
+            amount_text = re.sub(r"^-\s+(?=\d)", "-", amount_text)
+            if not re.fullmatch(r"-?\d+(?:\.\d+)?", amount_text):
+                raise _WithdrawalParseError()
+            try:
+                amount = abs(Decimal(amount_text))
+            except InvalidOperation:
+                raise _WithdrawalParseError() from None
+            if not amount.is_finite() or amount <= 0:
+                raise _WithdrawalParseError()
+            withdrawals.append((transaction_id, amount, currency))
+        return withdrawals
 
     # ВАЖНО: специально НЕ создаем здесь отдельную requests.Session с тем же
     # golden_key (как было раньше в _init_session/_raise_lot_safe). У self.account

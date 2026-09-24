@@ -1,6 +1,7 @@
 """Локальные receipts отзывов и наблюдения заказов одного FunPay-аккаунта."""
 
 import json
+import math
 import re
 import sqlite3
 import time
@@ -114,6 +115,11 @@ class ReviewReceiptStore:
                         "CREATE TABLE IF NOT EXISTS review_observations ("
                         "order_id TEXT PRIMARY KEY, observed_at INTEGER NOT NULL)"
                     )
+                    connection.execute(
+                        "CREATE TABLE IF NOT EXISTS withdrawals ("
+                        "transaction_id TEXT PRIMARY KEY, amount TEXT NOT NULL, "
+                        "currency TEXT, observed_at INTEGER NOT NULL)"
+                    )
                     # Уже доставленные отзывы — подтверждённый минимум истории.
                     connection.execute(
                         "INSERT OR IGNORE INTO review_observations (order_id, observed_at) "
@@ -161,7 +167,7 @@ class ReviewReceiptStore:
             if kind != "review":
                 try:
                     raw_amount = record.get("amount")
-                    if not isinstance(raw_amount, bool) and raw_amount is not None:
+                    if type(raw_amount) in (int, float):
                         value = Decimal(str(raw_amount))
                         if value.is_finite() and value > 0:
                             amount = str(value)
@@ -258,6 +264,44 @@ class ReviewReceiptStore:
         except (sqlite3.Error, OSError):
             raise StateError("Persistent review observation write failed.") from None
 
+    def record_withdrawal_observation(
+        self, transaction_id: str, amount, currency,
+        observed_at_utc: int | None = None,
+    ) -> None:
+        """Один подтверждённо завершённый вывод на transaction_id."""
+        if (not isinstance(transaction_id, str)
+                or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", transaction_id)):
+            raise StateError("Invalid withdrawal ID.")
+        try:
+            if type(amount) not in (int, float, Decimal):
+                raise ValueError
+            value = Decimal(str(amount))
+            if not value.is_finite() or value <= 0:
+                raise ValueError
+        except (InvalidOperation, ValueError):
+            raise StateError("Invalid withdrawal amount.") from None
+        if observed_at_utc is None:
+            observed_at_utc = int(time.time())
+        if type(observed_at_utc) is not int or observed_at_utc < 0:
+            raise StateError("Invalid withdrawal observation time.")
+        saved_currency = None
+        if isinstance(currency, str) and 0 < len(currency.strip()) <= 16:
+            cleaned = currency.strip()
+            saved_currency = "USD" if cleaned.upper() in ("$", "USD") else cleaned
+        try:
+            with closing(self._connect()) as connection:
+                with connection:
+                    connection.execute(
+                        "INSERT OR IGNORE INTO withdrawals "
+                        "(transaction_id, amount, currency, observed_at) "
+                        "SELECT ?, ?, ?, ? WHERE NOT EXISTS ("
+                        "SELECT 1 FROM legacy_stats WHERE kind = 'withdrawal' AND record_key = ?)",
+                        (transaction_id, str(value), saved_currency,
+                         observed_at_utc, transaction_id),
+                    )
+        except (sqlite3.Error, OSError):
+            raise StateError("Persistent withdrawal write failed.") from None
+
     def record_order_observation(
         self, order_id: str, status: str, observed_at_utc: int | None = None,
         *, amount=None, currency=None,
@@ -274,7 +318,7 @@ class ReviewReceiptStore:
         recorded_currency = None
         if status == "CLOSED":
             try:
-                if amount is not None and not isinstance(amount, bool):
+                if type(amount) in (int, float, Decimal):
                     value = Decimal(str(amount))
                     if value.is_finite() and value > 0:
                         recorded_amount = str(value)
@@ -342,14 +386,14 @@ class ReviewReceiptStore:
             raise StateError("Persistent order read failed.") from None
 
     def get_legacy_statistics(
-        self, period: str, now_utc: int | None = None,
+        self, period: str, now_utc: int | float | None = None,
     ) -> dict:
         """Архив старого бота + новые закрытия и проверенные buyer reviews."""
         if period not in ("today", "week", "month"):
             raise StateError("Invalid statistics period.")
         if now_utc is None:
-            now_utc = int(time.time())
-        if type(now_utc) is not int or now_utc < 0:
+            now_utc = time.time()
+        if type(now_utc) not in (int, float) or not math.isfinite(now_utc) or now_utc < 0:
             raise StateError("Invalid statistics time.")
         today_local = int(datetime.fromtimestamp(now_utc)
                           .replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
@@ -382,14 +426,27 @@ class ReviewReceiptStore:
                     "AND l.record_key = r.order_id)",
                     (start, now_utc),
                 ).fetchone()[0]
-                withdrawals_count = connection.execute(
-                    "SELECT COUNT(*) FROM legacy_stats "
+                archived_withdrawals = connection.execute(
+                    "SELECT amount, currency FROM legacy_stats "
                     "WHERE kind = 'withdrawal' AND recorded_at BETWEEN ? AND ?",
                     (start, now_utc),
-                ).fetchone()[0]
+                ).fetchall()
+                current_withdrawals = connection.execute(
+                    "SELECT w.amount, w.currency FROM withdrawals AS w "
+                    "WHERE w.observed_at BETWEEN ? AND ? AND NOT EXISTS ("
+                    "SELECT 1 FROM legacy_stats AS l WHERE l.kind = 'withdrawal' "
+                    "AND l.record_key = w.transaction_id)",
+                    (start, now_utc),
+                ).fetchall()
                 # Только подтверждённый USD: не переводим другие/неизвестные валюты.
                 usd_turnover = sum(
                     (Decimal(amount) for amount, currency in archived_orders + current_orders
+                     if amount is not None and currency in ("USD", "$")),
+                    Decimal(0),
+                )
+                usd_withdrawals = sum(
+                    (Decimal(amount) for amount, currency in
+                     archived_withdrawals + current_withdrawals
                      if amount is not None and currency in ("USD", "$")),
                     Decimal(0),
                 )
@@ -397,7 +454,8 @@ class ReviewReceiptStore:
                     "orders_count": len(archived_orders) + len(current_orders),
                     "reviews_count": archived_reviews + current_reviews,
                     "usd_turnover": usd_turnover,
-                    "withdrawals_count": withdrawals_count,
+                    "withdrawals_count": len(archived_withdrawals) + len(current_withdrawals),
+                    "usd_withdrawals": usd_withdrawals,
                 }
         except (sqlite3.Error, OSError):
             raise StateError("Persistent statistics read failed.") from None
