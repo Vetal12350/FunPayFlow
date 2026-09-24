@@ -15,6 +15,7 @@ import secrets
 import unicodedata
 from collections import deque
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal, ROUND_HALF_UP, localcontext
 from aiogram import Dispatcher, F
 from aiogram.filters import Command
 from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, ReplyKeyboardMarkup, KeyboardButton, FSInputFile
@@ -567,6 +568,7 @@ def get_stats_keyboard():
         [InlineKeyboardButton(text="📅 Сегодня", callback_data="stats_today")],
         [InlineKeyboardButton(text="🗓 Неделя", callback_data="stats_week")],
         [InlineKeyboardButton(text="🗓 Месяц", callback_data="stats_month")],
+        [InlineKeyboardButton(text="📈 Аналитика", callback_data="analytics")],
         [InlineKeyboardButton(text="🔙 Назад", callback_data="menu_main")],
     ])
 
@@ -1141,6 +1143,242 @@ async def _orders_callback(callback: CallbackQuery, action: str, user_id: int) -
     return True
 
 
+_ANALYTICS_PERIODS = {"today": "Сегодня", "7d": "7 дней",
+                      "30d": "30 дней", "all": "Всё время"}
+_ANALYTICS_NOTE = "ℹ️ Аналитика строится по данным, сохранённым ботом."
+
+
+def _analytics_money(value) -> str:
+    if value is None:
+        return "нет данных"
+    amount = Decimal(str(value))
+    with localcontext() as context:
+        context.prec = max(context.prec, len(amount.as_tuple().digits) + 4)
+        amount = amount.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    return f"{amount:.2f} $"
+
+
+def _analytics_percent(numerator: int, denominator: int) -> str:
+    if not denominator:
+        return "нет данных"
+    percent = (Decimal(numerator) * 100 / Decimal(denominator)).quantize(
+        Decimal("0.1"), rounding=ROUND_HALF_UP)
+    return f"{percent:.1f}%"
+
+
+def _analytics_change(current, previous) -> str:
+    if previous is None or current is None:
+        return ""
+    current, previous = Decimal(str(current)), Decimal(str(previous))
+    if previous == 0:
+        return " (новые данные)" if current > 0 else ""
+    change = ((current - previous).copy_abs() * 100 / previous).quantize(
+        Decimal("0.1"), rounding=ROUND_HALF_UP)
+    direction = "↑" if current > previous else "↓" if current < previous else "→"
+    return f" ({direction} {change:.1f}%)"
+
+
+def _analytics_product(value) -> str:
+    return _escaped_preview(value, 120) if value else "товар не указан"
+
+
+def _analytics_sections(period: str):
+    return [
+        [_button("🏆 Топ товаров", f"ana_top:{period}:count")],
+        [_button("👥 Покупатели", f"ana_buy:{period}")],
+        [_button("⭐ Отзывы", f"ana_reviews:{period}")],
+        [_button("📅 По времени", f"ana_time:{period}")],
+        [_button("🏅 Рекорды", "ana_records")],
+    ]
+
+
+def _analytics_keyboard(period: str, *, detail=False):
+    if detail:
+        return _menu([[_button("🔙 К аналитике", f"ana_over:{period}")]])
+    return _menu([
+        [_button("📅 Сегодня", "ana_over:today"), _button("🗓 7 дней", "ana_over:7d")],
+        [_button("🗓 30 дней", "ana_over:30d"), _button("♾ Всё время", "ana_over:all")],
+        *_analytics_sections(period),
+        [_button("🔙 Назад", "menu_stats")],
+    ])
+
+
+def _analytics_overview_text(period: str, data: dict) -> str:
+    turnover = data["usd_turnover"]
+    average = (Decimal(turnover) / data["usd_orders"]
+               if turnover is not None and data["usd_orders"] else None)
+    lines = [
+        f"📈 <b>Аналитика продаж · {_ANALYTICS_PERIODS[period]}</b>", "",
+        f"🛒 Заказов: {data['orders']}" + _analytics_change(data["orders"], data["previous_orders"]),
+        f"💰 Оборот: {_analytics_money(turnover)}" +
+        _analytics_change(turnover, data["previous_usd_turnover"]),
+        f"💵 Средний чек: {_analytics_money(average)}",
+        f"↩️ Возвратов: {data['refunds']}",
+        f"⭐ Отзывов: {data['reviews']}",
+        f"👥 Покупателей: {data['buyers']}",
+        f"🔁 Повторных: {data['repeat_buyers']}",
+    ]
+    if data["terminal_orders"]:
+        lines.append("Доля возвратов среди завершённых/возвращённых: " +
+                     _analytics_percent(data["refunds"], data["terminal_orders"]))
+    top = data["top_product"]
+    if top:
+        lines += ["", "🏆 Самый популярный:",
+                  f"{_analytics_product(top['product'])} — {top['orders']} заказов"]
+    expensive = data["most_expensive"]
+    if expensive:
+        lines += ["", "💎 Самый дорогой заказ:",
+                  f"{_analytics_product(expensive['product'])} — "
+                  f"{_analytics_money(expensive['usd_amount'])}"]
+    else:
+        lines += ["", "💎 Самый дорогой заказ: нет данных"]
+    top_money = data["top_turnover_product"]
+    if top_money:
+        lines += ["", "💰 Больше всего подтверждённого оборота:",
+                  f"{_analytics_product(top_money['product'])} — "
+                  f"{_analytics_money(top_money['usd_turnover'])}"]
+    best = data["best_day"]
+    if best:
+        money = (" / " + _analytics_money(best["usd_turnover"])
+                 if best["usd_turnover"] is not None else "")
+        lines += ["", "📅 Лучший день наблюдения закрытий:",
+                  f"{best['day']} — {best['orders']} заказов{money}"]
+    lines += ["", _ANALYTICS_NOTE]
+    return "\n".join(lines)
+
+
+def _analytics_top_text(period: str, sort: str, rows: list[dict]) -> str:
+    mode = "по продажам" if sort == "count" else "по обороту"
+    lines = [f"🏆 <b>Топ товаров · {_ANALYTICS_PERIODS[period]} · {mode}</b>", ""]
+    for index, row in enumerate(rows, 1):
+        lines.append(f"{index}. {_analytics_product(row['product'])}")
+        lines.append(f"   🛒 {row['orders']} · 💰 {_analytics_money(row['usd_turnover'])}")
+        lines.append("")
+    if not rows:
+        lines.append("Нет данных для выбранного периода.")
+    return "\n".join(lines).rstrip()
+
+
+def _analytics_buyers_text(period: str, data: dict) -> str:
+    lines = [f"👥 <b>Покупатели · {_ANALYTICS_PERIODS[period]}</b>", "",
+             f"👤 Уникальных: {data['unique']}", f"🔁 Повторных: {data['repeat']}"]
+    if data["top"]:
+        lines += ["", "🏆 Топ покупателей:"]
+        for index, row in enumerate(data["top"], 1):
+            name = _escaped_preview(row["username"], 100) if row["username"] else "Покупатель"
+            lines.append(f"{index}. {name} — {row['orders']} заказов")
+    return "\n".join(lines)
+
+
+def _analytics_reviews_text(period: str, data: dict) -> str:
+    return (f"⭐ <b>Отзывы · {_ANALYTICS_PERIODS[period]}</b>\n\n"
+            f"⭐ Получено отзывов: {data['reviews']}\n"
+            "📊 Доля закрытых заказов с отзывом: " +
+            _analytics_percent(data["reviewed_orders"], data["closed_orders"]))
+
+
+def _analytics_time_text(period: str, data: dict) -> str:
+    lines = [f"📅 <b>По времени · {_ANALYTICS_PERIODS[period]}</b>", ""]
+    best = data["best_day"]
+    if best:
+        lines += ["🏆 Лучший день наблюдения закрытий:",
+                  f"{best['day']} — {best['orders']} заказов" +
+                  (" / " + _analytics_money(best["usd_turnover"])
+                   if best["usd_turnover"] is not None else "")]
+    best_money = data["best_turnover_day"]
+    if best_money:
+        lines += ["", "💰 Максимум подтверждённого оборота за день:",
+                  f"{best_money['day']} — {_analytics_money(best_money['usd_turnover'])}"]
+    if not best:
+        lines.append("Нет дат наблюдения закрытий.")
+    return "\n".join(lines)
+
+
+def _analytics_records_text(data: dict) -> str:
+    lines = ["🏅 <b>Рекорды · вся известная история</b>"]
+    expensive = data["most_expensive"]
+    if expensive:
+        lines += ["", "💎 Самый дорогой заказ:",
+                  f"{_analytics_product(expensive['product'])} — "
+                  f"{_analytics_money(expensive['usd_amount'])}"]
+    for key, label in (("top_product", "🏆 Самый продаваемый товар"),
+                       ("top_turnover_product", "💰 Товар с максимальным оборотом")):
+        row = data[key]
+        if row:
+            value = (f"{row['orders']} заказов" if key == "top_product"
+                     else _analytics_money(row["usd_turnover"]))
+            lines += ["", label + ":", f"{_analytics_product(row['product'])} — {value}"]
+    for key, label in (("best_day", "📅 Максимум замеченных закрытий за день"),
+                       ("best_turnover_day", "💵 Максимальный оборот за день наблюдения")):
+        row = data[key]
+        if row:
+            value = (f"{row['orders']} заказов" if key == "best_day"
+                     else _analytics_money(row["usd_turnover"]))
+            lines += ["", label + ":", f"{row['day']} — {value}"]
+    top_buyer = data["top_buyer"]
+    if top_buyer:
+        name = (_escaped_preview(top_buyer["username"], 100)
+                if top_buyer["username"] else "Покупатель")
+        lines += ["", "👤 Самый частый покупатель:",
+                  f"{name} — {top_buyer['orders']} заказов"]
+    if len(lines) == 1:
+        lines.append("\nНет данных.")
+    lines += ["", _ANALYTICS_NOTE]
+    return "\n".join(lines)
+
+
+async def _analytics_callback(callback: CallbackQuery, action: str) -> bool:
+    prefix = action.split(":", 1)[0]
+    if prefix not in {"analytics", "ana_over", "ana_top", "ana_buy", "ana_reviews",
+                      "ana_time", "ana_records"}:
+        return False
+    answered = False
+    try:
+        parts = action.split(":")
+        store = _orders_store()
+        if action == "analytics":
+            text = "📈 <b>Аналитика продаж</b>\nВыберите период или раздел.\n\n" + _ANALYTICS_NOTE
+            markup = _analytics_keyboard("30d")
+        elif action == "ana_records":
+            data = await asyncio.to_thread(store.get_sales_records)
+            text, markup = _analytics_records_text(data), _analytics_keyboard("30d", detail=True)
+        elif len(parts) in (2, 3) and parts[1] in _ANALYTICS_PERIODS:
+            period = parts[1]
+            if prefix == "ana_over" and len(parts) == 2:
+                data = await asyncio.to_thread(store.get_sales_overview, period)
+                text, markup = _analytics_overview_text(period, data), _analytics_keyboard(period)
+            elif prefix == "ana_top" and len(parts) == 3 and parts[2] in ("count", "turnover"):
+                sort = parts[2]
+                data = await asyncio.to_thread(store.get_sales_top_products, period, sort)
+                text = _analytics_top_text(period, sort, data)
+                markup = _menu([
+                    [_button("🛒 По продажам", f"ana_top:{period}:count"),
+                     _button("💰 По обороту", f"ana_top:{period}:turnover")],
+                    [_button("🔙 Назад", f"ana_over:{period}")],
+                ])
+            elif prefix == "ana_buy" and len(parts) == 2:
+                data = await asyncio.to_thread(store.get_sales_buyers, period)
+                text, markup = _analytics_buyers_text(period, data), _analytics_keyboard(period, detail=True)
+            elif prefix == "ana_reviews" and len(parts) == 2:
+                data = await asyncio.to_thread(store.get_sales_reviews, period)
+                text, markup = _analytics_reviews_text(period, data), _analytics_keyboard(period, detail=True)
+            elif prefix == "ana_time" and len(parts) == 2:
+                data = await asyncio.to_thread(store.get_sales_by_time, period)
+                text, markup = _analytics_time_text(period, data), _analytics_keyboard(period, detail=True)
+            else:
+                raise ValueError("Invalid analytics action.")
+        else:
+            raise ValueError("Invalid analytics action.")
+        await callback.answer()
+        answered = True
+        await callback.message.edit_text(text, reply_markup=markup, parse_mode="HTML")
+    except Exception as e:
+        logger.warning(f"Sales analytics unavailable: {type(e).__name__}.")
+        if not answered:
+            await callback.answer("Аналитика недоступна.", show_alert=True)
+    return True
+
+
 def _chat_screen(chat_id: int, name: str, messages: list[tuple[str, str]]) -> tuple[str, InlineKeyboardMarkup]:
     header = f"💬 <b>{escape(name[:100])}</b>\n\n"
     remaining = 3500 - len(header)
@@ -1404,6 +1642,8 @@ async def callback_handler(callback: CallbackQuery):
     if await _automation_callback(callback, action, user_id):
         return
     if await _orders_callback(callback, action, user_id):
+        return
+    if await _analytics_callback(callback, action):
         return
 
     # Включение/выключение автоподнятия (глобальная настройка — влияет на всех)

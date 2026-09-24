@@ -6,12 +6,96 @@ import re
 import sqlite3
 import time
 from contextlib import closing
-from datetime import datetime, timezone
-from decimal import Decimal, InvalidOperation
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation, localcontext
 from pathlib import Path
 
 
 DEFAULT_DB_PATH = Path(__file__).resolve().with_name("state.sqlite3")
+
+
+class _DecimalSum:
+    """SQLite aggregate that keeps monetary arithmetic in Decimal, not binary float."""
+    def __init__(self):
+        self.total = Decimal(0)
+        self.found = False
+
+    def step(self, raw):
+        if raw is None:
+            return
+        try:
+            value = Decimal(str(raw))
+            if value.is_finite() and value >= 0:
+                with localcontext() as context:
+                    context.prec = max(
+                        context.prec, len(self.total.as_tuple().digits) +
+                        len(value.as_tuple().digits) +
+                        abs(self.total.as_tuple().exponent) +
+                        abs(value.as_tuple().exponent) + 4,
+                    )
+                    self.total += value
+                self.found = True
+        except InvalidOperation:
+            pass
+
+    def finalize(self):
+        return str(self.total) if self.found else None
+
+
+def _decimal_compare(left: str, right: str) -> int:
+    first, second = Decimal(left), Decimal(right)
+    return (first > second) - (first < second)
+
+
+# A sale is a first observed CLOSED transition, an archived old-bot closure,
+# or (all-time only) a sparse old CLOSED row with no trustworthy date.
+# The old bot hard-coded '$'; neither its currency nor the current settings
+# fallback proves USD. Only confirmed_currency may qualify an order for money.
+_USD_AMOUNT = "CASE WHEN o.confirmed_currency = 'USD' THEN COALESCE(o.amount, o.listed_price) END"
+_SALE_COLUMNS = ("o.order_id, o.product_description, o.subcategory_name, "
+                 "o.buyer_id, o.buyer_username, " + _USD_AMOUNT + " AS usd_amount")
+_ARCHIVE_COLUMNS = ("l.record_key AS order_id, o.product_description, o.subcategory_name, "
+                    "o.buyer_id, o.buyer_username, " + _USD_AMOUNT + " AS usd_amount")
+_SALES_CTE = (
+    "sale_source AS ("
+    "SELECT " + _SALE_COLUMNS + ", s.first_observed_at AS sale_at "
+    "FROM orders o JOIN order_status_observations s "
+    "ON s.order_id = o.order_id AND s.status = 'CLOSED' "
+    "UNION ALL SELECT " + _ARCHIVE_COLUMNS + ", l.recorded_at AS sale_at "
+    "FROM legacy_stats l LEFT JOIN orders o ON o.order_id = l.record_key "
+    "WHERE l.kind = 'order' AND NOT EXISTS ("
+    "SELECT 1 FROM order_status_observations s "
+    "WHERE s.order_id = l.record_key AND s.status = 'CLOSED') "
+    "UNION ALL SELECT " + _SALE_COLUMNS + ", NULL AS sale_at "
+    "FROM orders o WHERE o.current_status = 'CLOSED' "
+    "AND NOT EXISTS (SELECT 1 FROM order_status_observations s "
+    "WHERE s.order_id = o.order_id AND s.status = 'CLOSED') "
+    "AND NOT EXISTS (SELECT 1 FROM legacy_stats l "
+    "WHERE l.kind = 'order' AND l.record_key = o.order_id)"
+    "), sales AS (SELECT * FROM sale_source WHERE "
+    "(? IS NULL OR (sale_at >= ? AND sale_at < ?)))"
+)
+_REFUNDS_CTE = (
+    "refund_source AS ("
+    "SELECT order_id, first_observed_at AS refund_at FROM order_status_observations "
+    "WHERE status = 'REFUNDED' "
+    "UNION ALL SELECT o.order_id, NULL AS refund_at FROM orders o "
+    "WHERE o.current_status = 'REFUNDED' AND NOT EXISTS ("
+    "SELECT 1 FROM order_status_observations s "
+    "WHERE s.order_id = o.order_id AND s.status = 'REFUNDED')"
+    "), refunds AS (SELECT * FROM refund_source WHERE "
+    "(? IS NULL OR (refund_at >= ? AND refund_at < ?)))"
+)
+_REVIEWS_CTE = (
+    "review_source AS ("
+    "SELECT record_key AS order_id, recorded_at AS review_at FROM legacy_stats "
+    "WHERE kind = 'review' "
+    "UNION ALL SELECT r.order_id, r.observed_at FROM review_observations r "
+    "WHERE NOT EXISTS (SELECT 1 FROM legacy_stats l "
+    "WHERE l.kind = 'review' AND l.record_key = r.order_id)"
+    "), reviews AS (SELECT * FROM review_source WHERE "
+    "(? IS NULL OR (review_at >= ? AND review_at < ?)))"
+)
 
 
 class StateError(RuntimeError):
@@ -165,6 +249,18 @@ class ReviewReceiptStore:
                         "FROM review_receipts WHERE strftime('%s', delivered_at) IS NOT NULL"
                     )
                     self._import_legacy_stats(connection)
+                    connection.execute(
+                        "CREATE INDEX IF NOT EXISTS idx_order_status_time "
+                        "ON order_status_observations(status, first_observed_at, order_id)"
+                    )
+                    connection.execute(
+                        "CREATE INDEX IF NOT EXISTS idx_legacy_stats_time "
+                        "ON legacy_stats(kind, recorded_at, record_key)"
+                    )
+                    connection.execute(
+                        "CREATE INDEX IF NOT EXISTS idx_review_observed_time "
+                        "ON review_observations(observed_at, order_id)"
+                    )
                     if connection.execute("PRAGMA quick_check").fetchone() != ("ok",):
                         raise StateError("Persistent state integrity check failed.")
         except (sqlite3.Error, OSError):
@@ -584,6 +680,224 @@ class ReviewReceiptStore:
                     ).rowcount == 1
         except (sqlite3.Error, OSError):
             raise StateError("Persistent autoresponse write failed.") from None
+
+    @staticmethod
+    def _analytics_window(period: str, now_utc: int | None):
+        if period not in ("today", "7d", "30d", "all"):
+            raise StateError("Invalid analytics period.")
+        if now_utc is None:
+            now_utc = int(time.time())
+        if type(now_utc) is not int or now_utc < 0:
+            raise StateError("Invalid analytics time.")
+        if period == "all":
+            return None, None, None, None
+        if period == "today":
+            today = datetime.fromtimestamp(now_utc).replace(
+                hour=0, minute=0, second=0, microsecond=0)
+            start = int(today.timestamp())
+            previous = int((today - timedelta(days=1)).timestamp())
+        else:
+            days = 7 if period == "7d" else 30
+            start = now_utc - days * 86400
+            previous = start - days * 86400
+        return start, now_utc + 1, previous, start
+
+    @staticmethod
+    def _window_args(start, end):
+        return start, start, end
+
+    def _analytics_connect(self):
+        connection = self._connect()
+        connection.create_aggregate("decimal_sum", 1, _DecimalSum)
+        connection.create_collation("DECIMAL", _decimal_compare)
+        return connection
+
+    @staticmethod
+    def _sales_totals(connection, start, end):
+        return connection.execute(
+            "WITH " + _SALES_CTE + " SELECT COUNT(*), COUNT(usd_amount), "
+            "decimal_sum(usd_amount) FROM sales",
+            ReviewReceiptStore._window_args(start, end),
+        ).fetchone()
+
+    @staticmethod
+    def _top_products(connection, start, end, sort="count", limit=10):
+        if sort not in ("count", "turnover") or type(limit) is not int or not 1 <= limit <= 10:
+            raise StateError("Invalid analytics sort.")
+        rank = ("orders_count DESC, product_description, subcategory_name" if sort == "count"
+                else "usd_turnover COLLATE DECIMAL DESC, orders_count DESC, product_description")
+        having = " HAVING COUNT(usd_amount) > 0" if sort == "turnover" else ""
+        rows = connection.execute(
+            "WITH " + _SALES_CTE + " SELECT product_description, subcategory_name, "
+            "COUNT(*) AS orders_count, decimal_sum(usd_amount) AS usd_turnover "
+            "FROM sales WHERE product_description IS NOT NULL "
+            "GROUP BY product_description, subcategory_name" + having +
+            " ORDER BY " + rank + " LIMIT ?",
+            (*ReviewReceiptStore._window_args(start, end), limit),
+        ).fetchall()
+        return [dict(zip(("product", "subcategory", "orders", "usd_turnover"), row))
+                for row in rows]
+
+    @staticmethod
+    def _top_buyers(connection, start, end, limit=10):
+        rows = connection.execute(
+            "WITH " + _SALES_CTE + ", buyer_groups AS ("
+            "SELECT CASE WHEN buyer_id IS NOT NULL THEN 'id:' || buyer_id "
+            "ELSE 'name:' || buyer_username END AS buyer_key, "
+            "MIN(buyer_username) AS username, COUNT(*) AS orders_count "
+            "FROM sales WHERE buyer_id IS NOT NULL OR buyer_username IS NOT NULL "
+            "GROUP BY buyer_key) "
+            "SELECT username, orders_count FROM buyer_groups "
+            "ORDER BY orders_count DESC, username LIMIT ?",
+            (*ReviewReceiptStore._window_args(start, end), limit),
+        ).fetchall()
+        return [{"username": row[0], "orders": row[1]} for row in rows]
+
+    @staticmethod
+    def _best_day(connection, start, end, sort="count"):
+        if sort not in ("count", "turnover"):
+            raise StateError("Invalid analytics sort.")
+        having = " HAVING COUNT(usd_amount) > 0" if sort == "turnover" else ""
+        rank = ("orders_count DESC, day DESC" if sort == "count"
+                else "usd_turnover COLLATE DECIMAL DESC, orders_count DESC, day DESC")
+        row = connection.execute(
+            "WITH " + _SALES_CTE + " SELECT date(sale_at, 'unixepoch', 'localtime') AS day, "
+            "COUNT(*) AS orders_count, decimal_sum(usd_amount) AS usd_turnover "
+            "FROM sales WHERE sale_at IS NOT NULL GROUP BY day" + having +
+            " ORDER BY " + rank + " LIMIT 1",
+            ReviewReceiptStore._window_args(start, end),
+        ).fetchone()
+        return dict(zip(("day", "orders", "usd_turnover"), row)) if row else None
+
+    @staticmethod
+    def _most_expensive(connection, start, end):
+        row = connection.execute(
+            "WITH " + _SALES_CTE + " SELECT order_id, product_description, usd_amount "
+            "FROM sales WHERE usd_amount IS NOT NULL "
+            "ORDER BY usd_amount COLLATE DECIMAL DESC, order_id LIMIT 1",
+            ReviewReceiptStore._window_args(start, end),
+        ).fetchone()
+        return dict(zip(("order_id", "product", "usd_amount"), row)) if row else None
+
+    def get_sales_overview(self, period: str, now_utc: int | None = None) -> dict:
+        start, end, previous_start, previous_end = self._analytics_window(period, now_utc)
+        try:
+            with closing(self._analytics_connect()) as connection:
+                connection.execute("BEGIN")
+                orders, usd_orders, turnover = self._sales_totals(connection, start, end)
+                refunded, terminal = connection.execute(
+                    "WITH " + _SALES_CTE + ", " + _REFUNDS_CTE +
+                    " SELECT (SELECT COUNT(*) FROM refunds), "
+                    "(SELECT COUNT(*) FROM (SELECT order_id FROM sales "
+                    "UNION SELECT order_id FROM refunds))",
+                    (*self._window_args(start, end), *self._window_args(start, end)),
+                ).fetchone()
+                reviews, reviewed_sales = connection.execute(
+                    "WITH " + _SALES_CTE + ", " + _REVIEWS_CTE +
+                    " SELECT (SELECT COUNT(*) FROM reviews), "
+                    "(SELECT COUNT(*) FROM sales s WHERE EXISTS ("
+                    "SELECT 1 FROM review_source r WHERE r.order_id = s.order_id))",
+                    (*self._window_args(start, end), *self._window_args(start, end)),
+                ).fetchone()
+                buyers, repeat_buyers = connection.execute(
+                    "WITH " + _SALES_CTE + ", buyer_groups AS ("
+                    "SELECT CASE WHEN buyer_id IS NOT NULL THEN 'id:' || buyer_id "
+                    "ELSE 'name:' || buyer_username END AS buyer_key, "
+                    "COUNT(*) AS orders_count FROM sales "
+                    "WHERE buyer_id IS NOT NULL OR buyer_username IS NOT NULL GROUP BY buyer_key) "
+                    "SELECT COUNT(*), COALESCE(SUM(orders_count >= 2), 0) FROM buyer_groups",
+                    self._window_args(start, end),
+                ).fetchone()
+                previous = (self._sales_totals(connection, previous_start, previous_end)
+                            if previous_start is not None else None)
+                return {
+                    "orders": orders, "usd_orders": usd_orders,
+                    "usd_turnover": turnover if orders else "0",
+                    "refunds": refunded, "terminal_orders": terminal,
+                    "reviews": reviews, "reviewed_sales": reviewed_sales,
+                    "buyers": buyers, "repeat_buyers": repeat_buyers,
+                    "top_product": next(iter(self._top_products(connection, start, end, limit=1)), None),
+                    "top_turnover_product": next(iter(self._top_products(
+                        connection, start, end, sort="turnover", limit=1)), None),
+                    "most_expensive": self._most_expensive(connection, start, end),
+                    "best_day": self._best_day(connection, start, end),
+                    "previous_orders": previous[0] if previous else None,
+                    "previous_usd_turnover": (previous[2] if previous[0] else "0")
+                    if previous else None,
+                }
+        except (sqlite3.Error, OSError, InvalidOperation):
+            raise StateError("Sales analytics read failed.") from None
+
+    def get_sales_top_products(self, period: str, sort: str = "count",
+                               now_utc: int | None = None) -> list[dict]:
+        start, end, _, _ = self._analytics_window(period, now_utc)
+        try:
+            with closing(self._analytics_connect()) as connection:
+                return self._top_products(connection, start, end, sort=sort)
+        except (sqlite3.Error, OSError, InvalidOperation):
+            raise StateError("Sales analytics read failed.") from None
+
+    def get_sales_buyers(self, period: str, now_utc: int | None = None) -> dict:
+        start, end, _, _ = self._analytics_window(period, now_utc)
+        try:
+            with closing(self._analytics_connect()) as connection:
+                connection.execute("BEGIN")
+                rows = self._top_buyers(connection, start, end)
+                totals = connection.execute(
+                    "WITH " + _SALES_CTE + ", buyer_groups AS ("
+                    "SELECT CASE WHEN buyer_id IS NOT NULL THEN 'id:' || buyer_id "
+                    "ELSE 'name:' || buyer_username END AS buyer_key, "
+                    "COUNT(*) AS n FROM sales WHERE buyer_id IS NOT NULL "
+                    "OR buyer_username IS NOT NULL GROUP BY buyer_key) "
+                    "SELECT COUNT(*), COALESCE(SUM(n >= 2), 0) FROM buyer_groups",
+                    self._window_args(start, end),
+                ).fetchone()
+                return {"unique": totals[0], "repeat": totals[1], "top": rows}
+        except (sqlite3.Error, OSError, InvalidOperation):
+            raise StateError("Sales analytics read failed.") from None
+
+    def get_sales_reviews(self, period: str, now_utc: int | None = None) -> dict:
+        start, end, _, _ = self._analytics_window(period, now_utc)
+        try:
+            with closing(self._analytics_connect()) as connection:
+                reviews, closed, reviewed = connection.execute(
+                    "WITH " + _SALES_CTE + ", " + _REVIEWS_CTE +
+                    " SELECT (SELECT COUNT(*) FROM reviews), "
+                    "(SELECT COUNT(*) FROM sales), "
+                    "(SELECT COUNT(*) FROM sales s WHERE EXISTS ("
+                    "SELECT 1 FROM review_source r WHERE r.order_id = s.order_id))",
+                    (*self._window_args(start, end), *self._window_args(start, end)),
+                ).fetchone()
+                return {"reviews": reviews, "closed_orders": closed, "reviewed_orders": reviewed}
+        except (sqlite3.Error, OSError, InvalidOperation):
+            raise StateError("Sales analytics read failed.") from None
+
+    def get_sales_by_time(self, period: str, now_utc: int | None = None) -> dict:
+        start, end, _, _ = self._analytics_window(period, now_utc)
+        try:
+            with closing(self._analytics_connect()) as connection:
+                connection.execute("BEGIN")
+                return {"best_day": self._best_day(connection, start, end),
+                        "best_turnover_day": self._best_day(connection, start, end, "turnover")}
+        except (sqlite3.Error, OSError, InvalidOperation):
+            raise StateError("Sales analytics read failed.") from None
+
+    def get_sales_records(self) -> dict:
+        try:
+            with closing(self._analytics_connect()) as connection:
+                connection.execute("BEGIN")
+                start = end = None
+                return {
+                    "most_expensive": self._most_expensive(connection, start, end),
+                    "top_product": next(iter(self._top_products(connection, start, end, limit=1)), None),
+                    "top_turnover_product": next(iter(self._top_products(
+                        connection, start, end, sort="turnover", limit=1)), None),
+                    "best_day": self._best_day(connection, start, end),
+                    "best_turnover_day": self._best_day(connection, start, end, "turnover"),
+                    "top_buyer": next(iter(self._top_buyers(connection, start, end, limit=1)), None),
+                }
+        except (sqlite3.Error, OSError, InvalidOperation):
+            raise StateError("Sales analytics read failed.") from None
 
     def get_order_statistics(self, now_utc: int | None = None) -> dict[str, dict[str, int]]:
         """Считает только впервые увиденные ботом заказы, по UTC."""
