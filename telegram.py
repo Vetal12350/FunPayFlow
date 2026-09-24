@@ -405,7 +405,9 @@ def load_settings() -> None:
         templates = saved.get("reply_templates", [])
         if (custom_reply is not None and (type(custom_reply) is not str or not custom_reply.strip()
                                           or len(custom_reply) > 1000)):
-            raise ValueError("Invalid night mode reply.")
+            saved["night_mode_reply"] = None
+            saved["night_mode"] = False
+            print("[SETTINGS] Некорректный night_mode_reply пропущен; автоответ выключен.")
         if (type(templates) is not list or len(templates) > 20
                 or any(type(item) is not dict or set(item) != {"id", "title", "text"}
                        or type(item["id"]) is not str or not re.fullmatch(r"[0-9a-f]{8}", item["id"])
@@ -413,7 +415,9 @@ def load_settings() -> None:
                        or type(item["text"]) is not str or not 0 < len(item["text"]) <= 1000
                        for item in templates)
                 or len({item["id"] for item in templates}) != len(templates)):
-            raise ValueError("Invalid templates.")
+            saved["reply_templates"] = []
+            saved["autoresponder_enabled"] = False
+            print("[SETTINGS] Некорректные reply_templates пропущены; автоответчик выключен.")
         rules = saved.get("autoresponder_rules", [])
         if (type(rules) is not list or len(rules) > 50
                 or any(type(rule) is not dict or set(rule) != {
@@ -425,16 +429,24 @@ def load_settings() -> None:
                     or rule["match_mode"] not in ("EXACT", "CONTAINS")
                     or type(rule["enabled"]) is not bool for rule in rules)
                 or len({rule["id"] for rule in rules}) != len(rules)):
-            raise ValueError("Invalid autoresponder rules.")
+            saved["autoresponder_rules"] = []
+            saved["autoresponder_enabled"] = False
+            print("[SETTINGS] Некорректные autoresponder_rules пропущены; автоответчик выключен.")
         review_text = saved.get("review_request_text", DEFAULT_REVIEW_REQUEST_TEXT)
         review_delay = saved.get("review_request_delay", 5)
-        if (type(review_text) is not str or not review_text.strip() or len(review_text) > 1000
-                or type(review_delay) is not int or not 0 <= review_delay <= 1440):
-            raise ValueError("Invalid review request settings.")
+        if type(review_text) is not str or not review_text.strip() or len(review_text) > 1000:
+            saved["review_request_text"] = DEFAULT_REVIEW_REQUEST_TEXT
+            saved["review_request_enabled"] = False
+            print("[SETTINGS] Некорректный review_request_text пропущен; автоотправка выключена.")
+        if type(review_delay) is not int or not 0 <= review_delay <= 1440:
+            saved["review_request_delay"] = 5
+            saved["review_request_enabled"] = False
+            print("[SETTINGS] Некорректный review_request_delay пропущен; автоотправка выключена.")
 
         # --- Миграция старого формата (без user_settings) ---
         # Раньше notify_* хранились в корне — теперь они персональные.
         # При обнаружении старого формата переносим их в настройки ADMIN_ID.
+        loaded_user_settings: dict[int, dict] = {}
         if "user_settings" not in saved:
             old_user_keys = {"notifications_enabled", "notify_bump", "notify_message", "notify_order", "notify_review"}
             migrated: dict = {}
@@ -444,10 +456,12 @@ def load_settings() -> None:
             if migrated:
                 admin_id_str = os.getenv("ADMIN_ID", "")
                 if admin_id_str.isdigit():
-                    _user_settings[int(admin_id_str)] = {**_DEFAULT_USER_SETTINGS, **migrated}
+                    loaded_user_settings[int(admin_id_str)] = {**_DEFAULT_USER_SETTINGS, **migrated}
             print("[SETTINGS] Выполнена миграция настроек из старого формата в новый (персональные уведомления).")
 
         # Загружаем глобальные ключи
+        bot_settings.clear()
+        bot_settings.update(_DEFAULT_GLOBAL_SETTINGS)
         for key in _DEFAULT_GLOBAL_SETTINGS:
             if key in saved:
                 bot_settings[key] = saved[key]
@@ -466,16 +480,16 @@ def load_settings() -> None:
                 for k, v in usett.items():
                     if k in _DEFAULT_USER_SETTINGS:
                         merged[k] = v
-                _user_settings[uid] = merged
+                loaded_user_settings[uid] = merged
             except (ValueError, TypeError):
                 pass
 
+        _user_settings.clear()
+        _user_settings.update(loaded_user_settings)
+
         print("[SETTINGS] Настройки загружены.")
     except Exception as e:
-        bot_settings.clear()
-        bot_settings.update(_DEFAULT_GLOBAL_SETTINGS)
-        _user_settings.clear()
-        print(f"[SETTINGS] Ошибка загрузки, использую значения по умолчанию: {type(e).__name__}.")
+        raise RuntimeError(f"Persisted settings unavailable: {type(e).__name__}.") from None
 
 
 def save_settings(*, required: bool = False) -> None:
@@ -1707,10 +1721,10 @@ def _chat_screen(chat_id: int, name: str, messages: list[tuple[str, str]]) -> tu
     ])
 
 
-def _send_to_chat(chat_id: int, value: str) -> None:
+def _send_to_chat(chat_id: int, value: str):
     if _runtime_client is None:
         raise RuntimeError("Account unavailable.")
-    _runtime_client.send_message_once(chat_id, value)
+    return _runtime_client.send_message_once(chat_id, value)
 
 
 async def _send_one_reply(message: Message, chat_id: int, value: str,
@@ -1719,7 +1733,7 @@ async def _send_one_reply(message: Message, chat_id: int, value: str,
         actor_id = message.from_user.id
     actor = f"telegram:{actor_id}" if type(actor_id) is int and actor_id > 0 else "system"
     try:
-        await asyncio.to_thread(_send_to_chat, chat_id, value)
+        sent = await asyncio.to_thread(_send_to_chat, chat_id, value)
     except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
         logger.warning(f"Manual message result ambiguous: {type(e).__name__}.")
         await asyncio.to_thread(_audit_action, actor, "MANUAL_SEND", "chat", "AMBIGUOUS")
@@ -1739,6 +1753,10 @@ async def _send_one_reply(message: Message, chat_id: int, value: str,
         # A remote error can occur after transport; do not imply it is safe to retry.
         await message.answer("⚠️ Отправка не подтверждена. Проверьте чат перед повторной попыткой.")
     else:
+        if sent is False:
+            await asyncio.to_thread(_audit_action, actor, "MANUAL_SEND", "chat", "BLOCKED")
+            await message.answer("⛔ Бот останавливается. Сообщение не отправлено.")
+            return
         await asyncio.to_thread(_audit_action, actor, "MANUAL_SEND", "chat", "SUCCESS")
         await message.answer("✅ Отправлено")
 
@@ -2193,6 +2211,9 @@ async def text_handler(message: Message):
         bot_password.encode(),
     ):
         _reset_failed_attempts(user_id)
+        previous_user_ids = list(bot_settings["authorized_user_ids"])
+        had_user_settings = user_id in _user_settings
+        was_authorized = user_id in authorized_users
         authorized_users.add(user_id)
         # Сохраняем список авторизованных между перезапусками
         bot_settings["authorized_user_ids"] = list(authorized_users)
@@ -2200,7 +2221,20 @@ async def text_handler(message: Message):
         # если у него ещё нет своей записи (например, первый вход)
         if user_id not in _user_settings:
             _user_settings[user_id] = dict(_DEFAULT_USER_SETTINGS)
-        save_settings()
+        try:
+            save_settings(required=True)
+        except RuntimeError:
+            if not was_authorized:
+                authorized_users.discard(user_id)
+            bot_settings["authorized_user_ids"] = previous_user_ids
+            if not had_user_settings:
+                _user_settings.pop(user_id, None)
+            try:
+                await message.delete()
+            except Exception:
+                pass
+            await message.answer("Не удалось сохранить авторизацию. Попробуйте позже.")
+            return
         try:
             await message.delete()
         except Exception:

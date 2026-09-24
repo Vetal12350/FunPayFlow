@@ -176,7 +176,8 @@ class OperationsTests(unittest.IsolatedAsyncioTestCase):
 
         ui.bot_settings["auto_bump"] = True
         ui.bot_settings["safe_mode"] = True
-        task = asyncio.create_task(namespace["auto_bump_loop"](None, SimpleNamespace(bump_lots=bump_lots)))
+        task = asyncio.create_task(namespace["auto_bump_loop"](
+            None, SimpleNamespace(bump_lots=bump_lots, runner_stop_requested=lambda: False)))
         await asyncio.sleep(0.05)
         self.assertEqual(calls, [])
         ui.bot_settings["safe_mode"] = False

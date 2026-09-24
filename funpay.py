@@ -14,7 +14,7 @@ import FunPayAPI
 from FunPayAPI.common.enums import SubCategoryTypes
 import logger
 from runtime_events import (ActionEvent, ActionKind, QueuedCriticalEvent,
-                            critical_snapshot, hydrate_critical)
+                            critical_snapshot, hydrate_critical, html_preview)
 
 
 class _AutobumpActionCancelled(Exception):
@@ -229,6 +229,8 @@ class FunPayClient:
         if type(chat_id) is not int or chat_id <= 0 or type(text) is not str or not text.strip():
             raise ValueError("Invalid outgoing message.")
         with self._account_lock:
+            if self._runner_stop.is_set():
+                return False
             if enabled_check is not None and not enabled_check():
                 return False
             with self._outgoing_echo_lock:
@@ -937,7 +939,7 @@ class FunPayClient:
                 if last_notified is not None and (now - last_notified) < self._NOTIFY_COOLDOWN_SECONDS:
                     return results
 
-                author = escape(str(getattr(chat, "name", None) or "Покупатель"))
+                author = html_preview(getattr(chat, "name", None) or "Покупатель", 120)
                 chat_link = f"https://funpay.com/chat/?node={chat_id}" if chat_id is not None else None
 
                 if chat_link:
@@ -949,7 +951,7 @@ class FunPayClient:
                     self._notified_unread_chats[chat_id] = now
 
                 text = (
-                    f"На аккаунте {escape(str(self.account.username))} есть непрочитанные сообщения.\n"
+                    f"На аккаунте {html_preview(self.account.username, 120)} есть непрочитанные сообщения.\n"
                     f"{who_line}"
                 )
                 results.append(ActionEvent(ActionKind.NOTIFY_MESSAGE, text=text))
@@ -964,9 +966,9 @@ class FunPayClient:
 
                 text = (
                     "💰 <b>Оплачен новый заказ</b>\n"
-                    f"Покупатель: <b>{escape(str(buyer))}</b>\n"
-                    f"Сумма: {escape(str(amount))}\n"
-                    f"Описание: {escape(str(descr))}"
+                    f"Покупатель: <b>{html_preview(buyer, 120)}</b>\n"
+                    f"Сумма: {html_preview(amount, 80)}\n"
+                    f"Описание: {html_preview(descr, 3000)}"
                 )
                 results.append(ActionEvent(ActionKind.NOTIFY_ORDER, text=text))
                 direct_chat_id = getattr(order, "chat_id", None)
@@ -986,8 +988,8 @@ class FunPayClient:
                 if closed_status is not None and status == closed_status:
                     text = (
                         "✅ <b>Заказ закрыт покупателем</b>\n"
-                        f"Покупатель: <b>{escape(str(buyer))}</b>\n"
-                        f"№ заказа: {escape(str(order_id))}"
+                        f"Покупатель: <b>{html_preview(buyer, 120)}</b>\n"
+                        f"№ заказа: {html_preview(order_id, 80)}"
                     )
                     results.append(ActionEvent(ActionKind.NOTIFY_ORDER, text=text))
 
@@ -1011,8 +1013,8 @@ class FunPayClient:
                 elif refunded_status is not None and status == refunded_status:
                     text = (
                         "↩️ <b>Оформлен возврат по заказу</b>\n"
-                        f"Покупатель: <b>{escape(str(buyer))}</b>\n"
-                        f"№ заказа: {escape(str(order_id))}"
+                        f"Покупатель: <b>{html_preview(buyer, 120)}</b>\n"
+                        f"№ заказа: {html_preview(order_id, 80)}"
                     )
                     results.append(ActionEvent(ActionKind.NOTIFY_ORDER, text=text))
 

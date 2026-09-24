@@ -87,17 +87,21 @@ _credential_label = re.compile(
 _telegram_token = re.compile(r"\b\d{8,12}:[A-Za-z0-9_-]{20,}\b")
 
 
+def _safe_message(msg: str) -> str:
+    if type(msg) is not str:
+        return "[нестроковое сообщение]"
+    clean = _ansi_escape.sub("", msg)
+    clean = " ".join("".join(ch if ch.isprintable() else " " for ch in clean).split())
+    secret = _credential_label.search(clean)
+    if secret:
+        clean = clean[:secret.start()] + "[секрет скрыт]"
+    return _telegram_token.sub("[секрет скрыт]", clean)
+
+
 def _write_to_file(tag: str, msg: str) -> None:
     """Дублирует разрешённое консольное сообщение без ANSI и секретных значений."""
     try:
-        if type(msg) is not str:
-            msg = "[нестроковое сообщение]"
-        clean = _ansi_escape.sub("", msg)
-        clean = " ".join("".join(ch if ch.isprintable() else " " for ch in clean).split())
-        secret = _credential_label.search(clean)
-        if secret:
-            clean = clean[:secret.start()] + "[секрет скрыт]"
-        clean = _telegram_token.sub("[секрет скрыт]", clean)
+        clean = _safe_message(msg)
         with _file_lock:
             os.makedirs(LOGS_DIR, exist_ok=True)
             now = datetime.now()
@@ -114,8 +118,9 @@ def _ts() -> str:
 
 
 def _line(color: str, icon: str, tag: str, msg: str) -> None:
-    print(f"{_GR}[{_ts()}]{_R} {color}{_B}{icon} {tag}{_R}  {msg}")
-    _write_to_file(tag, msg)
+    clean = _safe_message(msg)
+    print(f"{_GR}[{_ts()}]{_R} {color}{_B}{icon} {tag}{_R}  {clean}")
+    _write_to_file(tag, clean)
 
 
 # ── Публичный API ─────────────────────────────────────────────────────────────
@@ -158,6 +163,7 @@ def debug(msg: str) -> None:
 
 def banner(username: str = "") -> None:
     """Красивый заголовок при старте. Вызывается после подключения к FunPay."""
+    username = _safe_message(username)
     acc_line = f"   Аккаунт FunPay: {username}" if username else ""
     pad = 40 - len(acc_line) if acc_line else 0
 

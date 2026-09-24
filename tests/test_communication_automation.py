@@ -53,6 +53,7 @@ class Client:
         self.review_state = store
         self.sent = []
         self.send_error = None
+        self.stop_requested = False
         self.message = SimpleNamespace(id=100, text="HELLO", author_id=20,
                                        author="Buyer", by_bot=False)
         self.order = SimpleNamespace(status=FunPayAPI.types.OrderStatuses.CLOSED,
@@ -60,6 +61,8 @@ class Client:
         self._manual_get_chat_history = lambda *args, **kwargs: [self.message]
 
     def send_message_once(self, chat_id, value, *, enabled_check=None):
+        if self.stop_requested:
+            return False
         if enabled_check is not None and not enabled_check():
             return False
         self.sent.append((chat_id, value))
@@ -68,6 +71,9 @@ class Client:
 
     def get_order_snapshot(self, order_id):
         return self.order, self.account.id
+
+    def runner_stop_requested(self):
+        return self.stop_requested
 
 
 def incoming(text="HELLO", *, author=20, kind=None):
@@ -301,6 +307,21 @@ class AutomationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.client.sent), 2)
         self.assertEqual(self.store.pending_review_requests(), [])
 
+    async def test_shutdown_before_review_request_transport_keeps_pending(self):
+        self.store.record_order_observation("ABC12345", "CLOSED")
+        self.store.schedule_review_request("ABC12345", "Buyer", int(time.time()))
+        ui.bot_settings["review_request_enabled"] = True
+
+        def stop_before_send(chat_id, value, *, enabled_check=None):
+            self.client.stop_requested = True
+            return False
+
+        self.client.send_message_once = stop_before_send
+        await runtime["_send_scheduled_review_request"](
+            self.client, "ABC12345", "Buyer", int(time.time()))
+        self.assertEqual(self.client.sent, [])
+        self.assertEqual(self.status()[0], "pending")
+
     async def test_crash_after_claim_cannot_resend_after_restart(self):
         self.store.record_order_observation("ABC12345", "CLOSED")
         self.store.schedule_review_request("ABC12345", "Buyer", int(time.time()))
@@ -403,6 +424,7 @@ class AutomationTests(unittest.IsolatedAsyncioTestCase):
         calls = []
         fake = SimpleNamespace(
             _account_lock=threading.RLock(), _outgoing_echo_lock=threading.Lock(),
+            _runner_stop=threading.Event(),
             _recent_outgoing_text={},
             account=SimpleNamespace(send_message=lambda *args, **kwargs: calls.append((args, kwargs))),
         )
