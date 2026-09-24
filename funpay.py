@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 import time
 import random
@@ -12,6 +13,8 @@ from bs4 import BeautifulSoup
 import FunPayAPI
 from FunPayAPI.common.enums import SubCategoryTypes
 import logger
+from runtime_events import (ActionEvent, ActionKind, QueuedCriticalEvent,
+                            critical_snapshot, hydrate_critical)
 
 
 class _AutobumpActionCancelled(Exception):
@@ -38,139 +41,6 @@ class _WithdrawalParseError(ValueError):
 EVENT_QUEUE_CAPACITY = 256
 NIGHT_MODE_MESSAGE_TEXT = "😴 Продавец спит, как только проснется сразу ответит Вам"
 NIGHT_MODE_ORDER_TEXT = "😴 Продавец спит, как проснётся — сразу приступит"
-
-# ---------------------------------------------------------------------------
-# ФИКС ДЛЯ 400 "Необходимая cookie отсутствует или устарела" на runner/
-# ---------------------------------------------------------------------------
-# Установленная версия FunPayAPI (1.1.0 с PyPI) собирает Cookie-заголовок
-# только из golden_key + PHPSESSID (см. self.account.method внутри библиотеки).
-# В более новых форках библиотеки (используемых, например, в актуальных сборках
-# FunPayCardinal) добавлен отдельный self.cookies - словарь ДОПОЛНИТЕЛЬНЫХ кук,
-# которые FunPay стал присылать в Set-Cookie и требовать обратно при каждом
-# запросе (в частности к runner/). Установленная версия 1.1.0 этот механизм не
-# реализует - отсюда "cookie отсутствует".
-#
-# Чтобы не переустанавливать/патчить саму библиотеку, патчим requests.Session.request
-# на уровне процесса: любой ответ с funpay.com запоминаем все "лишние" куки
-# (кроме PHPSESSID, которым и так управляет сама библиотека), и добавляем их
-# в заголовок Cookie каждого следующего запроса к funpay.com.
-_funpay_extra_cookies: dict[str, str] = {}
-_funpay_cookie_patch_applied = False
-
-
-def _apply_funpay_cookie_patch():
-    global _funpay_cookie_patch_applied
-    if _funpay_cookie_patch_applied:
-        return
-
-    original_request = requests.sessions.Session.request
-
-    def patched_request(self, method, url, *args, **kwargs):
-        is_funpay = isinstance(url, str) and "funpay.com" in url
-
-        if is_funpay and _funpay_extra_cookies:
-            headers = dict(kwargs.get("headers") or {})
-            cookie_key = next((k for k in headers if k.lower() == "cookie"), None)
-            extra = "; ".join(f"{k}={v}" for k, v in _funpay_extra_cookies.items())
-            if cookie_key:
-                if extra not in headers[cookie_key]:
-                    headers[cookie_key] = headers[cookie_key].rstrip("; ") + "; " + extra
-            else:
-                headers["cookie"] = extra
-            kwargs["headers"] = headers
-
-        response = original_request(self, method, url, *args, **kwargs)
-
-        if is_funpay:
-            try:
-                new_cookies = response.cookies.get_dict()
-                for name, value in new_cookies.items():
-                    if name in ("PHPSESSID", "fav_games"):
-                        continue
-                    if _funpay_extra_cookies.get(name) != value:
-                        logger.debug("Получена новая доп. кука от FunPay.")
-                    _funpay_extra_cookies[name] = value
-            except Exception:
-                pass
-
-        return response
-
-    requests.sessions.Session.request = patched_request
-    _funpay_cookie_patch_applied = True
-
-
-def _format_seconds(seconds: int) -> str:
-    """
-    Форматирует секунды в читаемый вид для Telegram-уведомлений.
-    7200 → "2 ч 00 мин",  90 → "1 мин 30 сек",  45 → "45 сек"
-    """
-    seconds = max(0, int(seconds))
-    if seconds >= 3600:
-        h = seconds // 3600
-        m = (seconds % 3600) // 60
-        return f"{h} ч {m:02d} мин"
-    elif seconds >= 60:
-        m = seconds // 60
-        s = seconds % 60
-        return f"{m} мин {s:02d} сек" if s else f"{m} мин"
-    return f"{seconds} сек"
-
-
-class FunPayClient:
-    def __init__(self, golden_key: str):
-        _apply_funpay_cookie_patch()
-
-        self.golden_key = golden_key
-        self.user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        self.account = FunPayAPI.Account(self.golden_key, self.user_agent, proxy={})
-        self.raise_time = {}
-        self.session = None
-        self.csrf_token = ""  # Переменная для хранения токена
-
-        self.runner = None  # FunPayAPI.Runner - слушатель событий (сообщения/заказы/отзывы)
-        self.event_queue: "queue.Queue" = queue.Queue()  # сюда Runner кладет события из отдельного потока
-
-        # Поднятие лотов (в потоке asyncio.to_thread) и Runner (в отдельном Thread)
-        # используют ОДИН И ТОТ ЖЕ self.account - общую сессию/CSRF-токен. Без
-        # блокировки они могут одновременно дергать сеть: пока Runner готовит
-        # запрос со старым токеном, account.get() из другого потока успевает
-        # обновить токен - и запрос Runner'а улетает с уже недействительным
-        # токеном, из-за чего FunPay отвечает 400. Лок гарантирует, что запросы
-        # к self.account всегда идут строго по одному, без гонки.
-        self._account_lock = threading.Lock()
-
-        # Чаты, по которым уведомление УЖЕ отправлено, пока они остаются
-        # непрочитанными. LAST_CHAT_MESSAGE_CHANGED срабатывает на КАЖДОЕ
-        # новое сообщение - без этого набора, если человек написал 2-3
-        # сообщения подряд, пока вы не открыли чат, прилетело бы 2-3
-        # уведомления. Как только чат снова становится прочитанным
-        # (chat.unread == False - вы открыли его на FunPay), id убирается
-        # отсюда, и следующее новое сообщение снова даст ровно одно
-        # уведомление. Хранится только в памяти - это осознанно: после
-        # перезапуска бота максимум придет одно "лишнее" уведомление по
-        # уже прочитанному, но еще не переоткрытому чату, что не критично.
-        #
-        # ХРАНИМ timestamp последнего уведомления (а не просто id в set),
-        # чтобы вдобавок к признаку chat.unread работал СТРАХОВОЧНЫЙ таймер
-        # (см. _NOTIFY_COOLDOWN_SECONDS ниже): если chat.unread у FunPay
-        # обновляется с задержкой/нестабильно и "прочитано" не долетает
-        # вовремя, повторное уведомление по тому же чату все равно не уйдет
-        # раньше, чем через cooldown - даже если формально unread снова True.
-        self._notified_unread_chats: dict[int, float] = {}
-        # Не слать повторное уведомление по одному и тому же чату чаще,
-        # чем раз в это количество секунд - даже если chat.unread из FunPay
-import asyncio
-import os
-import time
-import random
-import re
-import queue
-import threading
-import requests
-from bs4 import BeautifulSoup
-import FunPayAPI
-from FunPayAPI.common.enums import SubCategoryTypes
-import logger
 
 # ---------------------------------------------------------------------------
 # ФИКС ДЛЯ 400 "Необходимая cookie отсутствует или устарела" на runner/
@@ -305,6 +175,7 @@ class FunPayClient:
         self._runner_thread: threading.Thread | None = None
         self._runner_start_lock = threading.Lock()
         self._runner_publish_lock = threading.Lock()
+        self._queued_backlog_ids: set[str] = set()
         self._runner_stop = threading.Event()
         self._runner_finished = threading.Event()
         self._runner_failure_type: str | None = None
@@ -875,8 +746,20 @@ class FunPayClient:
                     with self._runner_publish_lock:
                         if is_cancelled():
                             return
+                        snapshot = critical_snapshot(event)
+                        if snapshot is not None:
+                            if not self.review_state.insert_critical_event(
+                                snapshot.event_id, snapshot.event_type,
+                                snapshot.entity_id, snapshot.payload,
+                            ):
+                                continue
+                            item = QueuedCriticalEvent(snapshot.event_id, event)
+                        else:
+                            item = event
                         try:
-                            self.event_queue.put_nowait(event)
+                            self.event_queue.put_nowait(item)
+                            if snapshot is not None:
+                                self._queued_backlog_ids.add(snapshot.event_id)
                         except queue.Full:
                             logger.error("Event queue overflow.")
                             raise _EventQueueOverflow() from None
@@ -915,13 +798,41 @@ class FunPayClient:
             if self._runner_stop.wait(delay):
                 return
 
+    def enqueue_pending_critical_events(self) -> int:
+        """Refill bounded RAM delivery queue from durable pending observations."""
+        malformed = 0
+        with self._runner_publish_lock:
+            while True:
+                room = self.event_queue.maxsize - self.event_queue.qsize()
+                if room <= 0:
+                    break
+                rows = self.review_state.pending_critical_events(room, self._queued_backlog_ids)
+                if not rows:
+                    break
+                for row in rows:
+                    try:
+                        payload = json.loads(row["safe_payload"])
+                        event = hydrate_critical(row["event_type"], row["entity_id"], payload)
+                    except (ValueError, TypeError, KeyError, AttributeError, UnicodeError):
+                        self.review_state.mark_critical_ambiguous(row["event_id"])
+                        malformed += 1
+                        continue
+                    try:
+                        self.event_queue.put_nowait(QueuedCriticalEvent(row["event_id"], event))
+                    except queue.Full:
+                        return malformed
+                    self._queued_backlog_ids.add(row["event_id"])
+        return malformed
+
+    def dequeued_critical_event(self, event_id: str) -> None:
+        with self._runner_publish_lock:
+            self._queued_backlog_ids.discard(event_id)
+
     def describe_event(self, event):
         """
         Превращает "сырое" событие Runner'а в список уведомлений для Telegram.
 
-        Возвращает список кортежей (ключ_настройки, html_текст).
-        Ключи совпадают с ключами bot_settings из telegram.py:
-        "notify_message", "notify_order", "notify_review".
+        Возвращает типизированные действия без строковых control markers.
 
         Если событие не требует уведомления (например, это наше собственное
         исходящее сообщение) - возвращается пустой список.
@@ -994,7 +905,7 @@ class FunPayClient:
                             match = re.search(r'#([A-Z0-9]{8})', msg_text)
                             if match:
                                 order_id = match.group(1)
-                                results.append(("_review_check_immediate", order_id))
+                                results.append(ActionEvent(ActionKind.REVIEW_CHECK_NOW, order_id=order_id))
                         
                         # Остальные системные сообщения игнорируем
                         return results
@@ -1041,9 +952,9 @@ class FunPayClient:
                     f"На аккаунте {escape(str(self.account.username))} есть непрочитанные сообщения.\n"
                     f"{who_line}"
                 )
-                results.append(("notify_message", text))
+                results.append(ActionEvent(ActionKind.NOTIFY_MESSAGE, text=text))
                 if chat_id is not None:
-                    results.append(("_night_mode_reply_message", str(chat_id)))
+                    results.append(ActionEvent(ActionKind.NIGHT_MESSAGE, chat_id=chat_id))
 
             elif event.type is event_types.NEW_ORDER:
                 order = event.order
@@ -1057,10 +968,11 @@ class FunPayClient:
                     f"Сумма: {escape(str(amount))}\n"
                     f"Описание: {escape(str(descr))}"
                 )
-                results.append(("notify_order", text))
+                results.append(ActionEvent(ActionKind.NOTIFY_ORDER, text=text))
                 direct_chat_id = getattr(order, "chat_id", None)
                 if (isinstance(buyer, str) and buyer != "—") or type(direct_chat_id) is int:
-                    results.append(("_night_mode_reply_order", (buyer, direct_chat_id)))
+                    results.append(ActionEvent(ActionKind.NIGHT_ORDER, buyer=buyer,
+                                               chat_id=direct_chat_id))
 
             elif event.type is event_types.ORDER_STATUS_CHANGED:
                 order = event.order
@@ -1077,7 +989,7 @@ class FunPayClient:
                         f"Покупатель: <b>{escape(str(buyer))}</b>\n"
                         f"№ заказа: {escape(str(order_id))}"
                     )
-                    results.append(("notify_order", text))
+                    results.append(ActionEvent(ActionKind.NOTIFY_ORDER, text=text))
 
                     # ВТОРОЙ, независимый способ поймать отзыв (в дополнение к
                     # LAST_CHAT_MESSAGE_CHANGED выше). Судя по скриншоту, "Покупатель
@@ -1093,7 +1005,8 @@ class FunPayClient:
                     # если review реально найден, а по каждому order_id/чату это
                     # сработает максимум пару раз за жизнь заказа.
                     if order_id and order_id != "—":
-                        results.append(("_review_check", order_id))
+                        results.append(ActionEvent(ActionKind.REVIEW_CHECK_LATER,
+                                                   order_id=order_id))
 
                 elif refunded_status is not None and status == refunded_status:
                     text = (
@@ -1101,7 +1014,7 @@ class FunPayClient:
                         f"Покупатель: <b>{escape(str(buyer))}</b>\n"
                         f"№ заказа: {escape(str(order_id))}"
                     )
-                    results.append(("notify_order", text))
+                    results.append(ActionEvent(ActionKind.NOTIFY_ORDER, text=text))
 
             # Обработка события NEW_REVIEW — присутствует в некоторых версиях
             # FunPayAPI. Проверяем защищённо через getattr, чтобы не ломаться
@@ -1111,7 +1024,7 @@ class FunPayClient:
                 review = getattr(event, "review", None)
                 order_id = getattr(review, "order_id", None)
                 if isinstance(order_id, str) and re.fullmatch(r"[A-Z0-9]{8}", order_id):
-                    results.append(("_review_check_immediate", order_id))
+                    results.append(ActionEvent(ActionKind.REVIEW_CHECK_NOW, order_id=order_id))
                 else:
                     logger.notify("Событие отзыва пропущено: нет корректного ID заказа.")
 

@@ -61,6 +61,8 @@ _PROBLEM_TYPES = {
     "SETTINGS_PERSISTENCE": ("ERROR", "Не удалось сохранить настройки."),
     "AUDIT_UNAVAILABLE": ("WARNING", "Журнал действий временно недоступен."),
     "CRITICAL_TASK": ("ERROR", "Критическая фоновая задача остановилась."),
+    "BACKLOG_UNAVAILABLE": ("ERROR", "Очередь важных событий SQLite недоступна."),
+    "BACKLOG_MALFORMED": ("WARNING", "Некорректная запись важного события изолирована."),
 }
 
 

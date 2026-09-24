@@ -271,6 +271,26 @@ class ReviewReceiptStore:
                         "CREATE INDEX IF NOT EXISTS idx_audit_events_recent "
                         "ON audit_events(ts DESC, id DESC)"
                     )
+                    connection.execute(
+                        "CREATE TABLE IF NOT EXISTS critical_event_backlog ("
+                        "event_id TEXT PRIMARY KEY, event_type TEXT NOT NULL, "
+                        "entity_id TEXT NOT NULL, safe_payload TEXT NOT NULL, "
+                        "created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, "
+                        "modifying_claimed INTEGER NOT NULL DEFAULT 0, "
+                        "state TEXT NOT NULL CHECK(state IN "
+                        "('pending', 'processing', 'done', 'ambiguous')))"
+                    )
+                    backlog_columns = {row[1] for row in connection.execute(
+                        "PRAGMA table_info(critical_event_backlog)")}
+                    if "modifying_claimed" not in backlog_columns:
+                        connection.execute(
+                            "ALTER TABLE critical_event_backlog ADD COLUMN "
+                            "modifying_claimed INTEGER NOT NULL DEFAULT 0"
+                        )
+                    connection.execute(
+                        "CREATE INDEX IF NOT EXISTS idx_critical_backlog_pending "
+                        "ON critical_event_backlog(state, created_at, event_id)"
+                    )
                     if connection.execute("PRAGMA quick_check").fetchone() != ("ok",):
                         raise StateError("Persistent state integrity check failed.")
         except (sqlite3.Error, OSError):
@@ -988,6 +1008,117 @@ class ReviewReceiptStore:
                 ).fetchone()[0]
         except (sqlite3.Error, OSError):
             raise StateError("Persistent review request read failed.") from None
+
+    def insert_critical_event(self, event_id: str, event_type: str,
+                              entity_id: str, payload: dict) -> bool:
+        """Idempotent durable observation, bounded by 4096 unfinished rows."""
+        from runtime_events import hydrate_critical
+        if (type(event_id) is not str or not 1 <= len(event_id) <= 160
+                or not re.fullmatch(r"[A-Za-z0-9:_-]+", event_id)):
+            raise StateError("Invalid critical event ID.")
+        try:
+            hydrate_critical(event_type, entity_id, payload)
+            encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+            if len(encoded) > 10000:
+                raise ValueError("Oversized critical event.")
+            with closing(self._connect()) as connection:
+                with connection:
+                    if connection.execute(
+                        "SELECT 1 FROM critical_event_backlog WHERE event_id = ?", (event_id,)
+                    ).fetchone():
+                        return False
+                    count = connection.execute(
+                        "SELECT COUNT(*) FROM critical_event_backlog "
+                        "WHERE state IN ('pending', 'processing')"
+                    ).fetchone()[0]
+                    if count >= 4096:
+                        raise StateError("Critical event backlog capacity exceeded.")
+                    now = int(time.time())
+                    connection.execute(
+                        "INSERT INTO critical_event_backlog "
+                        "(event_id, event_type, entity_id, safe_payload, created_at, updated_at, state) "
+                        "VALUES (?, ?, ?, ?, ?, ?, 'pending')",
+                        (event_id, event_type, entity_id, encoded, now, now),
+                    )
+                    connection.execute(
+                        "DELETE FROM critical_event_backlog WHERE state IN ('done', 'ambiguous') "
+                        "AND updated_at < ?", (now - 30 * 86400,)
+                    )
+                    connection.execute(
+                        "DELETE FROM critical_event_backlog WHERE event_id IN ("
+                        "SELECT event_id FROM critical_event_backlog WHERE state IN ('done', 'ambiguous') "
+                        "ORDER BY updated_at DESC, event_id DESC LIMIT -1 OFFSET 10000)"
+                    )
+                    return True
+        except (sqlite3.Error, OSError, ValueError, TypeError):
+            raise StateError("Critical event persist failed.") from None
+
+    def recover_critical_events(self) -> None:
+        try:
+            with closing(self._connect()) as connection:
+                with connection:
+                    connection.execute(
+                        "UPDATE critical_event_backlog SET state = 'pending' "
+                        "WHERE state = 'processing'"
+                    )
+        except (sqlite3.Error, OSError):
+            raise StateError("Critical event recovery failed.") from None
+
+    def pending_critical_events(self, limit: int, exclude: set[str] | None = None) -> list[dict]:
+        if type(limit) is not int or not 0 <= limit <= 256:
+            raise StateError("Invalid critical event page.")
+        excluded = tuple(exclude or ())
+        if len(excluded) > 256:
+            raise StateError("Invalid critical event exclusion.")
+        excluded_sql = (" AND event_id NOT IN (" + ",".join("?" for _ in excluded) + ")"
+                        if excluded else "")
+        try:
+            with closing(self._connect()) as connection:
+                connection.row_factory = sqlite3.Row
+                rows = connection.execute(
+                    "SELECT event_id, event_type, entity_id, safe_payload FROM critical_event_backlog "
+                    "WHERE state = 'pending'" + excluded_sql +
+                    " ORDER BY created_at, event_id LIMIT ?", (*excluded, limit),
+                ).fetchall()
+                return [dict(row) for row in rows]
+        except (sqlite3.Error, OSError):
+            raise StateError("Critical event read failed.") from None
+
+    def mark_critical_processing(self, event_id: str) -> bool:
+        return self._set_critical_state(event_id, "pending", "processing")
+
+    def claim_critical_modifying_action(self, event_id: str) -> bool:
+        """Durably claim before automatic HTTP; replay never repeats an uncertain send."""
+        try:
+            with closing(self._connect()) as connection:
+                with connection:
+                    result = connection.execute(
+                        "UPDATE critical_event_backlog SET modifying_claimed = 1 "
+                        "WHERE event_id = ? AND state = 'processing' AND modifying_claimed = 0",
+                        (event_id,),
+                    )
+                    return result.rowcount == 1
+        except (sqlite3.Error, OSError):
+            raise StateError("Critical action claim failed.") from None
+
+    def mark_critical_done(self, event_id: str) -> bool:
+        return self._set_critical_state(event_id, "processing", "done")
+
+    def mark_critical_ambiguous(self, event_id: str) -> bool:
+        return self._set_critical_state(event_id, "pending", "ambiguous")
+
+    def _set_critical_state(self, event_id: str, previous: str, state: str) -> bool:
+        try:
+            with closing(self._connect()) as connection:
+                with connection:
+                    result = connection.execute(
+                        "UPDATE critical_event_backlog SET state = ?, updated_at = ? "
+                        "WHERE event_id = ? AND state = ?",
+                        (state, int(time.time()), event_id, previous),
+                    )
+                    return result.rowcount == 1
+        except (sqlite3.Error, OSError):
+            raise StateError("Critical event state write failed.") from None
 
     def get_order_statistics(self, now_utc: int | None = None) -> dict[str, dict[str, int]]:
         """Считает только впервые увиденные ботом заказы, по UTC."""

@@ -19,10 +19,12 @@ from telegram import (dp, bot_settings, get_user_settings, get_all_recipients,
                       set_runtime_status_context, clear_runtime_status_context,
                       disable_autobump, get_reply_keyboard, is_night_mode_enabled,
                       is_safe_mode_enabled, record_withdrawal_poll,
-                      set_telegram_polling_state, _set_problem, _audit_action,
+                      set_telegram_polling_state, _set_problem, _clear_problem,
+                      _audit_action,
                       get_night_mode_reply_text, match_autoresponder, _expand_template,
                       expand_review_request_text, is_review_request_enabled)
 from funpay import FunPayClient, _AmbiguousRaiseOutcome
+from runtime_events import ActionEvent, ActionKind, QueuedCriticalEvent, ReviewCheckEvent
 from state import ReviewReceiptStore, StateError
 import logger
 
@@ -372,20 +374,21 @@ async def _fetch_and_send_review(
 
 
 async def _send_night_mode_reply(
-    client: FunPayClient, value: str | tuple[str, int | None], kind: str,
+    client: FunPayClient, action: ActionEvent,
 ) -> None:
     """Старый автоответ, с повторной проверкой тумблера под Account RLock."""
     if not is_night_mode_enabled() or is_safe_mode_enabled():
         return
+    kind = "message" if action.kind is ActionKind.NIGHT_MESSAGE else "order"
 
     def send_if_enabled() -> bool:
         with client._account_lock:
             if not is_night_mode_enabled() or is_safe_mode_enabled():
                 return False
-            if kind == "message":
-                chat_id = int(value) if value.isdecimal() else None
-            else:
-                buyer, fallback_chat_id = value
+            if action.kind is ActionKind.NIGHT_MESSAGE:
+                chat_id = action.chat_id
+            elif action.kind is ActionKind.NIGHT_ORDER:
+                buyer, fallback_chat_id = action.buyer, action.chat_id
                 chat = None
                 if isinstance(buyer, str) and buyer != "—":
                     try:
@@ -395,6 +398,8 @@ async def _send_night_mode_reply(
                 chat_id = getattr(chat, "id", None)
                 if chat_id is None:
                     chat_id = fallback_chat_id
+            else:
+                return False
             if type(chat_id) is not int or chat_id <= 0:
                 return False
             if not is_night_mode_enabled() or is_safe_mode_enabled():
@@ -692,10 +697,21 @@ async def notifications_loop(bot: Bot, client: FunPayClient):
             _set_problem("REVIEW_WORKER")
             review_failed = True
 
-    def start_review_check(order_id: str, delay: float) -> None:
+    def start_review_check(order_id: str, delay: float,
+                           completion_gate: asyncio.Event | None = None,
+                           backlog_id: str | None = None) -> None:
         if len(review_tasks) >= max_review_tasks:
             raise RuntimeError("Review task capacity exceeded.")
-        task = asyncio.create_task(_fetch_and_send_review(bot, client, order_id, delay=delay))
+
+        async def run_check() -> None:
+            await _fetch_and_send_review(bot, client, order_id, delay=delay)
+            if completion_gate is not None:
+                await completion_gate.wait()
+                if not await asyncio.to_thread(client.review_state.mark_critical_done, backlog_id):
+                    _set_problem("BACKLOG_UNAVAILABLE")
+                    raise StateError("Critical event completion failed.")
+
+        task = asyncio.create_task(run_check())
         review_tasks.add(task)
         task.add_done_callback(review_done)
 
@@ -717,6 +733,26 @@ async def notifications_loop(bot: Bot, client: FunPayClient):
                 review_failed = True
         task.add_done_callback(done)
 
+    try:
+        await asyncio.to_thread(client.review_state.recover_critical_events)
+        malformed = await asyncio.to_thread(client.enqueue_pending_critical_events)
+        _clear_problem("BACKLOG_UNAVAILABLE")
+        if malformed:
+            _set_problem("BACKLOG_MALFORMED")
+    except Exception:
+        _set_problem("BACKLOG_UNAVAILABLE")
+        raise
+
+    async def refill_backlog() -> None:
+        try:
+            malformed = await asyncio.to_thread(client.enqueue_pending_critical_events)
+            _clear_problem("BACKLOG_UNAVAILABLE")
+            if malformed:
+                _set_problem("BACKLOG_MALFORMED")
+        except Exception:
+            _set_problem("BACKLOG_UNAVAILABLE")
+            raise
+
     client.start_runner()
     try:
         for order_id, buyer, scheduled_at in await asyncio.to_thread(
@@ -732,8 +768,9 @@ async def notifications_loop(bot: Bot, client: FunPayClient):
                 raise RuntimeError("Review task unexpectedly failed.") from None
             # Забираем следующее событие из очереди, не блокируя asyncio-цикл
             try:
-                event = await asyncio.to_thread(client.event_queue.get, True, 1.0)
+                item = await asyncio.to_thread(client.event_queue.get, True, 1.0)
             except queue.Empty:
+                await refill_backlog()
                 continue
             if client.runner_stop_requested():
                 return
@@ -742,6 +779,29 @@ async def notifications_loop(bot: Bot, client: FunPayClient):
             if review_failed:
                 raise RuntimeError("Review task unexpectedly failed.") from None
 
+            backlog_id = item.event_id if isinstance(item, QueuedCriticalEvent) else None
+            event = item.event if backlog_id is not None else item
+            if backlog_id is not None:
+                await asyncio.to_thread(client.dequeued_critical_event, backlog_id)
+                try:
+                    claimed = await asyncio.to_thread(
+                        client.review_state.mark_critical_processing, backlog_id)
+                except Exception:
+                    _set_problem("BACKLOG_UNAVAILABLE")
+                    raise
+                if not claimed:
+                    await refill_backlog()
+                    continue
+            if isinstance(event, ReviewCheckEvent):
+                gate = asyncio.Event() if backlog_id is not None else None
+                start_review_check(event.order_id, delay=0, completion_gate=gate,
+                                   backlog_id=backlog_id)
+                if gate is not None:
+                    gate.set()
+                await refill_backlog()
+                continue
+
+            review_completion_gate = None
             observation = _order_observation(event)
             if observation is not None:
                 try:
@@ -764,28 +824,47 @@ async def notifications_loop(bot: Bot, client: FunPayClient):
                     raise StateError("Persistent order write failed.") from None
 
                 await _schedule_closed_review_request(
-                    client, event, observation, first_closed, start_review_request,
+                    client, event, observation, first_closed or backlog_id is not None,
+                    start_review_request,
                 )
 
             handled_by_rule = await _maybe_autorespond(
                 client, event, seen_autoresponses, rule_cooldowns,
             )
-            for setting_key, text in client.describe_event(event):
-                if setting_key == "_night_mode_reply_message":
+            for action in client.describe_event(event):
+                if action.kind is ActionKind.NIGHT_MESSAGE:
                     if not handled_by_rule:
-                        await _send_night_mode_reply(client, text, "message")
+                        await _send_night_mode_reply(client, action)
                     continue
-                if setting_key == "_night_mode_reply_order":
-                    await _send_night_mode_reply(client, text, "order")
+                if action.kind is ActionKind.NIGHT_ORDER:
+                    if backlog_id is not None:
+                        try:
+                            if not await asyncio.to_thread(
+                                    client.review_state.claim_critical_modifying_action,
+                                    backlog_id):
+                                continue
+                        except Exception:
+                            _set_problem("BACKLOG_UNAVAILABLE")
+                            raise
+                    await _send_night_mode_reply(client, action)
                     continue
-                # _review_check_immediate — отзыв поймали через NEW_FEEDBACK в чате, сразу проверяем
-                if setting_key == "_review_check_immediate":
-                    start_review_check(text, delay=0)
+                if action.kind is ActionKind.REVIEW_CHECK_NOW:
+                    if backlog_id is not None:
+                        review_completion_gate = asyncio.Event()
+                    start_review_check(action.order_id, delay=0,
+                                       completion_gate=review_completion_gate,
+                                       backlog_id=backlog_id)
                     continue
-                # _review_check — после закрытия проверяем заказ до ~130 секунд.
-                if setting_key == "_review_check":
-                    start_review_check(text, delay=5)
+                if action.kind is ActionKind.REVIEW_CHECK_LATER:
+                    if backlog_id is not None:
+                        review_completion_gate = asyncio.Event()
+                    start_review_check(action.order_id, delay=5,
+                                       completion_gate=review_completion_gate,
+                                       backlog_id=backlog_id)
                     continue
+
+                setting_key = action.kind.value
+                text = action.text
 
                 # Раньше здесь не было НИКАКОГО вывода в консоль - Telegram получал
                 # уведомление, а в CMD было тихо. Теперь то же самое, что летит в
@@ -807,6 +886,17 @@ async def notifications_loop(bot: Bot, client: FunPayClient):
                     except Exception as e:
                         if not _is_ignorable_send_error(e):
                             logger.notify(f"Не удалось отправить уведомление: {type(e).__name__}.")
+            if backlog_id is not None:
+                if review_completion_gate is not None:
+                    review_completion_gate.set()
+                else:
+                    try:
+                        if not await asyncio.to_thread(client.review_state.mark_critical_done, backlog_id):
+                            raise StateError("Critical event completion failed.")
+                    except Exception:
+                        _set_problem("BACKLOG_UNAVAILABLE")
+                        raise
+            await refill_backlog()
     finally:
         for task in tuple(request_tasks.values()):
             task.cancel()
