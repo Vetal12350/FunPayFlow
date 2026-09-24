@@ -181,6 +181,7 @@ def get_runtime_status_text() -> str:
 #   2. Персональные (_user_settings) — notify_*, notifications_enabled.
 #      У каждого авторизованного пользователя свои, независимые друг от друга.
 SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot_settings.json")
+DEFAULT_REVIEW_REQUEST_TEXT = "Спасибо за покупку! Если всё понравилось, пожалуйста, оставьте отзыв о заказе."
 
 # Глобальные настройки — общие для всего бота
 _DEFAULT_GLOBAL_SETTINGS: dict = {
@@ -191,6 +192,11 @@ _DEFAULT_GLOBAL_SETTINGS: dict = {
     "stats_currency": "USD",
     "night_mode_reply": None,
     "reply_templates": [],
+    "autoresponder_enabled": False,
+    "autoresponder_rules": [],
+    "review_request_enabled": False,
+    "review_request_text": DEFAULT_REVIEW_REQUEST_TEXT,
+    "review_request_delay": 5,
 }
 
 # Дефолтные персональные настройки — используются при первой авторизации нового пользователя
@@ -257,7 +263,9 @@ def load_settings() -> None:
         # Проверяем до изменения глобального состояния: строка "false" truthy.
         if (not isinstance(saved, dict)
                 or type(saved.get("auto_bump", False)) is not bool
-                or type(saved.get("night_mode", False)) is not bool):
+                or type(saved.get("night_mode", False)) is not bool
+                or type(saved.get("autoresponder_enabled", False)) is not bool
+                or type(saved.get("review_request_enabled", False)) is not bool):
             raise ValueError("Invalid global settings.")
         user_ids = saved.get("authorized_user_ids", [])
         if (not isinstance(user_ids, list)
@@ -287,6 +295,23 @@ def load_settings() -> None:
                        for item in templates)
                 or len({item["id"] for item in templates}) != len(templates)):
             raise ValueError("Invalid templates.")
+        rules = saved.get("autoresponder_rules", [])
+        if (type(rules) is not list or len(rules) > 50
+                or any(type(rule) is not dict or set(rule) != {
+                    "id", "trigger", "template_id", "match_mode", "enabled"}
+                    or type(rule["id"]) is not str or not re.fullmatch(r"[0-9a-f]{8}", rule["id"])
+                    or type(rule["trigger"]) is not str or not 0 < len(rule["trigger"].strip()) <= 200
+                    or type(rule["template_id"]) is not str
+                    or not re.fullmatch(r"[0-9a-f]{8}", rule["template_id"])
+                    or rule["match_mode"] not in ("EXACT", "CONTAINS")
+                    or type(rule["enabled"]) is not bool for rule in rules)
+                or len({rule["id"] for rule in rules}) != len(rules)):
+            raise ValueError("Invalid autoresponder rules.")
+        review_text = saved.get("review_request_text", DEFAULT_REVIEW_REQUEST_TEXT)
+        review_delay = saved.get("review_request_delay", 5)
+        if (type(review_text) is not str or not review_text.strip() or len(review_text) > 1000
+                or type(review_delay) is not int or not 0 <= review_delay <= 1440):
+            raise ValueError("Invalid review request settings.")
 
         # --- Миграция старого формата (без user_settings) ---
         # Раньше notify_* хранились в корне — теперь они персональные.
@@ -344,6 +369,11 @@ def save_settings(*, required: bool = False) -> None:
             "stats_currency": bot_settings["stats_currency"],
             "night_mode_reply": bot_settings["night_mode_reply"],
             "reply_templates": bot_settings["reply_templates"],
+            "autoresponder_enabled": bot_settings["autoresponder_enabled"],
+            "autoresponder_rules": bot_settings["autoresponder_rules"],
+            "review_request_enabled": bot_settings["review_request_enabled"],
+            "review_request_text": bot_settings["review_request_text"],
+            "review_request_delay": bot_settings["review_request_delay"],
             "user_settings": {
                 str(uid): sett for uid, sett in _user_settings.items()
             },
@@ -371,6 +401,11 @@ def save_settings(*, required: bool = False) -> None:
 def is_night_mode_enabled() -> bool:
     with _night_mode_state_lock:
         return bot_settings.get("night_mode", False)
+
+
+def is_review_request_enabled() -> bool:
+    with _night_mode_state_lock:
+        return bot_settings.get("review_request_enabled", False)
 
 
 def get_night_mode_reply_text(kind: str = "message") -> str:
@@ -512,6 +547,7 @@ def get_main_keyboard(user_id: int):
         [InlineKeyboardButton(text="🔔 Мои уведомления", callback_data="menu_notifications")],
         [InlineKeyboardButton(text=f"😴 Ночной режим: {night_status}", callback_data="menu_night_mode")],
         [InlineKeyboardButton(text="💬 Чаты", callback_data="chats:0")],
+        [InlineKeyboardButton(text="🤖 Автоответчик", callback_data="auto_menu")],
         [InlineKeyboardButton(text="📄 Лог", callback_data="menu_logs")],
     ])
     return keyboard
@@ -604,6 +640,49 @@ def _expand_template(text: str, chat_name: str, account_name: str) -> str:
     return text.format(chat_name=chat_name, account=account_name)
 
 
+def _normalized_trigger(value: str) -> str:
+    return value.replace("\r\n", "\n").replace("\r", "\n").strip().casefold()
+
+
+def match_autoresponder(message: str) -> tuple[dict, dict] | None:
+    if not bot_settings["autoresponder_enabled"] or type(message) is not str:
+        return None
+    normalized = _normalized_trigger(message)
+    if not normalized:
+        return None
+    rules = bot_settings["autoresponder_rules"]
+    for mode in ("EXACT", "CONTAINS"):
+        for rule in rules:
+            if not rule["enabled"] or rule["match_mode"] != mode:
+                continue
+            trigger = _normalized_trigger(rule["trigger"])
+            if not trigger or not (normalized == trigger if mode == "EXACT" else trigger in normalized):
+                continue
+            template = _template(rule["template_id"])
+            if template is None:
+                continue
+            try:
+                _validate_template(template["text"])
+            except ValueError:
+                continue
+            return rule, template
+    return None
+
+
+def _validate_review_text(value: str) -> None:
+    for _, field, spec, conversion in Formatter().parse(value):
+        if field is not None and (field not in {"account", "buyer", "order_id"}
+                                  or spec or conversion):
+            raise ValueError("Доступны только {account}, {buyer}, {order_id}.")
+
+
+def expand_review_request_text(text: str, account: str, buyer: str, order_id: str) -> str:
+    _validate_review_text(text)
+    if not account or not buyer or not re.fullmatch(r"[A-Z0-9]{8}", order_id):
+        raise ValueError("Недостаточно данных заказа.")
+    return text.format(account=account, buyer=buyer, order_id=order_id)
+
+
 def _templates() -> list[dict]:
     return bot_settings["reply_templates"]
 
@@ -635,6 +714,227 @@ def _template_screen(item: dict, chat_id: int) -> tuple[str, InlineKeyboardMarku
 
 def _cancel_keyboard(back: str) -> InlineKeyboardMarkup:
     return _menu([[_button("❌ Отмена", f"cancel:{back}")]])
+
+
+def _rule(rule_id: str) -> dict | None:
+    return next((rule for rule in bot_settings["autoresponder_rules"]
+                 if rule["id"] == rule_id), None)
+
+
+def _save_rule(replacement: dict | None, rule_id: str) -> None:
+    updated = [replacement if rule["id"] == rule_id else rule
+               for rule in bot_settings["autoresponder_rules"] if replacement is not None or rule["id"] != rule_id]
+    _save_global_setting("autoresponder_rules", updated)
+
+
+def _auto_screen() -> tuple[str, InlineKeyboardMarkup]:
+    status = "✅ Включён" if bot_settings["autoresponder_enabled"] else "⛔ Выключен"
+    return f"🤖 <b>Автоответчик</b>\n\nСтатус: {status}", _menu([
+        [_button("⛔ Выключить" if bot_settings["autoresponder_enabled"] else "✅ Включить", "auto_toggle")],
+        [_button("📋 Правила", "auto_rules")],
+        [_button("➕ Добавить правило", "auto_add")],
+        [_button("⭐ Запрос отзыва", "review_menu")],
+        [_button("🔙 Назад", "menu_main")],
+    ])
+
+
+def _rules_screen() -> tuple[str, InlineKeyboardMarkup]:
+    rows = [[_button(("✅ " if rule["enabled"] else "⛔ ") + rule["trigger"].replace("\n", " ⏎ ")[:35],
+                     f"auto_rule:{rule['id']}")]
+            for rule in bot_settings["autoresponder_rules"]]
+    rows.extend([[_button("➕ Добавить правило", "auto_add")],
+                 [_button("🔙 Назад", "auto_menu")]])
+    return "📋 <b>Правила автоответчика</b>", _menu(rows)
+
+
+def _rule_screen(rule: dict) -> tuple[str, InlineKeyboardMarkup]:
+    template = _template(rule["template_id"])
+    name = template["title"] if template else "Недоступен"
+    text = (f"🤖 <b>Правило</b> · {'✅' if rule['enabled'] else '⛔'}\n\n"
+            f"Триггер: {escape(rule['trigger'][:200])}\n"
+            f"Тип: {rule['match_mode']}\nШаблон: {escape(name)}")
+    return text, _menu([
+        [_button("⛔ Выключить" if rule["enabled"] else "✅ Включить", f"auto_rule_toggle:{rule['id']}")],
+        [_button("✏️ Триггер", f"auto_rule_trigger:{rule['id']}")],
+        [_button("🔁 EXACT / CONTAINS", f"auto_rule_mode:{rule['id']}")],
+        [_button("⚡ Шаблон", f"auto_rule_template:{rule['id']}")],
+        [_button("🗑 Удалить", f"auto_rule_delete:{rule['id']}")],
+        [_button("🔙 Назад", "auto_rules")],
+    ])
+
+
+def _choose_rule_template(back: str, action: str) -> tuple[str, InlineKeyboardMarkup]:
+    rows = [[_button(item["title"][:40], f"{action}:{item['id']}")]
+            for item in _templates()]
+    rows.append([_button("🔙 Назад", back)])
+    return "⚡ <b>Выберите шаблон</b>", _menu(rows)
+
+
+def _review_request_screen() -> tuple[str, InlineKeyboardMarkup]:
+    status = "✅ Включён" if bot_settings["review_request_enabled"] else "⛔ Выключен"
+    text = (f"⭐ <b>Запрос отзыва</b>\n\nСтатус: {status}\n"
+            f"Текст: {_escaped_preview(bot_settings['review_request_text'], 3400)}\n"
+            f"Задержка: {bot_settings['review_request_delay']} минут")
+    return text, _menu([
+        [_button("⛔ Выключить" if bot_settings["review_request_enabled"] else "✅ Включить", "review_toggle")],
+        [_button("✏️ Изменить текст", "review_edit")],
+        [_button("⏱ Изменить задержку", "review_delay")],
+        [_button("🔄 Сбросить текст", "review_reset")],
+        [_button("🔙 Назад", "auto_menu")],
+    ])
+
+
+async def _automation_callback(callback: CallbackQuery, action: str, user_id: int) -> bool:
+    prefix = action.split(":", 1)[0]
+    if prefix not in {"auto_menu", "auto_toggle", "auto_rules", "auto_add", "auto_mode",
+                      "auto_template", "auto_rule", "auto_rule_toggle", "auto_rule_trigger",
+                      "auto_rule_mode", "auto_rule_template", "auto_select", "auto_rule_delete",
+                      "review_menu", "review_toggle", "review_edit", "review_delay", "review_reset"}:
+        return False
+    if prefix not in {"auto_mode", "auto_template"}:
+        _interaction_state.pop(user_id, None)
+    answered = False
+    try:
+        parts = action.split(":")
+        if prefix == "auto_menu":
+            text, markup = _auto_screen()
+        elif prefix == "auto_toggle":
+            _save_global_setting("autoresponder_enabled", not bot_settings["autoresponder_enabled"])
+            text, markup = _auto_screen()
+        elif prefix == "auto_rules":
+            text, markup = _rules_screen()
+        elif prefix == "auto_add":
+            if len(bot_settings["autoresponder_rules"]) >= 50:
+                raise ValueError("Можно сохранить не более 50 правил.")
+            if not _templates():
+                raise ValueError("Сначала добавьте шаблон в разделе «Чаты».")
+            _interaction_state[user_id] = {"action": "auto_add_trigger"}
+            text, markup = "➕ Отправьте триггер (до 200 символов).", _cancel_keyboard("menu")
+        elif prefix == "auto_mode":
+            pending = _interaction_state.get(user_id)
+            if not pending or pending.get("action") != "auto_add_mode" or parts[1] not in ("EXACT", "CONTAINS"):
+                raise ValueError("Редактирование устарело.")
+            _interaction_state[user_id] = {**pending, "action": "auto_add_template", "match_mode": parts[1]}
+            text, markup = _choose_rule_template("auto_rules", "auto_template")
+        elif prefix == "auto_template":
+            pending = _interaction_state.pop(user_id, None)
+            if not pending or pending.get("action") != "auto_add_template" or _template(parts[1]) is None:
+                raise ValueError("Редактирование устарело.")
+            if len(bot_settings["autoresponder_rules"]) >= 50:
+                raise ValueError("Можно сохранить не более 50 правил.")
+            rule_id = secrets.token_hex(4)
+            while _rule(rule_id) is not None:
+                rule_id = secrets.token_hex(4)
+            rule = {"id": rule_id, "trigger": pending["trigger"], "template_id": parts[1],
+                    "match_mode": pending["match_mode"], "enabled": True}
+            _save_global_setting("autoresponder_rules", [*bot_settings["autoresponder_rules"], rule])
+            text, markup = _rule_screen(rule)
+        elif prefix in {"auto_rule", "auto_rule_toggle", "auto_rule_trigger", "auto_rule_mode",
+                        "auto_rule_template", "auto_rule_delete"}:
+            rule = _rule(parts[1])
+            if rule is None:
+                raise ValueError("Правило не найдено.")
+            if prefix == "auto_rule_toggle":
+                rule = {**rule, "enabled": not rule["enabled"]}
+                _save_rule(rule, rule["id"])
+            elif prefix == "auto_rule_mode":
+                rule = {**rule, "match_mode": "CONTAINS" if rule["match_mode"] == "EXACT" else "EXACT"}
+                _save_rule(rule, rule["id"])
+            elif prefix == "auto_rule_trigger":
+                _interaction_state[user_id] = {"action": "auto_edit_trigger", "id": rule["id"]}
+                text, markup = "✏️ Отправьте новый триггер (до 200 символов).", _cancel_keyboard("menu")
+            elif prefix == "auto_rule_template":
+                text, markup = _choose_rule_template("auto_rules", f"auto_select:{rule['id']}")
+            elif prefix == "auto_rule_delete":
+                _save_rule(None, rule["id"])
+                text, markup = _rules_screen()
+            if prefix in {"auto_rule", "auto_rule_toggle", "auto_rule_mode"}:
+                text, markup = _rule_screen(rule)
+        elif prefix == "auto_select":
+            rule = _rule(parts[1])
+            if rule is None or _template(parts[2]) is None:
+                raise ValueError("Правило или шаблон не найден.")
+            rule = {**rule, "template_id": parts[2]}
+            _save_rule(rule, rule["id"])
+            text, markup = _rule_screen(rule)
+        elif prefix == "review_menu":
+            text, markup = _review_request_screen()
+        elif prefix == "review_toggle":
+            _save_global_setting("review_request_enabled", not bot_settings["review_request_enabled"])
+            text, markup = _review_request_screen()
+        elif prefix == "review_edit":
+            _interaction_state[user_id] = {"action": "review_edit"}
+            text, markup = "✏️ Отправьте текст запроса отзыва (до 1000 символов).", _cancel_keyboard("menu")
+        elif prefix == "review_delay":
+            _interaction_state[user_id] = {"action": "review_delay"}
+            text, markup = "⏱ Отправьте задержку от 0 до 1440 минут.", _cancel_keyboard("menu")
+        else:
+            _save_global_setting("review_request_text", DEFAULT_REVIEW_REQUEST_TEXT)
+            text, markup = _review_request_screen()
+        await callback.answer()
+        answered = True
+        await callback.message.edit_text(text, reply_markup=markup, parse_mode="HTML")
+    except (ValueError, RuntimeError) as e:
+        if not answered:
+            safe_error = str(e) if str(e) in {
+                "Можно сохранить не более 50 правил.",
+                "Сначала добавьте шаблон в разделе «Чаты»."} else None
+            await callback.answer(safe_error or "Не удалось выполнить действие или сохранить настройку.",
+                                  show_alert=True)
+    except Exception as e:
+        logger.warning(f"Automation UI unavailable: {type(e).__name__}.")
+        if not answered:
+            await callback.answer("Данные недоступны.", show_alert=True)
+    return True
+
+
+async def _automation_pending(message: Message, pending: dict) -> bool:
+    action = pending["action"]
+    if action not in {"auto_add_trigger", "auto_add_mode", "auto_add_template",
+                      "auto_edit_trigger", "review_edit", "review_delay"}:
+        return False
+    user_id = message.from_user.id
+    if action in {"auto_add_mode", "auto_add_template"}:
+        await message.answer("Выберите вариант кнопкой в предыдущем сообщении.")
+        return True
+    try:
+        if action == "review_delay":
+            value = _clean_text(message.text, 4)
+            if not value.isdecimal() or not 0 <= int(value) <= 1440:
+                raise ValueError("Введите целое число от 0 до 1440.")
+            _save_global_setting("review_request_delay", int(value))
+            text, markup = _review_request_screen()
+        else:
+            limit = 200 if action.endswith("trigger") else 1000
+            value = _clean_text(message.text, limit).replace("\r\n", "\n").replace("\r", "\n")
+            if action == "auto_add_trigger":
+                _interaction_state[user_id] = {"action": "auto_add_mode", "trigger": value}
+                await message.answer("Выберите тип совпадения:", reply_markup=_menu([
+                    [_button("EXACT", "auto_mode:EXACT"), _button("CONTAINS", "auto_mode:CONTAINS")],
+                    [_button("❌ Отмена", "cancel:menu")],
+                ]))
+                return True
+            if action == "auto_edit_trigger":
+                rule = _rule(pending["id"])
+                if rule is None:
+                    raise ValueError("Правило не найдено.")
+                rule = {**rule, "trigger": value}
+                _save_rule(rule, rule["id"])
+                text, markup = _rule_screen(rule)
+            else:
+                _validate_review_text(value)
+                _save_global_setting("review_request_text", value)
+                text, markup = _review_request_screen()
+    except ValueError as e:
+        await message.answer(escape(str(e)), parse_mode="HTML")
+        return True
+    except Exception as e:
+        logger.warning(f"Automation settings save failed: {type(e).__name__}.")
+        await message.answer("Не удалось сохранить. Настройка не изменилась.")
+        return True
+    _interaction_state.pop(user_id, None)
+    await message.answer(text, reply_markup=markup, parse_mode="HTML")
+    return True
 
 
 def _chat_snapshot(chat_id: int) -> tuple[str, str]:
@@ -732,8 +1032,7 @@ def _chat_screen(chat_id: int, name: str, messages: list[tuple[str, str]]) -> tu
 def _send_to_chat(chat_id: int, value: str) -> None:
     if _runtime_client is None:
         raise RuntimeError("Account unavailable.")
-    with _runtime_client._account_lock:
-        _runtime_client.account.send_message(chat_id, value, update_last_saved_message=True)
+    _runtime_client.send_message_once(chat_id, value)
 
 
 async def _send_one_reply(message: Message, chat_id: int, value: str) -> None:
@@ -829,6 +1128,8 @@ async def _communication_callback(callback: CallbackQuery, action: str, user_id:
                 text, markup = ("✏️ Отправьте новое название (до 40 символов)." if prefix == "tpl_title"
                                 else "✏️ Отправьте новый текст (до 1000 символов)."), _cancel_keyboard("menu")
             elif prefix == "tpl_delete":
+                if any(rule["template_id"] == template_id for rule in bot_settings["autoresponder_rules"]):
+                    raise ValueError("Шаблон используется правилом. Сначала удалите правило.")
                 _save_global_setting("reply_templates", [row for row in _templates() if row["id"] != template_id])
                 text, markup = _templates_screen(chat_id)
             else:
@@ -862,6 +1163,7 @@ async def _communication_callback(callback: CallbackQuery, action: str, user_id:
         if not answered:
             await callback.answer(str(e) if isinstance(e, ValueError) and str(e) in {
                 "Шаблон не найден.", "Можно сохранить не более 20 шаблонов.",
+                "Шаблон используется правилом. Сначала удалите правило.",
                 "Развёрнутый текст слишком длинный.", "Подтверждение устарело."}
                 else "Данные недоступны или не удалось сохранить.", show_alert=True)
     except Exception as e:
@@ -965,9 +1267,11 @@ async def callback_handler(callback: CallbackQuery):
         return
 
     action = callback.data or ""
-    if not action or not action.startswith("quick_send:"):
+    if not action or not action.startswith(("quick_send:", "auto_mode:", "auto_template:")):
         _interaction_state.pop(user_id, None)
     if await _communication_callback(callback, action, user_id):
+        return
+    if await _automation_callback(callback, action, user_id):
         return
 
     # Включение/выключение автоподнятия (глобальная настройка — влияет на всех)
@@ -1113,6 +1417,8 @@ async def text_handler(message: Message):
             if message.text and message.text.startswith("/"):
                 _interaction_state.pop(user_id, None)
                 await message.answer("Действие отменено. Команда не сохранена.")
+                return
+            if await _automation_pending(message, pending):
                 return
             if pending["action"] == "quick_confirm":
                 await message.answer("Для отправки используйте кнопку «✅ Отправить».")

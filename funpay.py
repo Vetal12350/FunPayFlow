@@ -271,6 +271,8 @@ class FunPayClient:
         # токеном, из-за чего FunPay отвечает 400. Лок гарантирует, что запросы
         # к self.account всегда идут строго по одному, без гонки.
         self._account_lock = threading.RLock()
+        self._outgoing_echo_lock = threading.Lock()
+        self._recent_outgoing_text: dict[int, tuple[str, float]] = {}
 
         # Чаты, по которым уведомление УЖЕ отправлено, пока они остаются
         # непрочитанными. LAST_CHAT_MESSAGE_CHANGED срабатывает на КАЖДОЕ
@@ -350,6 +352,27 @@ class FunPayClient:
         with self._account_lock:
             order = self.account.get_order(order_id)
             return order, self.account.id
+
+    def send_message_once(self, chat_id: int, text: str, *, enabled_check=None):
+        """One modifying call under the existing Account lock; callers never retry."""
+        if type(chat_id) is not int or chat_id <= 0 or type(text) is not str or not text.strip():
+            raise ValueError("Invalid outgoing message.")
+        with self._account_lock:
+            if enabled_check is not None and not enabled_check():
+                return False
+            with self._outgoing_echo_lock:
+                self._recent_outgoing_text[chat_id] = (text, time.monotonic())
+                if len(self._recent_outgoing_text) > 10000:
+                    oldest = next(iter(self._recent_outgoing_text))
+                    self._recent_outgoing_text.pop(oldest, None)
+            return self.account.send_message(
+                chat_id, text, update_last_saved_message=True,
+            )
+
+    def _is_recent_outgoing_echo(self, chat_id: int, text: str | None) -> bool:
+        with self._outgoing_echo_lock:
+            recent = self._recent_outgoing_text.get(chat_id)
+            return bool(recent and text == recent[0] and time.monotonic() - recent[1] < 600)
 
     def get_completed_withdrawals(self) -> list[tuple[str, Decimal, str | None]]:
         """Read-only первая страница Финансов через тот же Account и RLock."""
@@ -986,6 +1009,9 @@ class FunPayClient:
                     return results
                 from telegram import is_night_mode_reply_text
                 if is_night_mode_reply_text(getattr(chat, "last_message_text", None)):
+                    return results
+                if (type(chat_id) is int and self._is_recent_outgoing_echo(
+                        chat_id, getattr(chat, "last_message_text", None))):
                     return results
 
                 # Системное событие отзыва не обязано делать чат непрочитанным.

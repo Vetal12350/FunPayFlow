@@ -116,6 +116,20 @@ class ReviewReceiptStore:
                         "order_id TEXT PRIMARY KEY, observed_at INTEGER NOT NULL)"
                     )
                     connection.execute(
+                        "CREATE TABLE IF NOT EXISTS review_requests ("
+                        "order_id TEXT PRIMARY KEY, state TEXT NOT NULL "
+                        "CHECK(state IN ('pending', 'sent', 'ambiguous')), "
+                        "buyer TEXT NOT NULL, created_at INTEGER NOT NULL, "
+                        "scheduled_at INTEGER NOT NULL, sent_at INTEGER)"
+                    )
+                    request_columns = {
+                        row[1]: row for row in connection.execute("PRAGMA table_info(review_requests)")
+                    }
+                    if (request_columns.get("order_id", (None,) * 6)[5] != 1
+                            or any(request_columns.get(name, (None,) * 6)[3] != 1
+                                   for name in ("state", "buyer", "created_at", "scheduled_at"))):
+                        raise StateError("Persistent review request schema is incompatible.")
+                    connection.execute(
                         "CREATE TABLE IF NOT EXISTS withdrawals ("
                         "transaction_id TEXT PRIMARY KEY, amount TEXT NOT NULL, "
                         "currency TEXT, observed_at INTEGER NOT NULL)"
@@ -264,6 +278,103 @@ class ReviewReceiptStore:
         except (sqlite3.Error, OSError):
             raise StateError("Persistent review observation write failed.") from None
 
+    def schedule_review_request(self, order_id: str, buyer: str, scheduled_at: int) -> bool:
+        self._require_order_id(order_id)
+        if (type(buyer) is not str or not buyer.strip() or len(buyer) > 100
+                or type(scheduled_at) is not int or scheduled_at < 0):
+            raise StateError("Invalid review request context.")
+        try:
+            with closing(self._connect()) as connection:
+                with connection:
+                    result = connection.execute(
+                        "INSERT OR IGNORE INTO review_requests "
+                        "(order_id, state, buyer, created_at, scheduled_at) "
+                        "SELECT ?, 'pending', ?, ?, ? WHERE EXISTS ("
+                        "SELECT 1 FROM orders WHERE order_id = ? AND current_status = 'CLOSED') "
+                        "AND NOT EXISTS (SELECT 1 FROM review_observations WHERE order_id = ?)",
+                        (order_id, buyer.strip(), int(time.time()), scheduled_at, order_id, order_id),
+                    )
+                    return result.rowcount == 1
+        except (sqlite3.Error, OSError):
+            raise StateError("Persistent review request write failed.") from None
+
+    def pending_review_requests(self) -> list[tuple[str, str, int]]:
+        try:
+            with closing(self._connect()) as connection:
+                return connection.execute(
+                    "SELECT order_id, buyer, scheduled_at FROM review_requests "
+                    "WHERE state = 'pending' ORDER BY scheduled_at, order_id"
+                ).fetchall()
+        except (sqlite3.Error, OSError):
+            raise StateError("Persistent review request read failed.") from None
+
+    def has_review_observation(self, order_id: str) -> bool:
+        self._require_order_id(order_id)
+        try:
+            with closing(self._connect()) as connection:
+                return connection.execute(
+                    "SELECT 1 FROM review_observations WHERE order_id = ?", (order_id,)
+                ).fetchone() is not None
+        except (sqlite3.Error, OSError):
+            raise StateError("Persistent review observation read failed.") from None
+
+    def discard_pending_review_request(self, order_id: str) -> None:
+        self._require_order_id(order_id)
+        try:
+            with closing(self._connect()) as connection:
+                with connection:
+                    connection.execute(
+                        "DELETE FROM review_requests WHERE order_id = ? AND state = 'pending'",
+                        (order_id,),
+                    )
+        except (sqlite3.Error, OSError):
+            raise StateError("Persistent review request write failed.") from None
+
+    def discard_unstarted_review_request(self, order_id: str) -> None:
+        """Only call after the send gate confirms no network request began."""
+        self._require_order_id(order_id)
+        try:
+            with closing(self._connect()) as connection:
+                with connection:
+                    connection.execute(
+                        "DELETE FROM review_requests WHERE order_id = ? "
+                        "AND state = 'ambiguous' AND sent_at IS NULL", (order_id,),
+                    )
+        except (sqlite3.Error, OSError):
+            raise StateError("Persistent review request write failed.") from None
+
+    def claim_review_request(self, order_id: str, now: int) -> bool:
+        """Claim before network I/O; a crash leaves ambiguous, never auto-retry."""
+        self._require_order_id(order_id)
+        try:
+            with closing(self._connect()) as connection:
+                with connection:
+                    result = connection.execute(
+                        "UPDATE review_requests SET state = 'ambiguous' "
+                        "WHERE order_id = ? AND state = 'pending' AND scheduled_at <= ? "
+                        "AND EXISTS (SELECT 1 FROM orders WHERE order_id = ? "
+                        "AND current_status = 'CLOSED') "
+                        "AND NOT EXISTS (SELECT 1 FROM review_observations WHERE order_id = ?)",
+                        (order_id, now, order_id, order_id),
+                    )
+                    return result.rowcount == 1
+        except (sqlite3.Error, OSError):
+            raise StateError("Persistent review request claim failed.") from None
+
+    def mark_review_request_sent(self, order_id: str, sent_at: int) -> None:
+        self._require_order_id(order_id)
+        try:
+            with closing(self._connect()) as connection:
+                with connection:
+                    result = connection.execute(
+                        "UPDATE review_requests SET state = 'sent', sent_at = ? "
+                        "WHERE order_id = ? AND state = 'ambiguous'", (sent_at, order_id),
+                    )
+                    if result.rowcount != 1:
+                        raise StateError("Review request state changed.")
+        except (sqlite3.Error, OSError):
+            raise StateError("Persistent review request write failed.") from None
+
     def record_withdrawal_observation(
         self, transaction_id: str, amount, currency,
         observed_at_utc: int | None = None,
@@ -305,8 +416,8 @@ class ReviewReceiptStore:
     def record_order_observation(
         self, order_id: str, status: str, observed_at_utc: int | None = None,
         *, amount=None, currency=None,
-    ) -> None:
-        """Записывает текущий статус; время — наблюдение ботом, не дата заказа."""
+    ) -> bool:
+        """Записывает статус; возвращает True лишь при первом наблюдении CLOSED."""
         self._require_order_id(order_id)
         if status not in ("PAID", "CLOSED", "REFUNDED"):
             raise StateError("Invalid order status.")
@@ -330,6 +441,11 @@ class ReviewReceiptStore:
         try:
             with closing(self._connect()) as connection:
                 with connection:
+                    connection.execute("BEGIN IMMEDIATE")
+                    previous = connection.execute(
+                        "SELECT closed_at_utc FROM orders WHERE order_id = ?", (order_id,)
+                    ).fetchone()
+                    first_closed = status == "CLOSED" and (previous is None or previous[0] is None)
                     connection.execute(
                         "INSERT INTO orders (order_id, first_seen_at, last_seen_at, "
                         "current_status, closed_at_utc, amount, currency) "
@@ -345,6 +461,7 @@ class ReviewReceiptStore:
                          observed_at_utc if status == "CLOSED" else None,
                          recorded_amount, recorded_currency),
                     )
+                    return first_closed
         except (sqlite3.Error, OSError):
             raise StateError("Persistent order write failed.") from None
 

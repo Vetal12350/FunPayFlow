@@ -72,6 +72,8 @@ class CommunicationTests(unittest.IsolatedAsyncioTestCase):
         self.account = FakeAccount()
         ui._runtime_client = SimpleNamespace(
             account=self.account, _account_lock=threading.RLock(),
+            send_message_once=lambda chat_id, text: self.account.send_message(
+                chat_id, text, update_last_saved_message=True),
             _manual_get_chat_history=lambda chat_id, **kwargs: [
                 SimpleNamespace(author_id=10, author="Seller", text="<mine>"),
                 SimpleNamespace(author_id=20, author=f"Buyer{chat_id}", text="<&>"),
