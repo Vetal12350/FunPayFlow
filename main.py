@@ -15,9 +15,9 @@ load_dotenv()
 import FunPayAPI
 from telegram import (dp, bot_settings, get_user_settings, get_all_recipients,
                       set_runtime_status_context, clear_runtime_status_context,
-                      disable_autobump, get_reply_keyboard, is_night_mode_enabled)
-from funpay import (FunPayClient, _AmbiguousRaiseOutcome,
-                    NIGHT_MODE_MESSAGE_TEXT, NIGHT_MODE_ORDER_TEXT)
+                      disable_autobump, get_reply_keyboard, is_night_mode_enabled,
+                      get_night_mode_reply_text)
+from funpay import FunPayClient, _AmbiguousRaiseOutcome
 from state import ReviewReceiptStore, StateError
 import logger
 
@@ -393,7 +393,7 @@ async def _send_night_mode_reply(
                 return False
             client.account.send_message(
                 chat_id,
-                NIGHT_MODE_MESSAGE_TEXT if kind == "message" else NIGHT_MODE_ORDER_TEXT,
+                get_night_mode_reply_text(kind),
                 update_last_saved_message=True,
             )
             return True

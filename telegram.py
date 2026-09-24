@@ -7,11 +7,18 @@ import re
 import threading
 import time
 import tempfile
+from html import escape
+from string import Formatter
+import requests
+import FunPayAPI
+import secrets
+import unicodedata
+from collections import deque
 from datetime import datetime, timedelta
 from aiogram import Dispatcher, F
 from aiogram.filters import Command
 from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, ReplyKeyboardMarkup, KeyboardButton, FSInputFile
-from funpay import FunPayClient
+from funpay import FunPayClient, NIGHT_MODE_MESSAGE_TEXT, NIGHT_MODE_ORDER_TEXT
 from state import StateError
 import logger
 
@@ -182,6 +189,8 @@ _DEFAULT_GLOBAL_SETTINGS: dict = {
     "authorized_user_ids": [],
     # OLD production-аккаунт был USD; это явная account-level настройка статистики.
     "stats_currency": "USD",
+    "night_mode_reply": None,
+    "reply_templates": [],
 }
 
 # Дефолтные персональные настройки — используются при первой авторизации нового пользователя
@@ -196,6 +205,9 @@ _DEFAULT_USER_SETTINGS: dict = {
 # Глобальные настройки бота (авто-подъём, список авторизованных)
 bot_settings: dict = dict(_DEFAULT_GLOBAL_SETTINGS)
 _night_mode_state_lock = threading.Lock()
+_night_reply_echoes = deque([NIGHT_MODE_MESSAGE_TEXT, NIGHT_MODE_ORDER_TEXT], maxlen=8)
+_interaction_state: dict[int, dict] = {}
+_chat_pages: dict[int, list[tuple[int, str, bool]]] = {}
 
 # Персональные настройки: {user_id (int): {notify_*, notifications_enabled}}
 _user_settings: dict[int, dict] = {}
@@ -262,6 +274,19 @@ def load_settings() -> None:
                 raise ValueError("Invalid user settings.")
         if any(type(saved[key]) is not bool for key in _DEFAULT_USER_SETTINGS if key in saved):
             raise ValueError("Invalid legacy settings.")
+        custom_reply = saved.get("night_mode_reply")
+        templates = saved.get("reply_templates", [])
+        if (custom_reply is not None and (type(custom_reply) is not str or not custom_reply.strip()
+                                          or len(custom_reply) > 1000)):
+            raise ValueError("Invalid night mode reply.")
+        if (type(templates) is not list or len(templates) > 20
+                or any(type(item) is not dict or set(item) != {"id", "title", "text"}
+                       or type(item["id"]) is not str or not re.fullmatch(r"[0-9a-f]{8}", item["id"])
+                       or type(item["title"]) is not str or not 0 < len(item["title"]) <= 40
+                       or type(item["text"]) is not str or not 0 < len(item["text"]) <= 1000
+                       for item in templates)
+                or len({item["id"] for item in templates}) != len(templates)):
+            raise ValueError("Invalid templates.")
 
         # --- Миграция старого формата (без user_settings) ---
         # Раньше notify_* хранились в корне — теперь они персональные.
@@ -317,6 +342,8 @@ def save_settings(*, required: bool = False) -> None:
             "night_mode": bot_settings["night_mode"],
             "authorized_user_ids": bot_settings["authorized_user_ids"],
             "stats_currency": bot_settings["stats_currency"],
+            "night_mode_reply": bot_settings["night_mode_reply"],
+            "reply_templates": bot_settings["reply_templates"],
             "user_settings": {
                 str(uid): sett for uid, sett in _user_settings.items()
             },
@@ -337,13 +364,43 @@ def save_settings(*, required: bool = False) -> None:
             except OSError:
                 pass
         if required:
-            raise RuntimeError("Не удалось сохранить настройки автоподнятия.") from None
+            raise RuntimeError("Не удалось сохранить настройки.") from None
         print(f"[SETTINGS] Не удалось сохранить настройки: {type(e).__name__}.")
 
 
 def is_night_mode_enabled() -> bool:
     with _night_mode_state_lock:
         return bot_settings.get("night_mode", False)
+
+
+def get_night_mode_reply_text(kind: str = "message") -> str:
+    with _night_mode_state_lock:
+        return bot_settings.get("night_mode_reply") or (
+            NIGHT_MODE_MESSAGE_TEXT if kind == "message" else NIGHT_MODE_ORDER_TEXT
+        )
+
+
+def is_night_mode_reply_text(value: str | None) -> bool:
+    with _night_mode_state_lock:
+        return type(value) is str and (
+            value in _night_reply_echoes or value == bot_settings.get("night_mode_reply")
+        )
+
+
+def _save_global_setting(key: str, value) -> None:
+    with _night_mode_state_lock:
+        previous = bot_settings[key]
+        bot_settings[key] = value
+        try:
+            save_settings(required=True)
+        except Exception:
+            bot_settings[key] = previous
+            raise
+        if key == "night_mode_reply":
+            if previous:
+                _night_reply_echoes.append(previous)
+            if value:
+                _night_reply_echoes.append(value)
 
 
 def toggle_night_mode_saved() -> bool:
@@ -453,7 +510,8 @@ def get_main_keyboard(user_id: int):
         [InlineKeyboardButton(text="📊 Статистика", callback_data="menu_stats")],
         [InlineKeyboardButton(text="🩺 Статус", callback_data="menu_status")],
         [InlineKeyboardButton(text="🔔 Мои уведомления", callback_data="menu_notifications")],
-        [InlineKeyboardButton(text=f"😴 Ночной режим: {night_status}", callback_data="toggle_night_mode")],
+        [InlineKeyboardButton(text=f"😴 Ночной режим: {night_status}", callback_data="menu_night_mode")],
+        [InlineKeyboardButton(text="💬 Чаты", callback_data="chats:0")],
         [InlineKeyboardButton(text="📄 Лог", callback_data="menu_logs")],
     ])
     return keyboard
@@ -490,6 +548,329 @@ def get_notifications_keyboard(user_id: int):
     return keyboard
 
 
+def _button(text: str, data: str) -> InlineKeyboardButton:
+    return InlineKeyboardButton(text=text, callback_data=data)
+
+
+def _menu(rows) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _night_mode_screen() -> tuple[str, InlineKeyboardMarkup]:
+    current = _escaped_preview(get_night_mode_reply_text(), 3500)
+    status = "✅ Включён" if is_night_mode_enabled() else "⛔ Выключен"
+    text = f"😴 <b>Ночной режим</b>\n\nСтатус: {status}\n\nТекущий автоответ:\n{current}"
+    return text, _menu([
+        [_button("⛔ Выключить" if is_night_mode_enabled() else "✅ Включить", "toggle_night_mode")],
+        [_button("✏️ Изменить автоответ", "night_edit")],
+        [_button("🔄 Сбросить автоответ", "night_reset")],
+        [_button("🔙 Назад", "menu_main")],
+    ])
+
+
+def _clean_text(value: str | None, limit: int) -> str:
+    if type(value) is not str:
+        raise ValueError("Нужен текст.")
+    cleaned = "".join(ch for ch in value if ch in "\n\t" or unicodedata.category(ch) != "Cc")
+    cleaned = cleaned.replace("\t", " ").strip()
+    if not cleaned or len(cleaned) > limit:
+        raise ValueError(f"Введите текст от 1 до {limit} символов.")
+    return cleaned
+
+
+def _escaped_preview(value: str, limit: int) -> str:
+    pieces, size = [], 0
+    for char in value:
+        escaped = escape(char)
+        if size + len(escaped) > limit:
+            pieces.append("…")
+            break
+        pieces.append(escaped)
+        size += len(escaped)
+    return "".join(pieces)
+
+
+_VARIABLES = frozenset({"chat_name", "account"})
+
+
+def _validate_template(text: str) -> None:
+    for _, field, format_spec, conversion in Formatter().parse(text):
+        if field is not None and (field not in _VARIABLES or format_spec or conversion):
+            raise ValueError("Доступны только {chat_name} и {account}.")
+
+
+def _expand_template(text: str, chat_name: str, account_name: str) -> str:
+    _validate_template(text)
+    return text.format(chat_name=chat_name, account=account_name)
+
+
+def _templates() -> list[dict]:
+    return bot_settings["reply_templates"]
+
+
+def _template(template_id: str) -> dict | None:
+    return next((item for item in _templates() if item["id"] == template_id), None)
+
+
+def _templates_screen(chat_id: int = 0, *, quick: bool = False) -> tuple[str, InlineKeyboardMarkup]:
+    rows = []
+    for item in _templates():
+        action = "quick_preview" if quick else "tpl_view"
+        rows.append([_button(item["title"][:40], f"{action}:{item['id']}:{chat_id}")])
+    if not quick:
+        rows.append([_button("➕ Добавить", f"tpl_add:{chat_id}")])
+    back = f"chat:{chat_id}" if quick else (f"chats:0" if chat_id == 0 else f"chat:{chat_id}")
+    rows.append([_button("🔙 Назад", back)])
+    return ("⚡ <b>Быстрый ответ</b>" if quick else "⚡ <b>Шаблоны</b>"), _menu(rows)
+
+
+def _template_screen(item: dict, chat_id: int) -> tuple[str, InlineKeyboardMarkup]:
+    return (f"⚡ <b>{escape(item['title'])}</b>\n\n{_escaped_preview(item['text'], 3400)}", _menu([
+        [_button("✏️ Название", f"tpl_title:{item['id']}:{chat_id}")],
+        [_button("✏️ Текст", f"tpl_text:{item['id']}:{chat_id}")],
+        [_button("🗑 Удалить", f"tpl_delete:{item['id']}:{chat_id}")],
+        [_button("🔙 Назад", f"tpl_menu:{chat_id}")],
+    ]))
+
+
+def _cancel_keyboard(back: str) -> InlineKeyboardMarkup:
+    return _menu([[_button("❌ Отмена", f"cancel:{back}")]])
+
+
+def _chat_snapshot(chat_id: int) -> tuple[str, str]:
+    if _runtime_client is None or type(chat_id) is not int or chat_id <= 0:
+        raise RuntimeError("Chat unavailable.")
+    with _runtime_client._account_lock:
+        account = _runtime_client.account
+        shortcut = account.get_chat_by_id(chat_id)
+        name = getattr(shortcut, "name", None)
+        account_name = getattr(account, "username", None)
+    if type(name) is not str or not name or type(account_name) is not str or not account_name:
+        raise RuntimeError("Chat unavailable.")
+    return name, account_name
+
+
+def _fetch_chats() -> list[tuple[int, str, bool]]:
+    if _runtime_client is None:
+        raise RuntimeError("Account unavailable.")
+    with _runtime_client._account_lock:
+        account = _runtime_client.account
+        chats = account.request_chats()
+        account.add_chats(chats)
+        return [(chat.id, chat.name or "Чат", chat.unread) for chat in chats
+                if type(chat.id) is int and chat.id > 0]
+
+
+def _fetch_chat(chat_id: int) -> tuple[str, list[tuple[str, str]]]:
+    if _runtime_client is None:
+        raise RuntimeError("Account unavailable.")
+    with _runtime_client._account_lock:
+        account = _runtime_client.account
+        shortcut = account.get_chat_by_id(chat_id)
+        if shortcut is None:
+            raise RuntimeError("Chat unavailable.")
+        name = shortcut.name or "Чат"
+        history_method = getattr(_runtime_client, "_manual_get_chat_history", None)
+        if history_method is None:
+            raise RuntimeError("History unavailable.")
+        try:
+            messages = history_method(chat_id, interlocutor_username=name)
+        except Exception as e:
+            logger.warning(f"Chat history unavailable: {type(e).__name__}.")
+            preview = getattr(shortcut, "last_message_text", None)
+            return name, [("Последний фрагмент · история недоступна", preview)] if preview else []
+        account_id = getattr(account, "id", None)
+    display = []
+    for item in messages[-10:]:
+        author_id = getattr(item, "author_id", None)
+        if type(account_id) is int and type(author_id) is int and author_id == account_id:
+            direction = "🧑‍💻 я"
+        elif type(author_id) is int and author_id > 0 and getattr(item, "author", None) == name:
+            direction = "👤 собеседник"
+        else:
+            direction = "Сообщение"
+        display.append((direction, getattr(item, "text", None) or "[без текста]"))
+    return name, display
+
+
+def _chats_screen(chats: list[tuple[int, str, bool]], page: int) -> tuple[str, InlineKeyboardMarkup]:
+    count = max(1, (len(chats) + 9) // 10)
+    page = min(max(0, page), count - 1)
+    rows = [[_button(("🟠 " if unread else "") + name[:45], f"chat:{chat_id}")]
+            for chat_id, name, unread in chats[page * 10:(page + 1) * 10]]
+    pages = []
+    if page > 0:
+        pages.append(_button("◀️", f"chats:{page - 1}"))
+    if page + 1 < count:
+        pages.append(_button("▶️", f"chats:{page + 1}"))
+    if pages:
+        rows.append(pages)
+    rows.extend([[_button("🔄 Обновить", "chats_refresh:0")],
+                 [_button("⚡ Шаблоны", "tpl_menu:0")],
+                 [_button("🔙 Назад", "menu_main")]])
+    return f"💬 <b>Чаты</b> · {page + 1}/{count}", _menu(rows)
+
+
+def _chat_screen(chat_id: int, name: str, messages: list[tuple[str, str]]) -> tuple[str, InlineKeyboardMarkup]:
+    header = f"💬 <b>{escape(name[:100])}</b>\n\n"
+    remaining = 3500 - len(header)
+    blocks = []
+    for direction, body in messages:
+        block = f"{direction}: {_escaped_preview(str(body), 600)}"
+        if len(block) > remaining:
+            break
+        blocks.append(block)
+        remaining -= len(block) + 2
+    text = header + ("\n\n".join(blocks) if blocks else "Сообщений нет.")
+    return text, _menu([
+        [_button("✉️ Ответить", f"reply:{chat_id}"), _button("⚡ Быстрый ответ", f"quick_menu:{chat_id}")],
+        [_button("🔄 Обновить", f"chat:{chat_id}")],
+        [_button("🔙 К чатам", "chats:0")],
+    ])
+
+
+def _send_to_chat(chat_id: int, value: str) -> None:
+    if _runtime_client is None:
+        raise RuntimeError("Account unavailable.")
+    with _runtime_client._account_lock:
+        _runtime_client.account.send_message(chat_id, value, update_last_saved_message=True)
+
+
+async def _send_one_reply(message: Message, chat_id: int, value: str) -> None:
+    try:
+        await asyncio.to_thread(_send_to_chat, chat_id, value)
+    except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+        logger.warning(f"Manual message result ambiguous: {type(e).__name__}.")
+        await message.answer("⚠️ Не удалось подтвердить отправку. Проверьте чат перед повторной попыткой.")
+    except FunPayAPI.exceptions.MessageNotDeliveredError as e:
+        if type(getattr(e, "error_message", None)) is str and e.error_message:
+            logger.warning("Manual message rejected by FunPay.")
+            await message.answer("⛔ FunPay отклонил сообщение. Отправка не выполнена.")
+        else:
+            logger.warning("Manual message result ambiguous: MessageNotDeliveredError.")
+            await message.answer("⚠️ Отправка не подтверждена. Проверьте чат перед повторной попыткой.")
+    except Exception as e:
+        logger.warning(f"Manual message failed: {type(e).__name__}.")
+        # A remote error can occur after transport; do not imply it is safe to retry.
+        await message.answer("⚠️ Отправка не подтверждена. Проверьте чат перед повторной попыткой.")
+    else:
+        await message.answer("✅ Отправлено")
+
+
+async def _communication_callback(callback: CallbackQuery, action: str, user_id: int) -> bool:
+    """Handles communication screens; callback values contain IDs, never user text."""
+    prefix = action.split(":", 1)[0]
+    if prefix not in {"menu_night_mode", "night_edit", "night_reset", "chats", "chats_refresh",
+                      "chat", "reply", "tpl_menu", "tpl_view", "tpl_add", "tpl_title",
+                      "tpl_text", "tpl_delete", "quick_menu", "quick_preview", "quick_send", "cancel"}:
+        return False
+    if prefix != "quick_send":
+        _interaction_state.pop(user_id, None)
+    answered = False
+    try:
+        parts = action.split(":")
+        if prefix == "menu_night_mode":
+            text, markup = _night_mode_screen()
+        elif prefix == "night_edit":
+            _interaction_state[user_id] = {"action": "night_edit"}
+            text, markup = "✏️ Отправьте новый автоответ (до 1000 символов).", _cancel_keyboard("night")
+        elif prefix == "night_reset":
+            _save_global_setting("night_mode_reply", None)
+            text, markup = _night_mode_screen()
+        elif prefix in {"chats", "chats_refresh"}:
+            page = int(parts[1])
+            if prefix == "chats_refresh" or user_id not in _chat_pages:
+                _chat_pages[user_id] = await asyncio.to_thread(_fetch_chats)
+            text, markup = _chats_screen(_chat_pages[user_id], page)
+        elif prefix == "chat":
+            chat_id = int(parts[1])
+            if chat_id not in {item[0] for item in _chat_pages.get(user_id, [])}:
+                raise ValueError("Chat unavailable.")
+            name, messages = await asyncio.to_thread(_fetch_chat, chat_id)
+            text, markup = _chat_screen(chat_id, name, messages)
+        elif prefix == "reply":
+            chat_id = int(parts[1])
+            if chat_id not in {item[0] for item in _chat_pages.get(user_id, [])}:
+                raise ValueError("Chat unavailable.")
+            _interaction_state[user_id] = {"action": "reply", "chat_id": chat_id}
+            text, markup = "✉️ Отправьте текст ответа.", _cancel_keyboard(f"chat_{chat_id}")
+        elif prefix in {"tpl_menu", "quick_menu"}:
+            chat_id = int(parts[1])
+            if chat_id and chat_id not in {item[0] for item in _chat_pages.get(user_id, [])}:
+                raise ValueError("Chat unavailable.")
+            text, markup = _templates_screen(chat_id, quick=prefix == "quick_menu")
+        elif prefix == "cancel":
+            back = parts[1]
+            if back == "night":
+                text, markup = _night_mode_screen()
+            elif back.startswith("chat_"):
+                chat_id = int(back.removeprefix("chat_"))
+                name, messages = await asyncio.to_thread(_fetch_chat, chat_id)
+                text, markup = _chat_screen(chat_id, name, messages)
+            else:
+                text, markup = MAIN_MENU_TEXT, get_main_keyboard(user_id)
+        elif prefix == "tpl_add":
+            chat_id = int(parts[1])
+            if len(_templates()) >= 20:
+                raise ValueError("Можно сохранить не более 20 шаблонов.")
+            _interaction_state[user_id] = {"action": "tpl_add_title", "chat_id": chat_id}
+            text, markup = "➕ Отправьте название шаблона (до 40 символов).", _cancel_keyboard("menu")
+        elif prefix in {"tpl_view", "tpl_title", "tpl_text", "tpl_delete", "quick_preview"}:
+            template_id, chat_id = parts[1], int(parts[2])
+            item = _template(template_id)
+            if item is None:
+                raise ValueError("Шаблон не найден.")
+            if chat_id and chat_id not in {row[0] for row in _chat_pages.get(user_id, [])}:
+                raise ValueError("Chat unavailable.")
+            if prefix == "tpl_view":
+                text, markup = _template_screen(item, chat_id)
+            elif prefix in {"tpl_title", "tpl_text"}:
+                _interaction_state[user_id] = {"action": prefix, "id": template_id, "chat_id": chat_id}
+                text, markup = ("✏️ Отправьте новое название (до 40 символов)." if prefix == "tpl_title"
+                                else "✏️ Отправьте новый текст (до 1000 символов)."), _cancel_keyboard("menu")
+            elif prefix == "tpl_delete":
+                _save_global_setting("reply_templates", [row for row in _templates() if row["id"] != template_id])
+                text, markup = _templates_screen(chat_id)
+            else:
+                if not chat_id:
+                    raise ValueError("Chat unavailable.")
+                chat_name, account_name = await asyncio.to_thread(_chat_snapshot, chat_id)
+                expanded = _expand_template(item["text"], chat_name, account_name)
+                if len(expanded) > 2000:
+                    raise ValueError("Развёрнутый текст слишком длинный.")
+                _interaction_state[user_id] = {"action": "quick_confirm", "chat_id": chat_id,
+                                               "text": expanded, "id": template_id}
+                text = f"⚡ <b>{escape(item['title'])}</b>\n\n{_escaped_preview(expanded, 3400)}"
+                markup = _menu([[_button("✅ Отправить", f"quick_send:{template_id}:{chat_id}")],
+                                [_button("🔙 Назад", f"quick_menu:{chat_id}")]])
+        elif prefix == "quick_send":
+            template_id, chat_id = parts[1], int(parts[2])
+            pending = _interaction_state.pop(user_id, None)
+            if (not pending or pending.get("action") != "quick_confirm"
+                    or pending.get("id") != template_id or pending.get("chat_id") != chat_id):
+                raise ValueError("Подтверждение устарело.")
+            await callback.answer()
+            answered = True
+            await _send_one_reply(callback.message, chat_id, pending["text"])
+            return True
+        else:
+            return False
+        await callback.answer()
+        answered = True
+        await callback.message.edit_text(text, reply_markup=markup, parse_mode="HTML")
+    except (ValueError, RuntimeError) as e:
+        if not answered:
+            await callback.answer(str(e) if isinstance(e, ValueError) and str(e) in {
+                "Шаблон не найден.", "Можно сохранить не более 20 шаблонов.",
+                "Развёрнутый текст слишком длинный.", "Подтверждение устарело."}
+                else "Данные недоступны или не удалось сохранить.", show_alert=True)
+    except Exception as e:
+        logger.warning(f"Communication UI unavailable: {type(e).__name__}.")
+        if not answered:
+            await callback.answer("Данные недоступны или не удалось сохранить.", show_alert=True)
+    return True
+
+
 MAIN_MENU_TEXT = "🎛 <b>Панель управления FunPay</b>\nВыберите действие с помощью кнопок ниже:"
 NOTIFICATIONS_MENU_TEXT = "🔔 <b>Мои настройки уведомлений</b>\nНастройте, о чём вас оповещать (настройки независимые для каждого пользователя):"
 
@@ -497,6 +878,7 @@ NOTIFICATIONS_MENU_TEXT = "🔔 <b>Мои настройки уведомлен�
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
     user_id = message.from_user.id
+    _interaction_state.pop(user_id, None)
     if is_authorized(user_id):
         await message.answer(
             MAIN_MENU_TEXT,
@@ -578,10 +960,15 @@ async def cmd_log(message: Message):
 async def callback_handler(callback: CallbackQuery):
     user_id = callback.from_user.id
     if not is_authorized(user_id):
+        _interaction_state.pop(user_id, None)
         await callback.answer("⛔ Доступ запрещен!", show_alert=True)
         return
 
-    action = callback.data
+    action = callback.data or ""
+    if not action or not action.startswith("quick_send:"):
+        _interaction_state.pop(user_id, None)
+    if await _communication_callback(callback, action, user_id):
+        return
 
     # Включение/выключение автоподнятия (глобальная настройка — влияет на всех)
     if action == "toggle_bump":
@@ -622,7 +1009,8 @@ async def callback_handler(callback: CallbackQuery):
         await callback.answer("Ночной режим включен 😴" if enabled
                               else "Ночной режим выключен")
         try:
-            await callback.message.edit_reply_markup(reply_markup=get_main_keyboard(user_id))
+            text, markup = _night_mode_screen()
+            await callback.message.edit_text(text, reply_markup=markup, parse_mode="HTML")
         except Exception:
             pass
 
@@ -709,13 +1097,75 @@ async def text_handler(message: Message):
     if is_authorized(user_id):
         # Если нажата кнопка вызова контекстного меню
         if message.text == "🛠 Главное меню":
+            _interaction_state.pop(user_id, None)
             await message.answer(
                 MAIN_MENU_TEXT,
                 reply_markup=get_main_keyboard(user_id),
                 parse_mode="HTML"
             )
+            return
+        if message.text == "❌ Отмена":
+            _interaction_state.pop(user_id, None)
+            await message.answer("Отменено.", reply_markup=get_main_keyboard(user_id))
+            return
+        pending = _interaction_state.get(user_id)
+        if pending:
+            if message.text and message.text.startswith("/"):
+                _interaction_state.pop(user_id, None)
+                await message.answer("Действие отменено. Команда не сохранена.")
+                return
+            if pending["action"] == "quick_confirm":
+                await message.answer("Для отправки используйте кнопку «✅ Отправить».")
+                return
+            try:
+                limit = 40 if pending["action"] in {"tpl_add_title", "tpl_title"} else (
+                    2000 if pending["action"] == "reply" else 1000)
+                value = _clean_text(message.text, limit)
+                if pending["action"] in {"tpl_add_text", "tpl_text"}:
+                    _validate_template(value)
+            except ValueError as e:
+                await message.answer(escape(str(e)), parse_mode="HTML")
+                return
+            action = pending["action"]
+            if action == "reply":
+                _interaction_state.pop(user_id, None)
+                await _send_one_reply(message, pending["chat_id"], value)
+                return
+            if action == "tpl_add_title":
+                _interaction_state[user_id] = {**pending, "action": "tpl_add_text", "title": value}
+                await message.answer("✏️ Отправьте текст шаблона (до 1000 символов).",
+                                     reply_markup=_cancel_keyboard("menu"))
+                return
+            try:
+                if action == "night_edit":
+                    _save_global_setting("night_mode_reply", value)
+                    text, markup = _night_mode_screen()
+                elif action == "tpl_add_text":
+                    if len(_templates()) >= 20:
+                        raise ValueError("Можно сохранить не более 20 шаблонов.")
+                    template_id = secrets.token_hex(4)
+                    while _template(template_id) is not None:
+                        template_id = secrets.token_hex(4)
+                    item = {"id": template_id, "title": pending["title"], "text": value}
+                    _save_global_setting("reply_templates", [*_templates(), item])
+                    text, markup = _templates_screen(pending["chat_id"])
+                else:
+                    item = _template(pending["id"])
+                    if item is None:
+                        raise ValueError("Шаблон не найден.")
+                    replacement = {**item, "title" if action == "tpl_title" else "text": value}
+                    _save_global_setting("reply_templates", [replacement if row["id"] == item["id"]
+                                                          else row for row in _templates()])
+                    text, markup = _template_screen(replacement, pending["chat_id"])
+            except Exception as e:
+                logger.warning(f"Communication settings save failed: {type(e).__name__}.")
+                await message.answer("Не удалось сохранить. Настройка не изменилась.")
+                return
+            _interaction_state.pop(user_id, None)
+            await message.answer(text, reply_markup=markup, parse_mode="HTML")
         return
 
+    _interaction_state.pop(user_id, None)
     # Проверяем блокировку до сравнения пароля — не тратим время на сравнение,
     # если пользователь уже заблокирован после превышения лимита попыток.
     if _is_rate_limited(user_id):
