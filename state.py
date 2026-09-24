@@ -95,6 +95,30 @@ class ReviewReceiptStore:
                             connection.execute(f"ALTER TABLE orders ADD COLUMN {name} TEXT")
                         elif order_columns[name][2].upper() != "TEXT":
                             raise StateError("Persistent order schema is incompatible.")
+                    history_columns = {
+                        "buyer_username": "TEXT", "buyer_id": "INTEGER", "chat_id": "INTEGER",
+                        "product_description": "TEXT", "quantity": "INTEGER",
+                        "subcategory_name": "TEXT", "funpay_order_date_local": "TEXT",
+                        "listed_price": "TEXT", "confirmed_currency": "TEXT",
+                    }
+                    for name, sql_type in history_columns.items():
+                        if name not in order_columns:
+                            connection.execute(f"ALTER TABLE orders ADD COLUMN {name} {sql_type}")
+                        elif order_columns[name][2].upper() != sql_type:
+                            raise StateError("Persistent order schema is incompatible.")
+                    connection.execute(
+                        "CREATE TABLE IF NOT EXISTS order_status_observations ("
+                        "order_id TEXT NOT NULL, status TEXT NOT NULL "
+                        "CHECK(status IN ('PAID', 'CLOSED', 'REFUNDED')), "
+                        "first_observed_at INTEGER NOT NULL, "
+                        "PRIMARY KEY(order_id, status))"
+                    )
+                    connection.execute(
+                        "CREATE TABLE IF NOT EXISTS autoresponse_receipts ("
+                        "chat_id INTEGER NOT NULL, message_id INTEGER NOT NULL, "
+                        "rule_id TEXT NOT NULL, claimed_at INTEGER NOT NULL, "
+                        "PRIMARY KEY(chat_id, message_id))"
+                    )
                     # Для уже закрытых заказов последняя запись — лучшее
                     # доступное время закрытия; историю возвратов не выдумываем.
                     connection.execute(
@@ -415,7 +439,10 @@ class ReviewReceiptStore:
 
     def record_order_observation(
         self, order_id: str, status: str, observed_at_utc: int | None = None,
-        *, amount=None, currency=None,
+        *, amount=None, currency=None, buyer_username=None, buyer_id=None,
+        chat_id=None, product_description=None, quantity=None,
+        subcategory_name=None, funpay_order_date_local=None, listed_price=None,
+        confirmed_currency=None,
     ) -> bool:
         """Записывает статус; возвращает True лишь при первом наблюдении CLOSED."""
         self._require_order_id(order_id)
@@ -425,6 +452,29 @@ class ReviewReceiptStore:
             observed_at_utc = int(time.time())
         if type(observed_at_utc) is not int or observed_at_utc < 0:
             raise StateError("Invalid observation time.")
+        def clean_text(value, limit):
+            return value.strip() if type(value) is str and 0 < len(value.strip()) <= limit else None
+
+        def clean_positive_int(value):
+            return value if type(value) is int and value > 0 else None
+
+        def clean_price(value):
+            try:
+                if type(value) in (int, float, Decimal):
+                    parsed = Decimal(str(value))
+                    if parsed.is_finite() and parsed >= 0:
+                        return str(parsed)
+            except InvalidOperation:
+                pass
+            return None
+
+        metadata = (
+            clean_text(buyer_username, 255), clean_positive_int(buyer_id),
+            clean_positive_int(chat_id), clean_text(product_description, 4000),
+            clean_positive_int(quantity), clean_text(subcategory_name, 255),
+            clean_text(funpay_order_date_local, 40), clean_price(listed_price),
+            clean_text(confirmed_currency, 16),
+        )
         recorded_amount = None
         recorded_currency = None
         if status == "CLOSED":
@@ -448,22 +498,92 @@ class ReviewReceiptStore:
                     first_closed = status == "CLOSED" and (previous is None or previous[0] is None)
                     connection.execute(
                         "INSERT INTO orders (order_id, first_seen_at, last_seen_at, "
-                        "current_status, closed_at_utc, amount, currency) "
-                        "VALUES (?, ?, ?, ?, ?, ?, ?) "
+                        "current_status, closed_at_utc, amount, currency, "
+                        "buyer_username, buyer_id, chat_id, product_description, quantity, "
+                        "subcategory_name, funpay_order_date_local, listed_price, confirmed_currency) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
                         "ON CONFLICT(order_id) DO UPDATE SET "
                         "last_seen_at = MAX(orders.last_seen_at, excluded.last_seen_at), "
                         "closed_at_utc = COALESCE(orders.closed_at_utc, excluded.closed_at_utc), "
                         "amount = COALESCE(orders.amount, excluded.amount), "
                         "currency = COALESCE(orders.currency, excluded.currency), "
+                        "buyer_username = COALESCE(orders.buyer_username, excluded.buyer_username), "
+                        "buyer_id = COALESCE(orders.buyer_id, excluded.buyer_id), "
+                        "chat_id = COALESCE(orders.chat_id, excluded.chat_id), "
+                        "product_description = COALESCE(orders.product_description, excluded.product_description), "
+                        "quantity = COALESCE(orders.quantity, excluded.quantity), "
+                        "subcategory_name = COALESCE(orders.subcategory_name, excluded.subcategory_name), "
+                        "funpay_order_date_local = COALESCE(orders.funpay_order_date_local, excluded.funpay_order_date_local), "
+                        "listed_price = COALESCE(orders.listed_price, excluded.listed_price), "
+                        "confirmed_currency = COALESCE(orders.confirmed_currency, excluded.confirmed_currency), "
                         "current_status = CASE WHEN excluded.last_seen_at >= orders.last_seen_at "
                         "THEN excluded.current_status ELSE orders.current_status END",
                         (order_id, observed_at_utc, observed_at_utc, status,
                          observed_at_utc if status == "CLOSED" else None,
-                         recorded_amount, recorded_currency),
+                         recorded_amount, recorded_currency, *metadata),
+                    )
+                    connection.execute(
+                        "INSERT OR IGNORE INTO order_status_observations "
+                        "(order_id, status, first_observed_at) VALUES (?, ?, ?)",
+                        (order_id, status, observed_at_utc),
                     )
                     return first_closed
         except (sqlite3.Error, OSError):
             raise StateError("Persistent order write failed.") from None
+
+    def list_order_history(self, status: str | None = None, page: int = 0) -> tuple[int, list[dict]]:
+        if status not in (None, "CLOSED", "REFUNDED") or type(page) is not int or page < 0:
+            raise StateError("Invalid order history query.")
+        where = " WHERE current_status = ?" if status else ""
+        params = (status,) if status else ()
+        try:
+            with closing(self._connect()) as connection:
+                connection.row_factory = sqlite3.Row
+                with connection:
+                    count = connection.execute("SELECT COUNT(*) FROM orders" + where, params).fetchone()[0]
+                    rows = connection.execute(
+                        "SELECT order_id, current_status, product_description, last_seen_at "
+                        "FROM orders" + where + " ORDER BY last_seen_at DESC, order_id DESC "
+                        "LIMIT 10 OFFSET ?", (*params, page * 10),
+                    ).fetchall()
+                    return count, [dict(row) for row in rows]
+        except (sqlite3.Error, OSError):
+            raise StateError("Persistent order read failed.") from None
+
+    def get_order_history(self, order_id: str) -> dict | None:
+        self._require_order_id(order_id)
+        try:
+            with closing(self._connect()) as connection:
+                connection.row_factory = sqlite3.Row
+                row = connection.execute("SELECT * FROM orders WHERE order_id = ?", (order_id,)).fetchone()
+                if row is None:
+                    return None
+                result = dict(row)
+                result["observed_statuses"] = {
+                    item[0]: item[1] for item in connection.execute(
+                        "SELECT status, first_observed_at FROM order_status_observations WHERE order_id = ?",
+                        (order_id,),
+                    )
+                }
+                return result
+        except (sqlite3.Error, OSError):
+            raise StateError("Persistent order read failed.") from None
+
+    def claim_autoresponse(self, chat_id: int, message_id: int, rule_id: str) -> bool:
+        if (type(chat_id) is not int or chat_id <= 0 or type(message_id) is not int
+                or message_id <= 0 or type(rule_id) is not str
+                or not re.fullmatch(r"[0-9a-f]{8}", rule_id)):
+            raise StateError("Invalid autoresponse identity.")
+        try:
+            with closing(self._connect()) as connection:
+                with connection:
+                    return connection.execute(
+                        "INSERT OR IGNORE INTO autoresponse_receipts "
+                        "(chat_id, message_id, rule_id, claimed_at) VALUES (?, ?, ?, ?)",
+                        (chat_id, message_id, rule_id, int(time.time())),
+                    ).rowcount == 1
+        except (sqlite3.Error, OSError):
+            raise StateError("Persistent autoresponse write failed.") from None
 
     def get_order_statistics(self, now_utc: int | None = None) -> dict[str, dict[str, int]]:
         """Считает только впервые увиденные ботом заказы, по UTC."""

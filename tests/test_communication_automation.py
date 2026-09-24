@@ -156,6 +156,18 @@ class AutomationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.client.sent), 1)
         self.assertIn("if not handled_by_rule:", source)
 
+    async def test_autoresponse_receipt_survives_restart_and_new_message_id(self):
+        self.assertTrue(await runtime["_maybe_autorespond"](self.client, incoming(), {}, {}))
+        self.assertEqual(len(self.client.sent), 1)
+        reopened = ReviewReceiptStore(self.store.path, self.store.legacy_stats_path)
+        reopened.initialize()
+        self.client.review_state = reopened
+        self.assertTrue(await runtime["_maybe_autorespond"](self.client, incoming(), {}, {}))
+        self.assertEqual(len(self.client.sent), 1)
+        self.client.message.id += 1
+        self.assertTrue(await runtime["_maybe_autorespond"](self.client, incoming(), {}, {}))
+        self.assertEqual(len(self.client.sent), 2)
+
     async def test_own_system_unknown_and_timeout(self):
         self.client.message.author_id = 10
         self.client.message.author = "Seller"
