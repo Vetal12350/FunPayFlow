@@ -427,10 +427,7 @@ def on_icon(state: bool) -> str:
 # Постоянная клавиатура внизу экрана (Контекстное меню)
 def get_reply_keyboard():
     return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="🛠 Главное меню")],
-            [KeyboardButton(text="🩺 Статус"), KeyboardButton(text="📊 Статистика")],
-        ],
+        keyboard=[[KeyboardButton(text="🛠 Главное меню")]],
         resize_keyboard=True,
         one_time_keyboard=False,
         is_persistent=True,
@@ -446,6 +443,7 @@ def get_main_keyboard(user_id: int):
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=f"🚀 Автоподнятие лотов: {bump_status}", callback_data="toggle_bump")],
         [InlineKeyboardButton(text="📊 Статистика", callback_data="menu_stats")],
+        [InlineKeyboardButton(text="🩺 Статус", callback_data="menu_status")],
         [InlineKeyboardButton(text="🔔 Мои уведомления", callback_data="menu_notifications")],
         [InlineKeyboardButton(text=f"😴 Ночной режим: {night_status}", callback_data="toggle_night_mode")],
         [InlineKeyboardButton(text="📄 Лог", callback_data="menu_logs")],
@@ -501,78 +499,50 @@ async def cmd_start(message: Message):
         await message.answer("🔒 <b>Доступ закрыт.</b>\nВведите пароль:", parse_mode="HTML")
 
 
+def _status_message_text() -> str:
+    try:
+        return get_runtime_status_text()
+    except Exception as e:
+        logger.warning(f"Status unavailable: {type(e).__name__}.")
+        return "🩺 Состояние бота\nRuntime: недоступно"
+
+
 async def _send_status(message: Message):
     if not is_authorized(message.from_user.id):
         await message.answer("⛔ Доступ запрещен!")
         return
-    try:
-        status_text = get_runtime_status_text()
-    except Exception as e:
-        logger.warning(f"Status unavailable: {type(e).__name__}.")
-        status_text = "🩺 Состояние бота\nRuntime: недоступно"
-    await message.answer(status_text)
+    await message.answer(_status_message_text())
 
 
-async def _read_order_stats() -> dict[str, dict[str, int]]:
+async def _read_legacy_stats(period: str) -> dict:
     store = _runtime_client.review_state if _runtime_client is not None else None
     if store is None:
         raise StateError("Persistent state unavailable.")
-    return await asyncio.to_thread(store.get_order_statistics)
+    return await asyncio.to_thread(store.get_legacy_statistics, period)
 
 
-_STAT_PERIODS = (("Сегодня", "today"), ("7 дней", "7_days"),
-                 ("30 дней", "30_days"), ("За всё время", "all_time"))
+_STATS_PERIOD_TITLES = {
+    "today": "за сегодня",
+    "week": "за неделю",
+    "month": "за месяц",
+}
 
 
-def _format_order_stats(stats: dict[str, dict[str, int]], period_key: str | None = None) -> str:
-    lines = ["📊 Статистика"]
-    for title, key in _STAT_PERIODS:
-        if period_key is not None and key != period_key:
-            continue
-        period = stats[key]
-        lines.extend((
-            "",
-            title,
-            f"🛒 Заказов: {period['orders']}",
-            f"✅ Завершено: {period['closed']}",
-            f"↩️ Возвратов: {period['refunded']}",
-        ))
-    lines.extend(("", "Учитываются заказы, полученные ботом."))
-    return "\n".join(lines)
-
-
-async def _send_stats(message: Message):
-    if not is_authorized(message.from_user.id):
-        await message.answer("⛔ Доступ запрещен!")
-        return
-    try:
-        stats = await _read_order_stats()
-        text = _format_order_stats(stats)
-    except Exception as e:
-        logger.warning(f"Order statistics unavailable: {type(e).__name__}.")
-        await message.answer("📊 Статистика недоступна")
-        return
-    await message.answer(text)
+def format_stats_text(period: str, data: dict) -> str:
+    """Старый компактный layout; оборот содержит только подтверждённые USD."""
+    title = _STATS_PERIOD_TITLES[period]
+    return (
+        f"📊 <b>Статистика {title}</b>\n\n"
+        f"🛒 Заказов: <b>{data['orders_count']}</b>\n"
+        f"🌟 Отзывов: <b>{data['reviews_count']}</b>\n"
+        f"💰 Оборот: <b>{data['usd_turnover']:.2f} $</b>\n"
+        f"🏦 Выводов (архив): <b>{data['withdrawals_count']}</b>"
+    )
 
 
 @dp.message(Command("status"))
 async def cmd_status(message: Message):
     await _send_status(message)
-
-
-@dp.message(Command("stats"))
-async def cmd_stats(message: Message):
-    await _send_stats(message)
-
-
-@dp.message(F.text == "🩺 Статус")
-async def text_status(message: Message):
-    await _send_status(message)
-
-
-@dp.message(F.text == "📊 Статистика")
-async def text_stats(message: Message):
-    await _send_stats(message)
 
 
 @dp.message(Command("log"))
@@ -672,19 +642,24 @@ async def callback_handler(callback: CallbackQuery):
         except Exception:
             pass
 
+    elif action == "menu_status":
+        await callback.answer()
+        await callback.message.answer(_status_message_text())
+
     elif action in ("stats_today", "stats_week", "stats_month"):
-        period = {"stats_today": "today", "stats_week": "7_days",
-                  "stats_month": "30_days"}[action]
+        period = action.removeprefix("stats_")
         try:
-            stats = await _read_order_stats()
-            text = _format_order_stats(stats, period)
+            stats = await _read_legacy_stats(period)
+            text = format_stats_text(period, stats)
         except Exception as e:
             logger.warning(f"Order statistics unavailable: {type(e).__name__}.")
             await callback.answer("Статистика недоступна.", show_alert=True)
             return
         await callback.answer()
         try:
-            await callback.message.edit_text(text, reply_markup=get_stats_keyboard())
+            await callback.message.edit_text(
+                text, reply_markup=get_stats_keyboard(), parse_mode="HTML"
+            )
         except Exception:
             pass
 

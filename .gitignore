@@ -12,6 +12,7 @@ bot.lock
 bot_settings.json
 /state.sqlite3
 /state.sqlite3-*
+/stats_log.json
 
 # Python
 __pycache__/
