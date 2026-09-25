@@ -143,67 +143,132 @@ def _backup_database(path):
     return backup
 
 
+_ORDER_COLUMNS = (
+    "order_id", "first_seen_at", "last_seen_at", "current_status", "closed_at_utc",
+    "amount", "currency", "buyer_username", "buyer_id", "product_description",
+    "subcategory_name", "listed_price", "confirmed_currency", "official_status",
+    "created_at_utc", "paid_at_utc", "refunded_at_utc", "partially_refunded_at_utc",
+    "game_id", "game_name", "section_type_id", "section_local_id", "section_name",
+    "lot_summary", "lot_amount",
+)
+_ORDER_UPDATES = (
+    ("first_seen_at", "MIN(orders.first_seen_at, excluded.first_seen_at)"),
+    ("last_seen_at", "MAX(orders.last_seen_at, excluded.last_seen_at)"),
+    ("current_status", "CASE WHEN excluded.last_seen_at > orders.last_seen_at "
+                       "THEN excluded.current_status ELSE orders.current_status END"),
+    ("closed_at_utc", "COALESCE(excluded.closed_at_utc, orders.closed_at_utc)"),
+    ("amount", "excluded.amount"),
+    ("currency", "excluded.currency"),
+    ("confirmed_currency", "excluded.confirmed_currency"),
+    ("buyer_username", "COALESCE(excluded.buyer_username, orders.buyer_username)"),
+    ("buyer_id", "COALESCE(excluded.buyer_id, orders.buyer_id)"),
+    ("product_description", "COALESCE(orders.product_description, excluded.product_description)"),
+    ("subcategory_name", "COALESCE(orders.subcategory_name, excluded.subcategory_name)"),
+    ("listed_price", "COALESCE(orders.listed_price, excluded.listed_price)"),
+    ("official_status", "excluded.official_status"),
+    ("created_at_utc", "COALESCE(excluded.created_at_utc, orders.created_at_utc)"),
+    ("paid_at_utc", "COALESCE(excluded.paid_at_utc, orders.paid_at_utc)"),
+    ("refunded_at_utc", "COALESCE(excluded.refunded_at_utc, orders.refunded_at_utc)"),
+    ("partially_refunded_at_utc", "COALESCE(excluded.partially_refunded_at_utc, "
+                                  "orders.partially_refunded_at_utc)"),
+    ("game_id", "COALESCE(excluded.game_id, orders.game_id)"),
+    ("game_name", "COALESCE(excluded.game_name, orders.game_name)"),
+    ("section_type_id", "COALESCE(excluded.section_type_id, orders.section_type_id)"),
+    ("section_local_id", "COALESCE(excluded.section_local_id, orders.section_local_id)"),
+    ("section_name", "COALESCE(excluded.section_name, orders.section_name)"),
+    ("lot_summary", "COALESCE(excluded.lot_summary, orders.lot_summary)"),
+    ("lot_amount", "COALESCE(excluded.lot_amount, orders.lot_amount)"),
+)
+_ORDER_INSERT_SQL = (
+    "INSERT INTO orders (" + ", ".join(_ORDER_COLUMNS) + ") VALUES (" +
+    ", ".join("?" for _ in _ORDER_COLUMNS) + ") ON CONFLICT(order_id) DO UPDATE SET " +
+    ", ".join(f"{column} = {expression}" for column, expression in _ORDER_UPDATES)
+)
+_ORDER_COMPARE_SQL = (
+    "WITH incoming (" + ", ".join(_ORDER_COLUMNS) + ") AS (VALUES (" +
+    ", ".join("?" for _ in _ORDER_COLUMNS) + ")) " +
+    "SELECT orders.current_status, (" + " OR ".join(
+        f"orders.{column} IS NOT {expression.replace('excluded.', 'incoming.')}"
+        for column, expression in _ORDER_UPDATES
+    ) + ") FROM orders, incoming WHERE orders.order_id = incoming.order_id"
+)
+
+
+def _order_values(row):
+    times = [row[key] for key in ("created_at", "paid_at", "closed_at",
+                                     "refunded_at", "partially_refunded_at") if row[key] is not None]
+    first_seen, last_seen = min(times), max(times)
+    return (row["order_id"], first_seen, last_seen, row["canonical"], row["closed_at"],
+            row["amount"], row["currency"], row["buyer_username"], row["buyer_id"],
+            row["lot_summary"], row["section_name"], row["amount"], row["currency"],
+            row["status"], row["created_at"], row["paid_at"], row["refunded_at"],
+            row["partially_refunded_at"], row["game_id"], row["game_name"],
+            row["section_type_id"], row["section_local_id"], row["section_name"],
+            row["lot_summary"], row["lot_amount"])
+
+
+def _classify_row(connection, row):
+    """Use the same SQL merge expressions as the writer for a null-safe diff."""
+    existing = connection.execute(_ORDER_COMPARE_SQL, _order_values(row)).fetchone()
+    if existing is None:
+        conflict, order_changed, observations = False, True, {}
+    else:
+        conflict, order_changed = existing[0] != row["canonical"], bool(existing[1])
+        observations = dict(connection.execute(
+            "SELECT status, first_observed_at FROM order_status_observations WHERE order_id = ?",
+            (row["order_id"],)))
+    status_changes = [(status, timestamp) for status, timestamp in
+                      (("PAID", row["paid_at"]), ("CLOSED", row["closed_at"]),
+                       ("REFUNDED", row["refunded_at"]))
+                      if timestamp is not None and observations.get(status) != timestamp]
+    review_changed = False
+    if row["has_review"]:
+        review = (connection.execute(
+            "SELECT rating, time_known FROM review_observations WHERE order_id = ?",
+            (row["order_id"],)).fetchone() if existing is not None else None)
+        if review is None:
+            review_changed = True
+        elif not (review[1] == 1 and review[0] is not None):
+            rating = row["rating"] if row["rating"] is not None else review[0]
+            if rating != review[0]:
+                review_changed = True
+    kind = ("insert" if existing is None else
+            "update" if order_changed or status_changes or review_changed else "unchanged")
+    return kind, conflict, order_changed, status_changes, review_changed
+
+
+def _count_classification(result, kind, conflict):
+    if kind == "insert":
+        result["predicted_inserts"] += 1
+    else:
+        result["potential_existing_matches"] += 1
+        result["conflicts"] += conflict
+        result["predicted_updates" if kind == "update" else "unchanged"] += 1
+
+
 def _apply_batch(connection, rows):
     """One transaction per batch; preserve newer live status and non-null live context."""
+    counts = {"predicted_inserts": 0, "predicted_updates": 0, "unchanged": 0,
+              "potential_existing_matches": 0, "conflicts": 0}
     with connection:
+        connection.execute("BEGIN IMMEDIATE")  # Classify and merge against one write snapshot.
         for row in rows:
-            times = [row[key] for key in ("created_at", "paid_at", "closed_at",
-                                         "refunded_at", "partially_refunded_at") if row[key] is not None]
-            first_seen, last_seen = min(times), max(times)
-            connection.execute(
-                "INSERT INTO orders (order_id, first_seen_at, last_seen_at, current_status, "
-                "closed_at_utc, amount, currency, buyer_username, buyer_id, "
-                "product_description, subcategory_name, listed_price, confirmed_currency, "
-                "official_status, created_at_utc, paid_at_utc, refunded_at_utc, "
-                "partially_refunded_at_utc, game_id, game_name, section_type_id, "
-                "section_local_id, section_name, lot_summary, lot_amount) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
-                "ON CONFLICT(order_id) DO UPDATE SET "
-                "first_seen_at = MIN(orders.first_seen_at, excluded.first_seen_at), "
-                "last_seen_at = MAX(orders.last_seen_at, excluded.last_seen_at), "
-                "current_status = CASE WHEN excluded.last_seen_at > orders.last_seen_at "
-                "THEN excluded.current_status ELSE orders.current_status END, "
-                "closed_at_utc = COALESCE(excluded.closed_at_utc, orders.closed_at_utc), "
-                "amount = excluded.amount, currency = excluded.currency, "
-                "confirmed_currency = excluded.confirmed_currency, "
-                "buyer_username = COALESCE(excluded.buyer_username, orders.buyer_username), "
-                "buyer_id = COALESCE(excluded.buyer_id, orders.buyer_id), "
-                "product_description = COALESCE(orders.product_description, excluded.product_description), "
-                "subcategory_name = COALESCE(orders.subcategory_name, excluded.subcategory_name), "
-                "listed_price = COALESCE(orders.listed_price, excluded.listed_price), "
-                "official_status = excluded.official_status, "
-                "created_at_utc = COALESCE(excluded.created_at_utc, orders.created_at_utc), "
-                "paid_at_utc = COALESCE(excluded.paid_at_utc, orders.paid_at_utc), "
-                "refunded_at_utc = COALESCE(excluded.refunded_at_utc, orders.refunded_at_utc), "
-                "partially_refunded_at_utc = COALESCE(excluded.partially_refunded_at_utc, "
-                "orders.partially_refunded_at_utc), "
-                "game_id = COALESCE(excluded.game_id, orders.game_id), "
-                "game_name = COALESCE(excluded.game_name, orders.game_name), "
-                "section_type_id = COALESCE(excluded.section_type_id, orders.section_type_id), "
-                "section_local_id = COALESCE(excluded.section_local_id, orders.section_local_id), "
-                "section_name = COALESCE(excluded.section_name, orders.section_name), "
-                "lot_summary = COALESCE(excluded.lot_summary, orders.lot_summary), "
-                "lot_amount = COALESCE(excluded.lot_amount, orders.lot_amount)",
-                (row["order_id"], first_seen, last_seen, row["canonical"], row["closed_at"],
-                 row["amount"], row["currency"], row["buyer_username"], row["buyer_id"],
-                 row["lot_summary"], row["section_name"], row["amount"], row["currency"],
-                 row["status"], row["created_at"], row["paid_at"], row["refunded_at"],
-                 row["partially_refunded_at"], row["game_id"], row["game_name"],
-                 row["section_type_id"], row["section_local_id"], row["section_name"],
-                 row["lot_summary"], row["lot_amount"]),
-            )
-            for status, timestamp in (("PAID", row["paid_at"]),
-                                      ("CLOSED", row["closed_at"]),
-                                      ("REFUNDED", row["refunded_at"])):
-                if timestamp is not None:
-                    connection.execute(
-                        "INSERT INTO order_status_observations "
-                        "(order_id, status, first_observed_at) VALUES (?, ?, ?) "
-                        "ON CONFLICT(order_id, status) DO UPDATE SET "
-                        "first_observed_at = excluded.first_observed_at",
-                        (row["order_id"], status, timestamp),
-                    )
-            if row["has_review"]:
+            kind, conflict, order_changed, status_changes, review_changed = _classify_row(
+                connection, row)
+            _count_classification(counts, kind, conflict)
+            if kind == "unchanged":
+                continue
+            if order_changed:
+                connection.execute(_ORDER_INSERT_SQL, _order_values(row))
+            for status, timestamp in status_changes:
+                connection.execute(
+                    "INSERT INTO order_status_observations "
+                    "(order_id, status, first_observed_at) VALUES (?, ?, ?) "
+                    "ON CONFLICT(order_id, status) DO UPDATE SET "
+                    "first_observed_at = excluded.first_observed_at",
+                    (row["order_id"], status, timestamp),
+                )
+            if review_changed:
                 connection.execute(
                     "INSERT INTO review_observations (order_id, observed_at, rating, time_known) "
                     "VALUES (?, 0, ?, 0) ON CONFLICT(order_id) DO UPDATE SET "
@@ -213,6 +278,7 @@ def _apply_batch(connection, rows):
                     "COALESCE(excluded.rating, review_observations.rating) END",
                     (row["order_id"], row["rating"]),
                 )
+    return counts
 
 
 def import_zip(zip_path: Path, db_path: Path = DEFAULT_DB_PATH, *, dry_run=False,
@@ -221,7 +287,7 @@ def import_zip(zip_path: Path, db_path: Path = DEFAULT_DB_PATH, *, dry_run=False
     zip_path, db_path = Path(zip_path), Path(db_path)
     result = {"rows": 0, "unique_order_ids": 0, "parse_errors": 0, "duplicates": 0,
               "potential_existing_matches": 0, "conflicts": 0,
-              "predicted_inserts": 0, "predicted_updates": 0,
+              "predicted_inserts": 0, "predicted_updates": 0, "unchanged": 0,
               "reviews": 0, "ratings": 0, "lot_summaries": 0,
               "statuses": Counter(), "currencies": Counter(),
               "first_date": None, "last_date": None, "backup": None}
@@ -231,6 +297,8 @@ def import_zip(zip_path: Path, db_path: Path = DEFAULT_DB_PATH, *, dry_run=False
     if dry_run:
         connection = (sqlite3.connect(f"file:{db_path.as_posix()}?mode=ro", uri=True)
                       if db_path.exists() else None)
+        if connection is not None:
+            connection.execute("BEGIN")  # One read-only snapshot for all preview counters.
     else:
         db_path.parent.mkdir(parents=True, exist_ok=True)
         backup = _backup_database(db_path)
@@ -278,34 +346,29 @@ def import_zip(zip_path: Path, db_path: Path = DEFAULT_DB_PATH, *, dry_run=False
                                                 min(result["first_date"], first_date))
                         result["last_date"] = (last_date if result["last_date"] is None else
                                                max(result["last_date"], last_date))
-                        existing = None
-                        if connection is not None:
+                        if dry_run:
                             try:
-                                existing = connection.execute(
-                                    "SELECT current_status, last_seen_at FROM orders WHERE order_id = ?",
-                                    (order_id,),
-                                ).fetchone()
+                                kind, conflict = (_classify_row(connection, row)[:2]
+                                                  if connection is not None else ("insert", False))
                             except sqlite3.OperationalError as error:
-                                if dry_run and "no such table" in str(error):
-                                    existing = None
+                                if str(error) == "no such table: orders":
+                                    kind, conflict = "insert", False
                                 else:
                                     raise
-                        if existing:
-                            result["potential_existing_matches"] += 1
-                            result["predicted_updates"] += 1
-                            if existing[0] != row["canonical"]:
-                                result["conflicts"] += 1
+                            _count_classification(result, kind, conflict)
                         else:
-                            result["predicted_inserts"] += 1
-                        if not dry_run:
                             batch.append(row)
                             if len(batch) >= BATCH_SIZE:
-                                _apply_batch(connection, batch)
+                                counts = _apply_batch(connection, batch)
+                                for key, value in counts.items():
+                                    result[key] += value
                                 batch.clear()
                         if progress and result["rows"] % 10000 == 0:
                             progress(result["rows"])
         if batch:
-            _apply_batch(connection, batch)
+            counts = _apply_batch(connection, batch)
+            for key, value in counts.items():
+                result[key] += value
         result["unique_order_ids"] = len(seen)
         for key in ("first_date", "last_date"):
             if result[key] is not None:
