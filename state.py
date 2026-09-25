@@ -105,11 +105,12 @@ _REFUNDS_CTE = (
 )
 _REVIEWS_CTE = (
     "review_source AS ("
-    "SELECT record_key AS order_id, recorded_at AS review_at FROM legacy_stats "
-    "WHERE kind = 'review' "
+    "SELECT l.record_key AS order_id, l.recorded_at AS review_at "
+    "FROM legacy_stats l LEFT JOIN review_observations r ON r.order_id = l.record_key "
+    "WHERE l.kind = 'review' AND r.review_hidden IS NOT 1 "
     "UNION ALL SELECT r.order_id, "
     "CASE WHEN r.time_known = 1 THEN r.observed_at END FROM review_observations r "
-    "WHERE NOT EXISTS (SELECT 1 FROM legacy_stats l "
+    "WHERE r.review_hidden IS NOT 1 AND NOT EXISTS (SELECT 1 FROM legacy_stats l "
     "WHERE l.kind = 'review' AND l.record_key = r.order_id)"
     "), reviews AS (SELECT * FROM review_source WHERE "
     "(? IS NULL OR (review_at >= ? AND review_at < ?)))"
@@ -249,6 +250,10 @@ class ReviewReceiptStore:
                     if "time_known" not in review_columns:
                         connection.execute(
                             "ALTER TABLE review_observations ADD COLUMN time_known INTEGER NOT NULL DEFAULT 1")
+                    if "review_hidden" not in review_columns:
+                        connection.execute(
+                            "ALTER TABLE review_observations ADD COLUMN review_hidden INTEGER "
+                            "CHECK(review_hidden IN (0, 1))")
                     connection.execute(
                         "CREATE TABLE IF NOT EXISTS review_requests ("
                         "order_id TEXT PRIMARY KEY, state TEXT NOT NULL "
@@ -1254,13 +1259,16 @@ class ReviewReceiptStore:
                     (start, now_utc),
                 ).fetchall()
                 archived_reviews = connection.execute(
-                    "SELECT COUNT(*) FROM legacy_stats "
-                    "WHERE kind = 'review' AND recorded_at BETWEEN ? AND ?",
+                    "SELECT COUNT(*) FROM legacy_stats l "
+                    "LEFT JOIN review_observations r ON r.order_id = l.record_key "
+                    "WHERE l.kind = 'review' AND l.recorded_at BETWEEN ? AND ? "
+                    "AND r.review_hidden IS NOT 1",
                     (start, now_utc),
                 ).fetchone()[0]
                 current_reviews = connection.execute(
                     "SELECT COUNT(*) FROM review_observations AS r "
-                    "WHERE r.observed_at BETWEEN ? AND ? AND NOT EXISTS ("
+                    "WHERE r.review_hidden IS NOT 1 AND r.observed_at BETWEEN ? AND ? "
+                    "AND NOT EXISTS ("
                     "SELECT 1 FROM legacy_stats AS l WHERE l.kind = 'review' "
                     "AND l.record_key = r.order_id)",
                     (start, now_utc),

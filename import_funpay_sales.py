@@ -116,7 +116,12 @@ def parse_row(raw):
             lot_amount = None
     rating_text = (raw["review_rating"] or "").strip()
     rating = int(rating_text) if rating_text in {"1", "2", "3", "4", "5"} else None
-    has_review = bool((raw["review_text"] or "").strip() or rating is not None)
+    hidden_text = (raw.get("review_hidden") or "").strip()
+    if hidden_text not in {"", "0", "1"}:
+        raise ValueError("Invalid review visibility flag.")
+    review_hidden = int(hidden_text) if hidden_text else None
+    has_review = bool((raw["review_text"] or "").strip() or rating is not None
+                      or review_hidden == 1)
     return {
         "order_id": raw["order_uid"], "status": raw["status"],
         "canonical": STATUSES[raw["status"]], "amount": str(amount),
@@ -127,7 +132,8 @@ def parse_row(raw):
         "section_local_id": _optional_int(raw["section_local_id"]),
         "section_name": _clean(raw["section_name"]),
         "lot_summary": summary, "lot_amount": lot_amount,
-        "rating": rating, "has_review": has_review, **timestamps,
+        "rating": rating, "review_hidden": review_hidden,
+        "has_review": has_review, **timestamps,
     }
 
 
@@ -222,16 +228,20 @@ def _classify_row(connection, row):
                        ("REFUNDED", row["refunded_at"]))
                       if timestamp is not None and observations.get(status) != timestamp]
     review_changed = False
-    if row["has_review"]:
+    if row["has_review"] or row["review_hidden"] is not None:
         review = (connection.execute(
-            "SELECT rating, time_known FROM review_observations WHERE order_id = ?",
+            "SELECT rating, time_known, review_hidden FROM review_observations "
+            "WHERE order_id = ?",
             (row["order_id"],)).fetchone() if existing is not None else None)
         if review is None:
-            review_changed = True
-        elif not (review[1] == 1 and review[0] is not None):
+            review_changed = row["has_review"]
+        elif row["has_review"] and not (review[1] == 1 and review[0] is not None):
             rating = row["rating"] if row["rating"] is not None else review[0]
             if rating != review[0]:
                 review_changed = True
+        if (review is not None and row["review_hidden"] is not None
+                and row["review_hidden"] != review[2]):
+            review_changed = True
     kind = ("insert" if existing is None else
             "update" if order_changed or status_changes or review_changed else "unchanged")
     return kind, conflict, order_changed, status_changes, review_changed
@@ -270,13 +280,16 @@ def _apply_batch(connection, rows):
                 )
             if review_changed:
                 connection.execute(
-                    "INSERT INTO review_observations (order_id, observed_at, rating, time_known) "
-                    "VALUES (?, 0, ?, 0) ON CONFLICT(order_id) DO UPDATE SET "
+                    "INSERT INTO review_observations "
+                    "(order_id, observed_at, rating, time_known, review_hidden) "
+                    "VALUES (?, 0, ?, 0, ?) ON CONFLICT(order_id) DO UPDATE SET "
                     "rating = CASE WHEN review_observations.time_known = 1 "
                     "AND review_observations.rating IS NOT NULL "
                     "THEN review_observations.rating ELSE "
-                    "COALESCE(excluded.rating, review_observations.rating) END",
-                    (row["order_id"], row["rating"]),
+                    "COALESCE(excluded.rating, review_observations.rating) END, "
+                    "review_hidden = COALESCE(excluded.review_hidden, "
+                    "review_observations.review_hidden)",
+                    (row["order_id"], row["rating"], row["review_hidden"]),
                 )
     return counts
 
