@@ -17,14 +17,17 @@ class AutobumpStartupTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.old_path = ui.SETTINGS_FILE
         self.old_settings = copy.deepcopy(ui.bot_settings)
+        self.old_effective = ui._effective_modules
         ui.SETTINGS_FILE = str(Path(self.tmp.name) / "settings.json")
         ui.bot_settings.clear()
         ui.bot_settings.update(copy.deepcopy(ui._DEFAULT_GLOBAL_SETTINGS))
+        ui.configure_module_runtime(fresh_install=False)
 
     def tearDown(self):
         ui.SETTINGS_FILE = self.old_path
         ui.bot_settings.clear()
         ui.bot_settings.update(self.old_settings)
+        ui._effective_modules = self.old_effective
         self.tmp.cleanup()
 
     def test_on_persisted_ui_and_restart(self):

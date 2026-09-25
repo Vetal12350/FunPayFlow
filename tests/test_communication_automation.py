@@ -34,6 +34,8 @@ runtime = {
     "expand_review_request_text": ui.expand_review_request_text,
     "is_review_request_enabled": ui.is_review_request_enabled,
     "is_safe_mode_enabled": ui.is_safe_mode_enabled,
+    "restart_requested": lambda: False,
+    "module_enabled": ui.module_enabled,
     "_audit_action": ui._audit_action,
     "logger": SimpleNamespace(warning=lambda *args: None, error=lambda *args: None),
 }
@@ -104,10 +106,12 @@ class AutomationTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.original_settings = copy.deepcopy(ui.bot_settings)
+        self.original_effective = ui._effective_modules
         self.original_file = ui.SETTINGS_FILE
         ui.SETTINGS_FILE = str(Path(self.tmp.name) / "settings.json")
         ui.bot_settings.clear()
         ui.bot_settings.update(copy.deepcopy(ui._DEFAULT_GLOBAL_SETTINGS))
+        ui.configure_module_runtime(fresh_install=False)
         ui._interaction_state.clear()
         self.store = ReviewReceiptStore(Path(self.tmp.name) / "state.sqlite3",
                                         Path(self.tmp.name) / "no-legacy.json")
@@ -117,6 +121,7 @@ class AutomationTests(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self):
         ui.bot_settings.clear()
         ui.bot_settings.update(self.original_settings)
+        ui._effective_modules = self.original_effective
         ui.SETTINGS_FILE = self.original_file
         ui._interaction_state.clear()
         self.tmp.cleanup()

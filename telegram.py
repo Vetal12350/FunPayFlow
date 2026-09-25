@@ -21,8 +21,12 @@ from aiogram import Dispatcher, F
 from aiogram.filters import Command
 from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, ReplyKeyboardMarkup, KeyboardButton, FSInputFile
 from funpay import FunPayClient, NIGHT_MODE_MESSAGE_TEXT, NIGHT_MODE_ORDER_TEXT
+from feature_registry import (MODULES_VERSION, all_features, get_feature,
+                              is_feature_enabled, profile_modules, resolve_modules,
+                              validate_modules_config)
 from import_funpay_sales import import_zip
-from state import StateError
+from state import StateError, normalize_reporting_currency
+from runtime_control import claim_restart, restart_requested, signal_restart
 import logger
 
 dp = Dispatcher()
@@ -248,10 +252,24 @@ def get_runtime_status_text() -> str:
 
     try:
         bump = bot_settings["auto_bump"]
-        bump_text = "включено" if bump is True else "выключено" if bump is False else "недоступно"
+        bump_text = ("модуль отключён" if not module_enabled("autobump") else
+                     "включено" if bump is True else "выключено" if bump is False else "недоступно")
     except Exception as e:
         logger.warning(f"Status autobump setting unavailable: {type(e).__name__}.")
         bump_text = "недоступно"
+
+    night_text = ("модуль отключён" if not module_enabled("night_mode") else
+                  "включён" if is_night_mode_enabled() else "выключен")
+    request_text = ("модуль отключён" if not module_enabled("review_request") else
+                    "включён" if is_review_request_enabled() else "выключен")
+    if not module_enabled("withdrawals"):
+        withdrawal_text = "модуль отключён"
+    elif _withdrawal_failures:
+        withdrawal_text = "ошибок подряд " + str(_withdrawal_failures)
+    elif _last_withdrawal_success_monotonic is not None:
+        withdrawal_text = "последняя проверка успешна"
+    else:
+        withdrawal_text = "ещё не проверялось"
 
     lines = [
         "🩺 Состояние бота",
@@ -267,15 +285,13 @@ def get_runtime_status_text() -> str:
         f"SQLite: {persistent}",
         f"Ожидающих запросов отзыва: {pending if pending is not None else 'недоступно'}",
         f"Автоподнятие: {bump_text}",
-        f"Night Mode: {'включён' if is_night_mode_enabled() else 'выключен'}",
-        f"Запрос отзыва: {'включён' if is_review_request_enabled() else 'выключен'}",
+        f"Night Mode: {night_text}",
+        f"Запрос отзыва: {request_text}",
         f"SAFE_MODE: {'включён' if is_safe_mode_enabled() else 'выключен'}",
-        "Withdrawal polling: " + ("ошибок подряд " + str(_withdrawal_failures)
-                                 if _withdrawal_failures else "последняя проверка успешна"
-                                 if _last_withdrawal_success_monotonic is not None
-                                 else "ещё не проверялось"),
+        f"Withdrawal polling: {withdrawal_text}",
+        f"🧩 Модули: {sum(_effective_modules.values())}/{len(_effective_modules)} включено",
     ]
-    if _last_withdrawal_success_monotonic is not None:
+    if module_enabled("withdrawals") and _last_withdrawal_success_monotonic is not None:
         lines.append("Последняя успешная проверка выводов: " +
                      _elapsed_since(_last_withdrawal_success_monotonic, now))
     category = health.get("last_failure_category")
@@ -310,10 +326,14 @@ _DEFAULT_GLOBAL_SETTINGS: dict = {
     "authorized_user_ids": [],
     # OLD production-аккаунт был USD; это явная account-level настройка статистики.
     "stats_currency": "USD",
+    "primary_currency": None,
     "night_mode_reply": None,
     "review_request_enabled": False,
     "review_request_text": DEFAULT_REVIEW_REQUEST_TEXT,
     "review_request_delay_seconds": DEFAULT_REVIEW_REQUEST_DELAY_SECONDS,
+    "modules_version": MODULES_VERSION,
+    "setup_completed": True,
+    "modules": profile_modules("all"),
 }
 
 # Дефолтные персональные настройки — используются при первой авторизации нового пользователя
@@ -328,6 +348,11 @@ _DEFAULT_USER_SETTINGS: dict = {
 
 # Глобальные настройки бота (авто-подъём, список авторизованных)
 bot_settings: dict = dict(_DEFAULT_GLOBAL_SETTINGS)
+bot_settings["modules"] = profile_modules("all")
+_effective_modules = resolve_modules(bot_settings["modules"])
+_module_drafts: dict[int, dict] = {}
+_analytics_currency_filters: dict[int, str] = {}
+_restart_confirmations: dict[int, str] = {}
 _night_mode_state_lock = threading.Lock()
 _night_reply_echoes = deque([NIGHT_MODE_MESSAGE_TEXT, NIGHT_MODE_ORDER_TEXT], maxlen=8)
 _interaction_state: dict[int, dict] = {}
@@ -404,6 +429,15 @@ def load_settings() -> None:
                 raise ValueError("Invalid user settings.")
         if any(type(saved[key]) is not bool for key in _DEFAULT_USER_SETTINGS if key in saved):
             raise ValueError("Invalid legacy settings.")
+        if (type(saved.get("modules_version", MODULES_VERSION)) is not int
+                or saved.get("modules_version", MODULES_VERSION) != MODULES_VERSION
+                or type(saved.get("setup_completed", True)) is not bool):
+            raise ValueError("Invalid modules metadata.")
+        setup_completed = saved.get("setup_completed", True)
+        loaded_modules = validate_modules_config(
+            saved.get("modules", profile_modules("all") if setup_completed else {}),
+            fresh_default=not setup_completed,
+        )
         custom_reply = saved.get("night_mode_reply")
         if (custom_reply is not None and (type(custom_reply) is not str or not custom_reply.strip()
                                           or len(custom_reply) > 1000)):
@@ -447,14 +481,20 @@ def load_settings() -> None:
         # Загружаем глобальные ключи
         bot_settings.clear()
         bot_settings.update(_DEFAULT_GLOBAL_SETTINGS)
+        bot_settings["modules"] = profile_modules("all")
         for key in _DEFAULT_GLOBAL_SETTINGS:
             if key in saved:
                 bot_settings[key] = saved[key]
+        bot_settings["modules"] = loaded_modules
+        bot_settings["setup_completed"] = setup_completed
         bot_settings["safe_mode"] = saved.get("safe_mode", False)
-        configured_currency = bot_settings.get("stats_currency")
-        if (type(configured_currency) is not str
-                or not re.fullmatch(r"[A-Z]{3}", configured_currency)):
+        try:
+            primary = saved.get("primary_currency", saved.get("stats_currency", "USD"))
+            bot_settings["primary_currency"] = normalize_reporting_currency(primary)
+            bot_settings["stats_currency"] = bot_settings["primary_currency"]
+        except StateError:
             # Некорректная явная настройка не должна молча превращаться в USD.
+            bot_settings["primary_currency"] = None
             bot_settings["stats_currency"] = None
 
         # Загружаем персональные настройки пользователей
@@ -481,16 +521,23 @@ def save_settings(*, required: bool = False) -> None:
     """Атомарно сохраняет настройки; required не скрывает ошибку записи."""
     temporary_path = None
     try:
+        modules = validate_modules_config(
+            bot_settings["modules"], fresh_default=not bot_settings["setup_completed"]
+        )
         data = {
             "auto_bump": bot_settings["auto_bump"],
             "night_mode": bot_settings["night_mode"],
             "safe_mode": bot_settings["safe_mode"],
             "authorized_user_ids": bot_settings["authorized_user_ids"],
             "stats_currency": bot_settings["stats_currency"],
+            "primary_currency": bot_settings["primary_currency"],
             "night_mode_reply": bot_settings["night_mode_reply"],
             "review_request_enabled": bot_settings["review_request_enabled"],
             "review_request_text": bot_settings["review_request_text"],
             "review_request_delay_seconds": bot_settings["review_request_delay_seconds"],
+            "modules_version": MODULES_VERSION,
+            "setup_completed": bot_settings["setup_completed"],
+            "modules": modules,
             "user_settings": {
                 str(uid): sett for uid, sett in _user_settings.items()
             },
@@ -625,6 +672,73 @@ def enable_autobump_on_startup() -> None:
 
 
 load_settings()
+_effective_modules = resolve_modules(
+    bot_settings["modules"] if bot_settings["setup_completed"] else {},
+    fresh_default=not bot_settings["setup_completed"],
+)
+
+
+def configure_module_runtime(*, fresh_install: bool) -> None:
+    """Freeze this process's effective modules before runtime tasks are created."""
+    global _effective_modules
+    if fresh_install and not os.path.exists(SETTINGS_FILE):
+        bot_settings["setup_completed"] = False
+        bot_settings["modules"] = profile_modules("all")
+        # Currency is configured independently in Statistics or Analytics.
+        bot_settings["stats_currency"] = None
+        bot_settings["primary_currency"] = None
+    if not bot_settings["setup_completed"]:
+        _effective_modules = resolve_modules({}, fresh_default=True)
+    else:
+        _effective_modules = resolve_modules(bot_settings["modules"])
+    if not module_enabled("withdrawals"):
+        _clear_problem("WITHDRAWAL_REPEATED")
+
+
+def effective_modules():
+    return _effective_modules
+
+
+def module_enabled(feature_id: str) -> bool:
+    return is_feature_enabled(_effective_modules, feature_id)
+
+
+def _owner_id(user_id: int) -> bool:
+    admin_id = os.getenv("ADMIN_ID", "")
+    return admin_id.isdecimal() and int(admin_id) == user_id
+
+
+def _action_feature(action: str) -> str | None:
+    """One guard for old buttons and direct callback paths."""
+    prefix = action.split(":", 1)[0]
+    if action == "toggle_bump":
+        return "autobump"
+    if prefix in {"menu_notifications"} or action.startswith("notif_"):
+        return "notifications"
+    if prefix in {"menu_night_mode", "night_edit", "night_reset", "toggle_night_mode"} or action == "cancel:night":
+        return "night_mode"
+    if prefix in {"review_menu", "review_toggle", "review_edit", "review_delay", "review_reset"} or action.startswith("review_") or action == "cancel:review":
+        return "review_request"
+    if prefix in {"orders", "ord_list", "ord_open"}:
+        return "order_history"
+    if action == "menu_stats" or action.startswith("stats_"):
+        return "statistics"
+    if action == "currency_open:stats":
+        return "statistics"
+    if action == "currency_open:analytics":
+        return "sales_analytics"
+    if prefix in {"analytics", "ana_over", "ana_top", "ana_buy", "ana_reviews",
+                  "ana_time", "ana_records", "ana_currency"}:
+        return "sales_analytics"
+    if action.startswith("sales_import_"):
+        return "sales_import"
+    if action in {"menu_logs", "log_today", "log_yesterday"}:
+        return "logs_ui"
+    return None
+
+
+_MODULE_OFF_TEXT = ("⚠️ Этот модуль отключён. Измените настройки в "
+                    "🧩 Модули и перезапустите бота.")
 
 # Восстанавливаем authorized_users из сохранённых настроек
 authorized_users: set[int] = set(bot_settings.get("authorized_user_ids", []))
@@ -707,19 +821,28 @@ def get_reply_keyboard():
 def get_main_keyboard(user_id: int):
     bump_status = on_icon(bot_settings["auto_bump"])
     night_status = on_icon(bot_settings["night_mode"])
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"🚀 Автоподнятие лотов: {bump_status}", callback_data="toggle_bump")],
-        [InlineKeyboardButton(text="📊 Статистика", callback_data="menu_stats")],
-        [InlineKeyboardButton(text="📈 Аналитика", callback_data="analytics")],
-        [InlineKeyboardButton(text="📦 Заказы", callback_data="orders")],
-        [InlineKeyboardButton(text="🩺 Статус", callback_data="menu_status")],
-        [InlineKeyboardButton(text="⚙️ Система", callback_data="system")],
-        [InlineKeyboardButton(text="🔔 Мои уведомления", callback_data="menu_notifications")],
-        [InlineKeyboardButton(text=f"😴 Ночной режим: {night_status}", callback_data="menu_night_mode")],
-        [InlineKeyboardButton(text="⭐ Запрос отзыва", callback_data="review_menu")],
-        [InlineKeyboardButton(text="📄 Лог", callback_data="menu_logs")],
-    ])
-    return keyboard
+    rows = []
+    if module_enabled("autobump"):
+        rows.append([_button(f"🚀 Автоподнятие лотов: {bump_status}", "toggle_bump")])
+    if module_enabled("statistics"):
+        rows.append([_button("📊 Статистика", "menu_stats")])
+    if module_enabled("sales_analytics"):
+        rows.append([_button("📈 Аналитика", "analytics")])
+    if module_enabled("order_history"):
+        rows.append([_button("📦 Заказы", "orders")])
+    rows.extend([[_button("🩺 Статус", "menu_status")], [_button("⚙️ Система", "system")]])
+    if module_enabled("notifications"):
+        rows.append([_button("🔔 Мои уведомления", "menu_notifications")])
+    if module_enabled("night_mode"):
+        rows.append([_button(f"😴 Ночной режим: {night_status}", "menu_night_mode")])
+    if module_enabled("review_request"):
+        rows.append([_button("⭐ Запрос отзыва", "review_menu")])
+    if module_enabled("logs_ui"):
+        rows.append([_button("📄 Лог", "menu_logs")])
+    if _owner_id(user_id):
+        rows.append([_button("🧩 Модули", "modules_open")])
+        rows.append([_button("🔄 Перезапустить бота", "restart_open")])
+    return _menu(rows)
 
 
 def get_logs_keyboard():
@@ -730,13 +853,17 @@ def get_logs_keyboard():
     ])
 
 
-def get_stats_keyboard():
-    return InlineKeyboardMarkup(inline_keyboard=[
+def get_stats_keyboard(user_id: int | None = None):
+    rows = [
         [InlineKeyboardButton(text="📅 Сегодня", callback_data="stats_today")],
         [InlineKeyboardButton(text="🗓 Неделя", callback_data="stats_week")],
         [InlineKeyboardButton(text="🗓 Месяц", callback_data="stats_month")],
-        [InlineKeyboardButton(text="🔙 Назад", callback_data="menu_main")],
-    ])
+    ]
+    if user_id is not None and _owner_id(user_id):
+        rows.append([InlineKeyboardButton(text="💱 Валюта по умолчанию",
+                                          callback_data="currency_open:stats")])
+    rows.append([InlineKeyboardButton(text="🔙 Назад", callback_data="menu_main")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 # Подменю уведомлений — полностью персональное для каждого пользователя.
@@ -1046,17 +1173,50 @@ async def _orders_callback(callback: CallbackQuery, action: str, user_id: int) -
 
 _ANALYTICS_PERIODS = {"today": "Сегодня", "7d": "7 дней",
                       "30d": "30 дней", "all": "Всё время"}
+_ANALYTICS_ONE_DAY_PERIODS = frozenset({"today"})
 _ANALYTICS_NOTE = "ℹ️ Аналитика строится по всей известной истории продаж."
 
 
-def _analytics_money(value) -> str:
+_CURRENCY_SYMBOLS = {"USD": "$", "EUR": "€", "GBP": "£", "UAH": "₴"}
+
+
+def _reporting_currency() -> str:
+    return normalize_reporting_currency(
+        bot_settings.get("primary_currency") or bot_settings.get("stats_currency"))
+
+
+def _primary_currency_or_none() -> str | None:
+    try:
+        return _reporting_currency()
+    except StateError:
+        return None
+
+
+def _currency_required_screen(section: str, user_id: int):
+    label = "Статистика" if section == "stats" else "Аналитика продаж"
+    rows = []
+    if _owner_id(user_id):
+        rows.append([_button("💱 Настроить валюту", f"currency_open:{section}")])
+    owner_note = ("" if _owner_id(user_id) else
+                  "\nПопросите владельца настроить валюту по умолчанию.")
+    rows.append([_button("🔙 Назад", "menu_main")])
+    return (f"📊 <b>{label}</b>\nВалюта по умолчанию ещё не настроена. "
+            "Исторические валюты заказов не изменятся." + owner_note, _menu(rows))
+
+
+def _currency_display(currency: str | None = None) -> str:
+    currency = currency or _reporting_currency()
+    return _CURRENCY_SYMBOLS.get(currency, currency)
+
+
+def _analytics_money(value, currency: str | None = None) -> str:
     if value is None:
         return "нет данных"
     amount = Decimal(str(value))
     with localcontext() as context:
         context.prec = max(context.prec, len(amount.as_tuple().digits) + 4)
         amount = amount.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-    return f"{amount:.2f} $"
+    return f"{amount:.2f} {_currency_display(currency)}"
 
 
 def _analytics_percent(numerator: int, denominator: int) -> str:
@@ -1093,28 +1253,38 @@ def _analytics_sections(period: str):
     ]
 
 
-def _analytics_keyboard(period: str, *, detail=False):
+def _analytics_keyboard(period: str, *, detail=False, selected=None,
+                        currencies=(), user_id=None):
     if detail:
         return _menu([[_button("🔙 К аналитике", f"ana_over:{period}")]])
-    return _menu([
+    rows = [
         [_button("📅 Сегодня", "ana_over:today"), _button("🗓 7 дней", "ana_over:7d")],
         [_button("🗓 30 дней", "ana_over:30d"), _button("♾ Всё время", "ana_over:all")],
-        *_analytics_sections(period),
-        [_button("📥 Импорт продаж", "sales_import_open")],
-        [_button("🔙 Назад", "menu_main")],
-    ])
+    ]
+    choices = list(currencies) + ["all"]
+    rows.extend([[_button(("✅ " if selected == code else "") +
+                          ("Все" if code == "all" else code),
+                          f"ana_currency:{code}:{period}") for code in choices[index:index + 3]]
+                 for index in range(0, len(choices), 3)])
+    rows.extend(_analytics_sections(period))
+    if user_id is not None and _owner_id(user_id):
+        rows.append([_button("⚙️ Валюта по умолчанию", "currency_open:analytics")])
+    if module_enabled("sales_import"):
+        rows.append([_button("📥 Импорт продаж", "sales_import_open")])
+    rows.append([_button("🔙 Назад", "menu_main")])
+    return _menu(rows)
 
 
-def _analytics_overview_text(period: str, data: dict) -> str:
+def _analytics_overview_text(period: str, data: dict, currency: str | None = None) -> str:
     turnover = data["usd_turnover"]
     average = (Decimal(turnover) / data["usd_orders"]
                if turnover is not None and data["usd_orders"] else None)
     lines = [
         f"📈 <b>Аналитика продаж · {_ANALYTICS_PERIODS[period]}</b>", "",
         f"🛒 Заказов: {data['orders']}" + _analytics_change(data["orders"], data["previous_orders"]),
-        f"💰 Оборот: {_analytics_money(turnover)}" +
+        f"💰 Оборот: {_analytics_money(turnover, currency)}" +
         _analytics_change(turnover, data["previous_usd_turnover"]),
-        f"💵 Средний чек: {_analytics_money(average)}",
+        f"💵 Средний чек: {_analytics_money(average, currency)}",
         f"↩️ Возвратов: {data['refunds']}",
         f"⭐ Отзывов: {data['reviews']}",
         f"👥 Покупателей: {data['buyers']}",
@@ -1133,17 +1303,17 @@ def _analytics_overview_text(period: str, data: dict) -> str:
     if expensive:
         lines += ["", "💎 Самый дорогой заказ:",
                   f"{_analytics_product(expensive['product'])} — "
-                  f"{_analytics_money(expensive['usd_amount'])}"]
+                  f"{_analytics_money(expensive['usd_amount'], currency)}"]
     else:
         lines += ["", "💎 Самый дорогой заказ: нет данных"]
     top_money = data["top_turnover_product"]
     if top_money:
         lines += ["", "💰 Больше всего подтверждённого оборота:",
                   f"{_analytics_product(top_money['product'])} — "
-                  f"{_analytics_money(top_money['usd_turnover'])}"]
+                  f"{_analytics_money(top_money['usd_turnover'], currency)}"]
     best = data["best_day"]
-    if best:
-        money = (" / " + _analytics_money(best["usd_turnover"])
+    if best and period not in _ANALYTICS_ONE_DAY_PERIODS:
+        money = (" / " + _analytics_money(best["usd_turnover"], currency)
                  if best["usd_turnover"] is not None else "")
         lines += ["", "📅 Лучший день продаж:",
                   f"{best['day']} — {best['orders']} заказов{money}"]
@@ -1151,12 +1321,15 @@ def _analytics_overview_text(period: str, data: dict) -> str:
     return "\n".join(lines)
 
 
-def _analytics_top_text(period: str, sort: str, rows: list[dict]) -> str:
+def _analytics_top_text(period: str, sort: str, rows: list[dict],
+                        currency: str | None = None) -> str:
     mode = "по продажам" if sort == "count" else "по обороту"
     lines = [f"🏆 <b>Топ товаров · {_ANALYTICS_PERIODS[period]} · {mode}</b>", ""]
     for index, row in enumerate(rows, 1):
         lines.append(f"{index}. {_analytics_product(row['product'])}")
-        lines.append(f"   🛒 {row['orders']} · 💰 {_analytics_money(row['usd_turnover'])}")
+        lines.append(f"   🛒 {row['orders']}" +
+                     (f" · 💰 {_analytics_money(row['usd_turnover'], currency)}"
+                      if currency != "all" else ""))
         lines.append("")
     if not rows:
         lines.append("Нет данных для выбранного периода.")
@@ -1186,19 +1359,20 @@ def _analytics_reviews_text(period: str, data: dict) -> str:
     return "\n".join(lines)
 
 
-def _analytics_time_text(period: str, data: dict) -> str:
+def _analytics_time_text(period: str, data: dict,
+                         currency: str | None = None) -> str:
     lines = [f"📅 <b>По времени · {_ANALYTICS_PERIODS[period]}</b>",
              "Местное время сервера.", ""]
     best = data["best_day"]
-    if best:
+    if best and period not in _ANALYTICS_ONE_DAY_PERIODS:
         lines += ["🏆 Лучший день продаж:",
                   f"{best['day']} — {best['orders']} заказов" +
-                  (" / " + _analytics_money(best["usd_turnover"])
-                   if best["usd_turnover"] is not None else "")]
+                  (" / " + _analytics_money(best["usd_turnover"], currency)
+                   if best["usd_turnover"] is not None and currency != "all" else "")]
     best_money = data["best_turnover_day"]
-    if best_money:
+    if best_money and currency != "all" and period not in _ANALYTICS_ONE_DAY_PERIODS:
         lines += ["", "💰 Максимум подтверждённого оборота за день:",
-                  f"{best_money['day']} — {_analytics_money(best_money['usd_turnover'])}"]
+                  f"{best_money['day']} — {_analytics_money(best_money['usd_turnover'], currency)}"]
     if not best:
         lines.append("Нет известных дат продаж.")
     weekdays = ("Воскресенье", "Понедельник", "Вторник", "Среда", "Четверг",
@@ -1214,26 +1388,30 @@ def _analytics_time_text(period: str, data: dict) -> str:
     return "\n".join(lines)
 
 
-def _analytics_records_text(data: dict) -> str:
+def _analytics_records_text(data: dict, currency: str | None = None) -> str:
     lines = ["🏅 <b>Рекорды · вся известная история</b>"]
     expensive = data["most_expensive"]
-    if expensive:
+    if expensive and currency != "all":
         lines += ["", "💎 Самый дорогой заказ:",
                   f"{_analytics_product(expensive['product'])} — "
-                  f"{_analytics_money(expensive['usd_amount'])}"]
+                  f"{_analytics_money(expensive['usd_amount'], currency)}"]
     for key, label in (("top_product", "🏆 Самый продаваемый товар"),
                        ("top_turnover_product", "💰 Товар с максимальным оборотом")):
+        if currency == "all" and key == "top_turnover_product":
+            continue
         row = data[key]
         if row:
             value = (f"{row['orders']} заказов" if key == "top_product"
-                     else _analytics_money(row["usd_turnover"]))
+                     else _analytics_money(row["usd_turnover"], currency))
             lines += ["", label + ":", f"{_analytics_product(row['product'])} — {value}"]
     for key, label in (("best_day", "📅 Максимум замеченных закрытий за день"),
                        ("best_turnover_day", "💵 Максимальный оборот за день наблюдения")):
+        if currency == "all" and key == "best_turnover_day":
+            continue
         row = data[key]
         if row:
             value = (f"{row['orders']} заказов" if key == "best_day"
-                     else _analytics_money(row["usd_turnover"]))
+                     else _analytics_money(row["usd_turnover"], currency))
             lines += ["", label + ":", f"{row['day']} — {value}"]
     top_buyer = data["top_buyer"]
     if top_buyer:
@@ -1247,44 +1425,121 @@ def _analytics_records_text(data: dict) -> str:
     return "\n".join(lines)
 
 
+def _analytics_all_overview_text(period: str, data: dict,
+                                 turnover_by_currency: dict[str, str]) -> str:
+    """Combined counts with independent money blocks; no mixed average/rank."""
+    lines = [f"📈 <b>Аналитика продаж · {_ANALYTICS_PERIODS[period]}</b>",
+             "💱 Все валюты", "",
+             f"🛒 Заказов: {data['orders']}",
+             "💰 Оборот:"]
+    lines.extend(f"• {code}: {_analytics_money(amount, code)}"
+                 for code, amount in turnover_by_currency.items())
+    if not turnover_by_currency:
+        lines.append("• нет подтверждённых сумм")
+    lines.extend([f"↩️ Возвратов: {data['refunds']}",
+                  f"⭐ Отзывов: {data['reviews']}",
+                  f"👥 Покупателей: {data['buyers']}",
+                  f"🔁 Повторных: {data['repeat_buyers']}"])
+    if data.get("partial_refunds"):
+        lines.append(f"↪️ Частичных возвратов: {data['partial_refunds']}")
+    if data["terminal_orders"]:
+        lines.append("Доля возвратов среди завершённых/возвращённых: " +
+                     _analytics_percent(data["refunds"], data["terminal_orders"]))
+    top = data["top_product"]
+    if top:
+        lines += ["", "🏆 Самый популярный по количеству:",
+                  f"{_analytics_product(top['product'])} — {top['orders']} заказов"]
+    if data["best_day"] and period not in _ANALYTICS_ONE_DAY_PERIODS:
+        best = data["best_day"]
+        lines += ["", "📅 Лучший день продаж:",
+                  f"{best['day']} — {best['orders']} заказов"]
+    lines += ["", "Количество — все продажи; деньги — отдельно по валюте заказа.",
+              _ANALYTICS_NOTE]
+    return "\n".join(lines)
+
+
 async def _analytics_callback(callback: CallbackQuery, action: str) -> bool:
     prefix = action.split(":", 1)[0]
     if prefix not in {"analytics", "ana_over", "ana_top", "ana_buy", "ana_reviews",
-                      "ana_time", "ana_records"}:
+                      "ana_time", "ana_records", "ana_currency"}:
         return False
     answered = False
     try:
+        user_id = getattr(getattr(callback, "from_user", None), "id", 0)
+        primary = _primary_currency_or_none()
+        if primary is None:
+            text, markup = _currency_required_screen("analytics", user_id)
+            await callback.answer()
+            await callback.message.edit_text(text, reply_markup=markup, parse_mode="HTML")
+            return True
         parts = action.split(":")
         store = _orders_store()
+        currencies = await asyncio.to_thread(store.get_sales_currencies)
+        default = primary if primary in currencies else (currencies[0] if currencies else primary)
         if action == "analytics":
-            text = "📈 <b>Аналитика продаж</b>\nВыберите период или раздел.\n\n" + _ANALYTICS_NOTE
-            markup = _analytics_keyboard("30d")
+            _analytics_currency_filters.pop(user_id, None)
+        currency = _analytics_currency_filters.get(user_id, default)
+        if currency != "all" and currency not in currencies:
+            currency = default
+        if prefix == "ana_currency" and len(parts) == 3 and parts[2] in _ANALYTICS_PERIODS:
+            selected = parts[1]
+            if selected != "all" and selected not in currencies:
+                raise ValueError("Unknown historical currency.")
+            _analytics_currency_filters[user_id] = selected
+            currency = selected
+            action = f"ana_over:{parts[2]}"
+            parts = action.split(":")
+            prefix = "ana_over"
+        if action == "analytics":
+            text = ("📈 <b>Аналитика продаж</b>\n"
+                    f"💱 Валюта: {'Все' if currency == 'all' else currency}\n"
+                    "Выберите период или раздел. Количество — вся история; "
+                    "деньги — выбранная валюта.\n\n" + _ANALYTICS_NOTE)
+            markup = _analytics_keyboard("30d", selected=currency, currencies=currencies,
+                                         user_id=user_id)
         elif action == "ana_records":
-            data = await asyncio.to_thread(store.get_sales_records)
-            text, markup = _analytics_records_text(data), _analytics_keyboard("30d", detail=True)
+            data = await asyncio.to_thread(store.get_sales_records,
+                                           primary if currency == "all" else currency)
+            text, markup = _analytics_records_text(data, currency), _analytics_keyboard("30d", detail=True)
         elif len(parts) in (2, 3) and parts[1] in _ANALYTICS_PERIODS:
             period = parts[1]
+            query_currency = primary if currency == "all" else currency
             if prefix == "ana_over" and len(parts) == 2:
-                data = await asyncio.to_thread(store.get_sales_overview, period)
-                text, markup = _analytics_overview_text(period, data), _analytics_keyboard(period)
+                data = await asyncio.to_thread(store.get_sales_overview,
+                                               period, currency=query_currency)
+                if currency == "all":
+                    amounts = await asyncio.to_thread(store.get_sales_turnover_by_currency, period)
+                    text = _analytics_all_overview_text(period, data, amounts)
+                else:
+                    text = _analytics_overview_text(period, data, currency)
+                    if len(currencies) > 1:
+                        text = (f"💱 Валюта денег: {currency}\n" + text +
+                                "\nКоличество и отзывы — все продажи периода.")
+                markup = _analytics_keyboard(period, selected=currency, currencies=currencies,
+                                             user_id=user_id)
             elif prefix == "ana_top" and len(parts) == 3 and parts[2] in ("count", "turnover"):
                 sort = parts[2]
-                data = await asyncio.to_thread(store.get_sales_top_products, period, sort)
-                text = _analytics_top_text(period, sort, data)
-                markup = _menu([
-                    [_button("🛒 По продажам", f"ana_top:{period}:count"),
-                     _button("💰 По обороту", f"ana_top:{period}:turnover")],
-                    [_button("🔙 Назад", f"ana_over:{period}")],
-                ])
+                if currency == "all" and sort == "turnover":
+                    raise ValueError("Cross-currency turnover ranking is unavailable.")
+                data = await asyncio.to_thread(store.get_sales_top_products,
+                                               period, sort, currency=query_currency)
+                text = _analytics_top_text(period, sort, data, currency)
+                rows = ([] if currency == "all" else
+                        [[_button("🛒 По продажам", f"ana_top:{period}:count"),
+                          _button("💰 По обороту", f"ana_top:{period}:turnover")]])
+                markup = _menu(rows + [[_button("🔙 Назад", f"ana_over:{period}")]])
             elif prefix == "ana_buy" and len(parts) == 2:
-                data = await asyncio.to_thread(store.get_sales_buyers, period)
+                data = await asyncio.to_thread(store.get_sales_buyers,
+                                               period, currency=query_currency)
                 text, markup = _analytics_buyers_text(period, data), _analytics_keyboard(period, detail=True)
             elif prefix == "ana_reviews" and len(parts) == 2:
-                data = await asyncio.to_thread(store.get_sales_reviews, period)
+                data = await asyncio.to_thread(store.get_sales_reviews,
+                                               period, currency=query_currency)
                 text, markup = _analytics_reviews_text(period, data), _analytics_keyboard(period, detail=True)
             elif prefix == "ana_time" and len(parts) == 2:
-                data = await asyncio.to_thread(store.get_sales_by_time, period)
-                text, markup = _analytics_time_text(period, data), _analytics_keyboard(period, detail=True)
+                data = await asyncio.to_thread(store.get_sales_by_time,
+                                               period, currency=query_currency)
+                text, markup = _analytics_time_text(period, data, currency), _analytics_keyboard(period, detail=True)
             else:
                 raise ValueError("Invalid analytics action.")
         else:
@@ -1389,6 +1644,11 @@ def _sales_import_preview(report: dict) -> str:
     last = datetime.strptime(report["last_date"], "%Y-%m-%d").strftime("%d.%m.%Y")
     unchanged = (f"✅ Без изменений: {report['unchanged']}\n"
                  if report.get("unchanged") else "")
+    try:
+        currency = _reporting_currency()
+        currency_line = f"💵 {currency}: {report['currencies'].get(currency, 0)}\n"
+    except StateError:
+        currency_line = f"💵 Валют в экспорте: {len(report['currencies'])}\n"
     return ("🔍 <b>Проверка экспорта завершена</b>\n\n"
             f"📦 Заказов: {report['unique_order_ids']}\n"
             f"🆕 Новых: {report['predicted_inserts']}\n"
@@ -1396,7 +1656,7 @@ def _sales_import_preview(report: dict) -> str:
             f"{unchanged}"
             f"⚠️ Конфликтов: {report['conflicts']}\n"
             f"❌ Ошибок: {report['parse_errors']}\n\n"
-            f"💵 USD: {report['currencies'].get('USD', 0)}\n"
+            f"{currency_line}"
             f"⭐ Оценок: {report['ratings']}\n\n"
             f"📅 Период: {first} — {last}\n\n"
             "Данные пока НЕ импортированы.")
@@ -1458,9 +1718,9 @@ async def _sales_import_callback(callback: CallbackQuery, action: str, user_id: 
         if parts[0] == "sales_import_cancel" and session["phase"] in {"upload", "ready"}:
             _sales_import_cleanup()
             await callback.answer("Импорт отменён.")
+            return_text, return_markup = _sales_import_return_screen(user_id)
             await callback.message.edit_text(
-                "📈 <b>Аналитика продаж</b>\nВыберите период или раздел.\n\n" + _ANALYTICS_NOTE,
-                reply_markup=_analytics_keyboard("30d"), parse_mode="HTML")
+                return_text, reply_markup=return_markup, parse_mode="HTML")
             return True
         if parts[0] != "sales_import_confirm" or session["phase"] != "ready":
             await callback.answer("Действие устарело.", show_alert=True)
@@ -1484,9 +1744,18 @@ async def _sales_import_callback(callback: CallbackQuery, action: str, user_id: 
             text = "⚠️ Не удалось импортировать историю. Данные проверьте через CLI перед повтором."
         finally:
             _sales_import_cleanup()
-        await callback.message.edit_text(text, reply_markup=_analytics_keyboard("30d"),
+        return_markup = (_analytics_keyboard("30d") if module_enabled("sales_analytics")
+                         else _system_screen(user_id)[1])
+        await callback.message.edit_text(text, reply_markup=return_markup,
                                          parse_mode="HTML")
         return True
+
+
+def _sales_import_return_screen(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
+    if module_enabled("sales_analytics"):
+        return ("📈 <b>Аналитика продаж</b>\nВыберите период или раздел.\n\n"
+                + _ANALYTICS_NOTE, _analytics_keyboard("30d"))
+    return _system_screen(user_id)
 
 
 async def _sales_import_document(message: Message, user_id: int) -> bool:
@@ -1558,14 +1827,276 @@ async def _sales_import_document(message: Message, user_id: int) -> bool:
         return True
 
 
-def _system_screen() -> tuple[str, InlineKeyboardMarkup]:
+def _system_screen(user_id: int | None = None) -> tuple[str, InlineKeyboardMarkup]:
     safe = "✅" if is_safe_mode_enabled() else "⛔"
-    return "⚙️ <b>Система</b>\nУправление и диагностика:", _menu([
+    rows = [
         [_button("⚠️ Проблемы", "sys_problems")],
         [_button("📜 Журнал действий", "sys_audit:0")],
         [_button(f"🛡 SAFE_MODE: {safe}", "sys_safe_toggle")],
-        [_button("🔙 Назад", "menu_main")],
-    ])
+    ]
+    if module_enabled("sales_import") and not module_enabled("sales_analytics"):
+        rows.append([_button("📥 Импорт продаж", "sales_import_open")])
+    rows.append([_button("🔙 Назад", "menu_main")])
+    return "⚙️ <b>Система</b>\nУправление и диагностика:", _menu(rows)
+
+
+def _wizard_screen() -> tuple[str, InlineKeyboardMarkup]:
+    return ("🧩 <b>Первоначальная настройка</b>\n"
+            "Все встроенные модули выбраны по умолчанию. Можно выбрать другой набор. "
+            "Автоматические действия начнутся только после "
+            "сохранения и перезапуска бота.", _menu([
+                [_button("⚡ Минимальный", "modules_profile:minimal")],
+                [_button("🛒 Продавец · рекомендуется", "modules_profile:seller")],
+                [_button("🧰 Всё", "modules_profile:all")],
+                [_button("⚙️ Настроить вручную", "modules_manual")],
+            ]))
+
+
+def _module_draft_screen(draft: dict) -> tuple[str, InlineKeyboardMarkup]:
+    current = sum(module_enabled(feature.id) for feature in all_features())
+    desired = sum(draft["modules"].values())
+    lines = ["🧩 <b>Модули</b>",
+             f"Сейчас: {current}/{len(all_features())} · После перезапуска: {desired}/{len(all_features())}",
+             "Кнопки меняют черновик. Сохранение не перезапускает бота."]
+    if draft["kind"] == "wizard":
+        lines.append("Профиль: " + {"minimal": "⚡ Минимальный", "seller": "🛒 Продавец",
+                                    "all": "🧰 Всё", "manual": "⚙️ Вручную"}.get(
+                                        draft.get("profile"), "⚙️ Вручную"))
+    if draft["modules"]["autobump"]:
+        lines.append("⚠️ Автоподнятие автоматически включится при запуске с этим модулем.")
+    if draft["modules"]["night_mode"] or draft["modules"]["review_request"]:
+        lines.append("Ночной режим и запрос отзыва отправляют сообщения только при их отдельных тумблерах.")
+    if any(draft["modules"][key] for key in ("autobump", "night_mode", "review_request")):
+        lines.append("SAFE_MODE всегда блокирует автоматические изменяющие действия.")
+    rows = []
+    for feature in all_features():
+        active, next_start = module_enabled(feature.id), draft["modules"][feature.id]
+        label = (("✅" if active else "❌") + "→" + ("✅" if next_start else "❌")
+                 if active != next_start else ("✅" if active else "❌"))
+        rows.append([_button(f"{label} {feature.title_ru}",
+                             f"modules_toggle:{feature.id}")])
+    rows.extend([[_button("💾 Сохранить", "modules_save")],
+                 [_button("⭐ Рекомендуемые", "modules_recommended")],
+                 [_button("↩️ Отмена", "modules_cancel")],
+                 [_button("🔙 Назад", "modules_back")]])
+    return "\n".join(lines), _menu(rows)
+
+
+def _new_module_draft(kind: str) -> dict:
+    return {"kind": kind, "modules": (profile_modules("all") if kind == "wizard"
+                                      else dict(bot_settings["modules"])),
+            "profile": None}
+
+
+async def _modules_callback(callback: CallbackQuery, action: str, user_id: int) -> bool:
+    if not action.startswith("modules_") and action != "cancel:modules":
+        return False
+    if not _owner_id(user_id):
+        await callback.answer("Настройка доступна только владельцу.", show_alert=True)
+        return True
+    if action == "modules_later":
+        await callback.answer()
+        await callback.message.edit_text(
+            MAIN_MENU_TEXT, reply_markup=get_main_keyboard(user_id), parse_mode="HTML")
+        return True
+    if action == "modules_open":
+        _module_drafts[user_id] = _new_module_draft(
+            "wizard" if not bot_settings["setup_completed"] else "manager")
+        text, markup = (_wizard_screen() if not bot_settings["setup_completed"]
+                        else _module_draft_screen(_module_drafts[user_id]))
+    else:
+        draft = _module_drafts.get(user_id)
+        if draft is None:
+            await callback.answer("Черновик устарел. Откройте модули снова.", show_alert=True)
+            return True
+        if action.startswith("modules_profile:") and draft["kind"] == "wizard":
+            profile = action.split(":", 1)[1]
+            if profile not in {"minimal", "seller", "all"}:
+                await callback.answer("Неизвестный профиль.", show_alert=True)
+                return True
+            draft["modules"] = profile_modules(profile)
+            draft["profile"] = profile
+        elif action == "modules_manual" and draft["kind"] == "wizard":
+            draft["profile"] = "manual"
+        elif action.startswith("modules_toggle:"):
+            feature_id = action.split(":", 1)[1]
+            if get_feature(feature_id) is None:
+                await callback.answer("Неизвестный модуль.", show_alert=True)
+                return True
+            draft["modules"][feature_id] = not draft["modules"][feature_id]
+            draft["profile"] = "manual"
+        elif action == "modules_recommended":
+            draft["modules"] = profile_modules("seller")
+            draft["profile"] = "seller"
+        elif action in {"modules_cancel", "modules_back"}:
+            _module_drafts.pop(user_id, None)
+            _interaction_state.pop(user_id, None)
+            text, markup = (_wizard_screen() if draft["kind"] == "wizard"
+                            else (MAIN_MENU_TEXT, get_main_keyboard(user_id)))
+            if draft["kind"] == "wizard":
+                _module_drafts[user_id] = _new_module_draft("wizard")
+        elif action == "modules_save":
+            try:
+                modules = validate_modules_config(draft["modules"])
+            except ValueError:
+                await callback.answer("Зависимость модулей не выполнена.", show_alert=True)
+                return True
+            restart_needed = modules != dict(effective_modules())
+            previous = (bot_settings["modules"], bot_settings["setup_completed"])
+            bot_settings["modules"] = modules
+            bot_settings["setup_completed"] = True
+            try:
+                save_settings(required=True)
+            except RuntimeError:
+                (bot_settings["modules"], bot_settings["setup_completed"]) = previous
+                await callback.answer("Не удалось сохранить. Настройки не изменены.", show_alert=True)
+                return True
+            _module_drafts.pop(user_id, None)
+            _interaction_state.pop(user_id, None)
+            _audit_action(f"telegram:{user_id}", "MODULES", "configuration", "SAVED")
+            if draft["kind"] == "wizard":
+                _audit_action(f"telegram:{user_id}", "PROFILE",
+                              draft.get("profile") or "manual", "APPLIED")
+            if restart_needed:
+                text = ("✅ Конфигурация модулей сохранена.\n\n"
+                        "Для применения нужен перезапуск.")
+                markup = _menu([[_button("🔄 Перезапустить сейчас", "restart_open")],
+                                [_button("Позже", "modules_later")]])
+            else:
+                text = "✅ Конфигурация модулей сохранена."
+                markup = _menu([[_button("🔙 В главное меню", "menu_main")]])
+        elif action == "cancel:modules":
+            _interaction_state.pop(user_id, None)
+        else:
+            await callback.answer("Действие устарело.", show_alert=True)
+            return True
+        if action not in {"modules_cancel", "modules_back", "modules_save"}:
+            text, markup = _module_draft_screen(draft)
+    await callback.answer()
+    try:
+        await callback.message.edit_text(text, reply_markup=markup, parse_mode="HTML")
+    except Exception:
+        pass
+    return True
+
+
+_RESTART_BUSY_TEXT = ("⚠️ Сейчас выполняется операция с данными.\n"
+                      "Дождитесь её завершения и повторите попытку.")
+
+
+async def _restart_callback(callback: CallbackQuery, action: str, user_id: int) -> bool:
+    if not (action == "restart_open" or action.startswith("restart_confirm:")
+            or action.startswith("restart_cancel:")):
+        return False
+    if not _owner_id(user_id):
+        await callback.answer("Перезапуск доступен только владельцу.", show_alert=True)
+        return True
+    if restart_requested():
+        await callback.answer("Перезапуск уже запущен.", show_alert=True)
+        return True
+    if action == "restart_open":
+        nonce = secrets.token_hex(8)
+        _restart_confirmations[user_id] = nonce
+        await callback.answer()
+        await callback.message.edit_text(
+            "🔄 <b>Перезапустить бота?</b>\n\n"
+            "Бот корректно завершит текущие задачи и запустится снова.",
+            reply_markup=_menu([
+                [_button("✅ Перезапустить", f"restart_confirm:{nonce}")],
+                [_button("❌ Отмена", f"restart_cancel:{nonce}")],
+            ]), parse_mode="HTML")
+        return True
+    kind, nonce = action.split(":", 1)
+    if _restart_confirmations.get(user_id) != nonce:
+        await callback.answer("Подтверждение устарело.", show_alert=True)
+        return True
+    if kind == "restart_cancel":
+        _restart_confirmations.pop(user_id, None)
+        await callback.answer("Перезапуск отменён.")
+        await callback.message.edit_text(
+            MAIN_MENU_TEXT, reply_markup=get_main_keyboard(user_id), parse_mode="HTML")
+        return True
+    if (_sales_import_session is not None
+            and _sales_import_session["phase"] in {"checking", "importing"}):
+        await callback.answer(_RESTART_BUSY_TEXT, show_alert=True)
+        return True
+    async with _sales_import_lock:
+        if (_sales_import_session is not None
+                and _sales_import_session["phase"] in {"checking", "importing"}):
+            await callback.answer(_RESTART_BUSY_TEXT, show_alert=True)
+            return True
+        if not await asyncio.to_thread(claim_restart):
+            await callback.answer("Перезапуск уже запущен.", show_alert=True)
+            return True
+        if _sales_import_session is not None:
+            _sales_import_cleanup()
+        _module_drafts.clear()
+        _interaction_state.clear()
+        _restart_confirmations.clear()
+    _audit_action(f"telegram:{user_id}", "RESTART", "global", "REQUESTED")
+    try:
+        await asyncio.wait_for(callback.answer("Перезапуск начинается."), timeout=5.0)
+        await asyncio.wait_for(callback.message.edit_text(
+            "🔄 Перезапуск начинается."), timeout=5.0)
+    except Exception as error:
+        logger.warning(f"Не удалось подтвердить перезапуск в Telegram: {type(error).__name__}.")
+    finally:
+        signal_restart()
+    return True
+
+
+async def _primary_currency_callback(callback: CallbackQuery, action: str,
+                                     user_id: int) -> bool:
+    if action not in {"currency_open:stats", "currency_open:analytics"}:
+        return False
+    if not _owner_id(user_id):
+        await callback.answer("Настройка доступна только владельцу.", show_alert=True)
+        return True
+    section = action.split(":", 1)[1]
+    _interaction_state[user_id] = {"action": "primary_currency", "section": section}
+    await callback.answer()
+    await callback.message.edit_text(
+        "💱 Укажите предпочтительную валюту кодом из трёх латинских букв, "
+        "например USD.\nИсторические валюты заказов сохранятся; конвертации нет.",
+        reply_markup=_menu([[_button("❌ Отмена", "menu_main")]]), parse_mode="HTML")
+    return True
+
+
+async def _primary_currency_input(message: Message, user_id: int) -> bool:
+    pending = _interaction_state.get(user_id, {})
+    if pending.get("action") != "primary_currency":
+        return False
+    section = pending.get("section")
+    if not _owner_id(user_id) or section not in {"stats", "analytics"}:
+        _interaction_state.pop(user_id, None)
+        await message.answer("Настройка недоступна.")
+        return True
+    if message.text and message.text.startswith("/"):
+        _interaction_state.pop(user_id, None)
+        await message.answer("Изменение валюты отменено.")
+        return True
+    try:
+        currency = normalize_reporting_currency(message.text or "")
+    except StateError:
+        await message.answer("Введите код валюты из трёх латинских букв.")
+        return True
+    previous = (bot_settings["primary_currency"], bot_settings["stats_currency"])
+    bot_settings["primary_currency"] = currency
+    bot_settings["stats_currency"] = currency  # Backward-compatible settings alias.
+    try:
+        save_settings(required=True)
+    except RuntimeError:
+        bot_settings["primary_currency"], bot_settings["stats_currency"] = previous
+        await message.answer("Не удалось сохранить валюту. Настройка не изменилась.")
+        return True
+    _interaction_state.pop(user_id, None)
+    _analytics_currency_filters.pop(user_id, None)
+    _audit_action(f"telegram:{user_id}", "SETTINGS", "settings", "UPDATED")
+    target = "menu_stats" if section == "stats" else "analytics"
+    await message.answer(
+        f"✅ Валюта по умолчанию: {currency}. Исторические заказы не изменены.",
+        reply_markup=_menu([[_button("📊 Открыть раздел", target)]]))
+    return True
 
 
 def _problems_screen() -> tuple[str, InlineKeyboardMarkup]:
@@ -1642,7 +2173,7 @@ async def _operations_callback(callback: CallbackQuery, action: str, user_id: in
     try:
         parts = action.split(":")
         if action == "system" or action == "sys_safe_cancel":
-            text, markup = _system_screen()
+            text, markup = _system_screen(user_id)
         elif action == "sys_problems":
             text, markup = _problems_screen()
         elif prefix == "sys_audit" and len(parts) == 2:
@@ -1666,14 +2197,14 @@ async def _operations_callback(callback: CallbackQuery, action: str, user_id: in
                                 [_button("❌ Отмена", "sys_safe_cancel")]])
             else:
                 toggle_safe_mode_saved(actor=f"telegram:{user_id}")
-                text, markup = _system_screen()
+                text, markup = _system_screen(user_id)
                 await callback.answer("🛡 SAFE_MODE включён. Автоматические действия приостановлены.")
                 answered = True
         elif action == "sys_safe_off":
             if not is_safe_mode_enabled():
                 raise ValueError("SAFE_MODE already off.")
             toggle_safe_mode_saved(actor=f"telegram:{user_id}")
-            text, markup = _system_screen()
+            text, markup = _system_screen(user_id)
             await callback.answer("🛡 SAFE_MODE выключен.")
             answered = True
         else:
@@ -1738,8 +2269,17 @@ async def cmd_start(message: Message):
             reply_markup=get_reply_keyboard(),
             parse_mode="HTML"
         )
+        await _send_setup_wizard(message, user_id)
     else:
         await message.answer("🔒 <b>Доступ закрыт.</b>\nВведите пароль:", parse_mode="HTML")
+
+
+async def _send_setup_wizard(message: Message, user_id: int) -> None:
+    if bot_settings["setup_completed"] or not _owner_id(user_id):
+        return
+    _module_drafts[user_id] = _new_module_draft("wizard")
+    text, markup = _wizard_screen()
+    await message.answer(text, reply_markup=markup, parse_mode="HTML")
 
 
 def _status_message_text() -> str:
@@ -1761,7 +2301,8 @@ async def _read_legacy_stats(period: str) -> dict:
     store = _runtime_client.review_state if _runtime_client is not None else None
     if store is None:
         raise StateError("Persistent state unavailable.")
-    return await asyncio.to_thread(store.get_legacy_statistics, period)
+    return await asyncio.to_thread(store.get_legacy_statistics,
+                                   period, currency=_reporting_currency())
 
 
 _STATS_PERIOD_TITLES = {
@@ -1772,15 +2313,38 @@ _STATS_PERIOD_TITLES = {
 
 
 def format_stats_text(period: str, data: dict) -> str:
-    """Старый компактный layout; оборот содержит только подтверждённые USD."""
+    """Compact for one currency; split money by code for mixed history."""
     title = _STATS_PERIOD_TITLES[period]
+    turnover = data.get("turnover_by_currency")
+    withdrawals = data.get("withdrawals_by_currency")
+    if turnover is None and withdrawals is None:
+        turnover = {_reporting_currency(): data["usd_turnover"]}
+        withdrawals = {_reporting_currency(): data["usd_withdrawals"]}
+    period_currencies = set(turnover) | set(withdrawals)
+    fallback_code = (next(iter(period_currencies)) if len(period_currencies) == 1
+                     else _reporting_currency())
+
+    def money_lines(label: str, amounts: dict, fallback) -> str:
+        if not amounts:
+            return f"{label}: <b>{_analytics_money(fallback, fallback_code)}</b>"
+        if len(amounts) == 1:
+            code, amount = next(iter(amounts.items()))
+            return f"{label}: <b>{_analytics_money(amount, code)}</b>"
+        return label + ":\n" + "\n".join(
+            f"• <b>{_analytics_money(amount, code)}</b>" for code, amount in sorted(amounts.items()))
+
     return (
         f"📊 <b>Статистика {title}</b>\n\n"
         f"🛒 Заказов: <b>{data['orders_count']}</b>\n"
         f"🌟 Отзывов: <b>{data['reviews_count']}</b>\n"
-        f"💰 Оборот: <b>{data['usd_turnover']:.2f} $</b>\n"
+        f"{money_lines('💰 Оборот', turnover, data['usd_turnover'])}\n"
         f"🏦 Выводов: <b>{data['withdrawals_count']}</b> "
-        f"на сумму <b>{data['usd_withdrawals']:.2f} $</b>"
+        f"на сумму " +
+        (f"<b>{_analytics_money(next(iter(withdrawals.values())), next(iter(withdrawals)))}</b>"
+         if len(withdrawals) == 1 else
+         "\n" + "\n".join(f"• <b>{_analytics_money(amount, code)}</b>"
+                            for code, amount in sorted(withdrawals.items()))
+         if withdrawals else f"<b>{_analytics_money(data['usd_withdrawals'], fallback_code)}</b>")
     )
 
 
@@ -1793,6 +2357,9 @@ async def cmd_status(message: Message):
 async def cmd_log(message: Message):
     if not is_authorized(message.from_user.id):
         await message.answer("⛔ Доступ запрещен!")
+        return
+    if not module_enabled("logs_ui"):
+        await message.answer(_MODULE_OFF_TEXT)
         return
     parts = (message.text or "").split(maxsplit=1)
     if len(parts) < 2:
@@ -1818,6 +2385,16 @@ async def callback_handler(callback: CallbackQuery):
         return
 
     action = callback.data or ""
+    if await _modules_callback(callback, action, user_id):
+        return
+    if await _restart_callback(callback, action, user_id):
+        return
+    feature_id = _action_feature(action)
+    if feature_id is not None and not module_enabled(feature_id):
+        await callback.answer(_MODULE_OFF_TEXT, show_alert=True)
+        return
+    if await _primary_currency_callback(callback, action, user_id):
+        return
     if await _sales_import_callback(callback, action, user_id):
         return
     if (_sales_import_session is not None
@@ -1903,9 +2480,13 @@ async def callback_handler(callback: CallbackQuery):
     elif action == "menu_stats":
         await callback.answer()
         try:
+            if _primary_currency_or_none() is None:
+                text, markup = _currency_required_screen("stats", user_id)
+            else:
+                text = "📊 <b>Статистика</b>\nВыберите период:"
+                markup = get_stats_keyboard(user_id)
             await callback.message.edit_text(
-                "📊 <b>Статистика</b>\nВыберите период:",
-                reply_markup=get_stats_keyboard(), parse_mode="HTML"
+                text, reply_markup=markup, parse_mode="HTML"
             )
         except Exception:
             pass
@@ -1915,6 +2496,11 @@ async def callback_handler(callback: CallbackQuery):
         await callback.message.answer(_status_message_text())
 
     elif action in ("stats_today", "stats_week", "stats_month"):
+        if _primary_currency_or_none() is None:
+            text, markup = _currency_required_screen("stats", user_id)
+            await callback.answer()
+            await callback.message.edit_text(text, reply_markup=markup, parse_mode="HTML")
+            return
         period = action.removeprefix("stats_")
         try:
             stats = await _read_legacy_stats(period)
@@ -1926,7 +2512,7 @@ async def callback_handler(callback: CallbackQuery):
         await callback.answer()
         try:
             await callback.message.edit_text(
-                text, reply_markup=get_stats_keyboard(), parse_mode="HTML"
+                text, reply_markup=get_stats_keyboard(user_id), parse_mode="HTML"
             )
         except Exception:
             pass
@@ -1989,6 +2575,7 @@ async def text_handler(message: Message):
                 reply_markup=get_main_keyboard(user_id),
                 parse_mode="HTML"
             )
+            await _send_setup_wizard(message, user_id)
             return
         if message.text == "❌ Отмена":
             if (_sales_import_session is not None
@@ -1999,10 +2586,25 @@ async def text_handler(message: Message):
             _interaction_state.pop(user_id, None)
             await message.answer("Отменено.", reply_markup=get_main_keyboard(user_id))
             return
+        if await _primary_currency_input(message, user_id):
+            return
+        if not module_enabled("sales_import") and _sales_import_session is not None:
+            async with _sales_import_lock:
+                if _sales_import_session is not None and _sales_import_session["owner"] == user_id:
+                    _sales_import_cleanup()
+                    await message.answer(_MODULE_OFF_TEXT)
+                    return
         if await _sales_import_document(message, user_id):
             return
         pending = _interaction_state.get(user_id)
         if pending:
+            pending_module = ("review_request" if pending.get("action", "").startswith("review_")
+                              else "night_mode" if pending.get("action") == "night_edit"
+                              else None)
+            if pending_module is not None and not module_enabled(pending_module):
+                _interaction_state.pop(user_id, None)
+                await message.answer(_MODULE_OFF_TEXT)
+                return
             if message.text and message.text.startswith("/"):
                 _interaction_state.pop(user_id, None)
                 await message.answer("Действие отменено. Команда не сохранена.")
@@ -2074,6 +2676,7 @@ async def text_handler(message: Message):
             pass
         await message.answer("🔓 <b>Авторизация успешна!</b>", reply_markup=get_reply_keyboard(), parse_mode="HTML")
         await message.answer(MAIN_MENU_TEXT, reply_markup=get_main_keyboard(user_id), parse_mode="HTML")
+        await _send_setup_wizard(message, user_id)
     else:
         remaining = _record_failed_attempt(user_id)
         if remaining == 0:

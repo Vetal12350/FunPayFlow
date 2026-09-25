@@ -110,6 +110,10 @@ class HistoricalImportTests(unittest.TestCase):
                 "SELECT COUNT(*) FROM order_status_observations WHERE order_id='AA000003'"
             ).fetchone()[0], 3)
             self.assertEqual(connection.execute(
+                "SELECT order_id, confirmed_currency FROM orders "
+                "WHERE order_id IN ('AA000001', 'AA000002') ORDER BY order_id"
+            ).fetchall(), [("AA000001", "USD"), ("AA000002", "RUB")])
+            self.assertEqual(connection.execute(
                 "SELECT rating, time_known FROM review_observations WHERE order_id='AA000001'"
             ).fetchone(), (5, 0))
         all_sales = self.store.get_sales_overview("all")
@@ -118,6 +122,10 @@ class HistoricalImportTests(unittest.TestCase):
                          (2, "10.25", 1, 1))
         self.assertEqual(self.store.get_legacy_statistics("week", REPORT_AT)["usd_turnover"],
                          10.25)
+        self.assertEqual(self.store.get_sales_overview("all", currency="RUB")
+                         ["usd_turnover"], "10.25")
+        self.assertEqual(self.store.get_legacy_statistics(
+            "week", REPORT_AT, "RUB")["usd_turnover"], 10.25)
         self.assertIn("Частичный возврат", ui._order_card_screen(
             self.store.get_order_history("AA000004"), "all", 0)[0])
 

@@ -209,6 +209,7 @@ class MessageLimitsTests(unittest.IsolatedAsyncioTestCase):
                    "logger": SimpleNamespace(warning=lambda *args: None,
                                              notify=lambda *args: None),
                    "get_all_recipients": lambda: [1],
+                   "module_enabled": lambda feature_id: True,
                    "get_user_settings": lambda _: {"notifications_enabled": True,
                                                     "notify_review": True}}
         exec(compile(ast.Module(body=nodes, type_ignores=[]), "main.py", "exec"), runtime)

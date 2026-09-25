@@ -2,6 +2,7 @@
 import log_isolation
 
 import asyncio
+import copy
 import csv
 import io
 import json
@@ -86,7 +87,14 @@ class TelegramSalesImportTests(unittest.IsolatedAsyncioTestCase):
         self.store.initialize()
         self.previous_client = ui._runtime_client
         self.previous_lock = ui._sales_import_lock
+        self.previous_settings = copy.deepcopy(ui.bot_settings)
+        self.previous_effective = ui._effective_modules
         ui._runtime_client = SimpleNamespace(review_state=self.store)
+        ui.bot_settings["modules"] = ui.profile_modules("all")
+        ui.bot_settings["setup_completed"] = True
+        ui.bot_settings["primary_currency"] = "USD"
+        ui.bot_settings["stats_currency"] = "USD"
+        ui.configure_module_runtime(fresh_install=False)
         ui._sales_import_lock = asyncio.Lock()
         ui._sales_import_session = None
         self.auth = patch.object(ui, "is_authorized", side_effect=lambda user: user == 1)
@@ -98,6 +106,9 @@ class TelegramSalesImportTests(unittest.IsolatedAsyncioTestCase):
             ui._sales_import_cleanup()
         ui._sales_import_lock = self.previous_lock
         ui._runtime_client = self.previous_client
+        ui.bot_settings.clear()
+        ui.bot_settings.update(self.previous_settings)
+        ui._effective_modules = self.previous_effective
         self.auth.stop()
         self.tmp.cleanup()
 
