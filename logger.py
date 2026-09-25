@@ -12,7 +12,7 @@ logger.py — Красивый консольный логгер в стиле F
 
 Использование:
     import logger
-    logger.success("Сессия FunPay инициализирована: Vitas1975")
+    logger.success("Сессия FunPay инициализирована: ExampleSeller")
     logger.bump("ARC Raiders — поднята")
     logger.notify("Новое сообщение от buyer123")
     logger.warning("Кулдаун, повтор через 7200 сек")

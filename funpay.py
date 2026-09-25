@@ -6,6 +6,7 @@ import random
 import re
 import queue
 import threading
+from urllib.parse import urlsplit
 from decimal import Decimal, InvalidOperation
 from html import escape
 import requests
@@ -55,11 +56,26 @@ NIGHT_MODE_ORDER_TEXT = "😴 Продавец спит, как проснётс
 # реализует - отсюда "cookie отсутствует".
 #
 # Чтобы не переустанавливать/патчить саму библиотеку, патчим requests.Session.request
-# на уровне процесса: любой ответ с funpay.com запоминаем все "лишние" куки
+# на уровне процесса: ответ с HTTPS funpay.com запоминает все "лишние" куки
 # (кроме PHPSESSID, которым и так управляет сама библиотека), и добавляем их
-# в заголовок Cookie каждого следующего запроса к funpay.com.
+# в заголовок Cookie только следующего запроса к тому же точному host.
 _funpay_extra_cookies: dict[str, str] = {}
 _funpay_cookie_patch_applied = False
+
+
+def _is_funpay_request_url(url: object) -> bool:
+    """Extra session cookies belong only on HTTPS requests to funpay.com."""
+    if not isinstance(url, str):
+        return False
+    try:
+        parsed = urlsplit(url)
+        # FunPayAPI 1.1.0 sends account, runner and lots requests to this
+        # exact host. No subdomain is needed for the current runtime.
+        return (parsed.scheme == "https" and parsed.hostname == "funpay.com"
+                and parsed.username is None and parsed.password is None
+                and parsed.port in (None, 443))
+    except ValueError:
+        return False
 
 
 def _apply_funpay_cookie_patch():
@@ -70,7 +86,7 @@ def _apply_funpay_cookie_patch():
     original_request = requests.sessions.Session.request
 
     def patched_request(self, method, url, *args, **kwargs):
-        is_funpay = isinstance(url, str) and "funpay.com" in url
+        is_funpay = _is_funpay_request_url(url)
 
         if is_funpay and _funpay_extra_cookies:
             headers = dict(kwargs.get("headers") or {})

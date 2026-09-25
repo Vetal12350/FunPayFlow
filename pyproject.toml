@@ -22,5 +22,20 @@ build-backend = "hatchling.build"
 [tool.uv]
 package = true
 
+[tool.hatch.build.targets.wheel]
+only-include = [
+    "main.py",
+    "telegram.py",
+    "funpay.py",
+    "state.py",
+    "feature_registry.py",
+    "runtime_control.py",
+    "runtime_events.py",
+    "logger.py",
+    "import_funpay_sales.py",
+]
+
 [dependency-groups]
-dev = []
+dev = [
+    "pytest>=9.1.1",
+]

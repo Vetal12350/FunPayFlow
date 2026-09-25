@@ -5,17 +5,31 @@
 
 # Virtual environments
 .venv/
+.venv.*/
 venv/
 
 # Runtime / personal state
 bot.lock
 bot_settings.json
+/bot_settings*.json*
+/.bot_settings-*.tmp
 /state.sqlite3
 /state.sqlite3-*
 /state.sqlite3.pre-sales-import*.bak
+/state*.sqlite3*
 /stats_log.json
-funpay_sales_*.zip
-funpay_sales_*.csv
+# Official exports dropped in the project root; test fixtures below tests/ stay trackable.
+/*.zip
+/*.csv
+/*.bak
+/*.backup
+/imports/
+/exports/
+/data/
+/private/
+/secrets/
+/credentials.local.json
+/config.local.json
 
 # Python
 __pycache__/
