@@ -12,7 +12,10 @@ bot.lock
 bot_settings.json
 /state.sqlite3
 /state.sqlite3-*
+/state.sqlite3.pre-sales-import*.bak
 /stats_log.json
+funpay_sales_*.zip
+funpay_sales_*.csv
 
 # Python
 __pycache__/

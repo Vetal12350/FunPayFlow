@@ -603,6 +603,17 @@ def disable_autobump() -> None:
     save_settings(required=True)
 
 
+def enable_autobump_on_startup() -> None:
+    """Publish ON only after the required atomic settings save succeeds."""
+    previous = bot_settings["auto_bump"]
+    bot_settings["auto_bump"] = True
+    try:
+        save_settings(required=True)
+    except Exception:
+        bot_settings["auto_bump"] = previous
+        raise RuntimeError("Не удалось сохранить автоподнятие при запуске.") from None
+
+
 load_settings()
 
 # Восстанавливаем authorized_users из сохранённых настроек
@@ -929,7 +940,10 @@ def _order_list_screen(kind: str, page: int, count: int, orders: list[dict]):
     for order in orders:
         order_id = order["order_id"]
         product = order["product_description"]
-        label = f"{_ORDER_ICONS.get(order['current_status'], '📦')} {order_id}"
+        icon = ("↪️" if order.get("official_status") == "partially_refunded"
+                and order["current_status"] == "PAID" else
+                _ORDER_ICONS.get(order["current_status"], "📦"))
+        label = f"{icon} {order_id}"
         if product:
             label += " · " + " ".join(product.split())[:32]
         rows.append([_button(label, f"ord_open:{order_id}:{kind}:{page}")])
@@ -950,14 +964,18 @@ def _order_list_screen(kind: str, page: int, count: int, orders: list[dict]):
 def _order_card_screen(order: dict, kind: str, page: int):
     status_names = {"PAID": "🆕 Оплачен", "CLOSED": "✅ Завершён",
                     "REFUNDED": "↩️ Возврат"}
-    lines = [f"📦 <b>Заказ #{escape(order['order_id'])}</b>",
-             f"Статус: {status_names.get(order['current_status'], 'Неизвестен')}"]
+    status = ("↪️ Частичный возврат" if order.get("official_status") == "partially_refunded"
+              and order["current_status"] == "PAID" else
+              status_names.get(order["current_status"], "Неизвестен"))
+    lines = [f"📦 <b>Заказ #{escape(order['order_id'])}</b>", f"Статус: {status}"]
     if order.get("buyer_username"):
         lines.append("👤 Покупатель: " + _escaped_preview(order["buyer_username"], 100))
-    if order.get("product_description"):
-        lines.append("🛒 Товар: " + _escaped_preview(order["product_description"], 600))
-    if order.get("subcategory_name"):
-        lines.append("🏷 Подкатегория: " + _escaped_preview(order["subcategory_name"], 100))
+    if order.get("lot_summary") or order.get("product_description"):
+        lines.append("🛒 Товар: " + _escaped_preview(
+            order.get("lot_summary") or order["product_description"], 600))
+    if order.get("section_name") or order.get("subcategory_name"):
+        lines.append("🏷 Подкатегория: " + _escaped_preview(
+            order.get("section_name") or order["subcategory_name"], 100))
     if order.get("quantity") is not None:
         lines.append(f"🔢 Количество: {order['quantity']}")
     if order.get("listed_price") is not None:
@@ -1018,7 +1036,7 @@ async def _orders_callback(callback: CallbackQuery, action: str, user_id: int) -
 
 _ANALYTICS_PERIODS = {"today": "Сегодня", "7d": "7 дней",
                       "30d": "30 дней", "all": "Всё время"}
-_ANALYTICS_NOTE = "ℹ️ Аналитика строится по данным, сохранённым ботом."
+_ANALYTICS_NOTE = "ℹ️ Аналитика строится по всей известной истории продаж."
 
 
 def _analytics_money(value) -> str:
@@ -1072,7 +1090,7 @@ def _analytics_keyboard(period: str, *, detail=False):
         [_button("📅 Сегодня", "ana_over:today"), _button("🗓 7 дней", "ana_over:7d")],
         [_button("🗓 30 дней", "ana_over:30d"), _button("♾ Всё время", "ana_over:all")],
         *_analytics_sections(period),
-        [_button("🔙 Назад", "menu_stats")],
+        [_button("🔙 Назад", "menu_main")],
     ])
 
 
@@ -1091,6 +1109,8 @@ def _analytics_overview_text(period: str, data: dict) -> str:
         f"👥 Покупателей: {data['buyers']}",
         f"🔁 Повторных: {data['repeat_buyers']}",
     ]
+    if data.get("partial_refunds"):
+        lines.append(f"↪️ Частичных возвратов: {data['partial_refunds']} (сумма возврата неизвестна)")
     if data["terminal_orders"]:
         lines.append("Доля возвратов среди завершённых/возвращённых: " +
                      _analytics_percent(data["refunds"], data["terminal_orders"]))
@@ -1114,7 +1134,7 @@ def _analytics_overview_text(period: str, data: dict) -> str:
     if best:
         money = (" / " + _analytics_money(best["usd_turnover"])
                  if best["usd_turnover"] is not None else "")
-        lines += ["", "📅 Лучший день наблюдения закрытий:",
+        lines += ["", "📅 Лучший день продаж:",
                   f"{best['day']} — {best['orders']} заказов{money}"]
     lines += ["", _ANALYTICS_NOTE]
     return "\n".join(lines)
@@ -1144,17 +1164,23 @@ def _analytics_buyers_text(period: str, data: dict) -> str:
 
 
 def _analytics_reviews_text(period: str, data: dict) -> str:
-    return (f"⭐ <b>Отзывы · {_ANALYTICS_PERIODS[period]}</b>\n\n"
-            f"⭐ Получено отзывов: {data['reviews']}\n"
-            "📊 Доля закрытых заказов с отзывом: " +
-            _analytics_percent(data["reviewed_orders"], data["closed_orders"]))
+    lines = [f"⭐ <b>Отзывы · {_ANALYTICS_PERIODS[period]}</b>", "",
+             f"⭐ Получено отзывов: {data['reviews']}",
+             "📊 Доля закрытых заказов с отзывом: " +
+             _analytics_percent(data["reviewed_orders"], data["closed_orders"])]
+    if data["average_rating"] is not None:
+        lines += [f"⭐ Средняя оценка: {data['average_rating']:.2f}",
+                  " · ".join(f"{stars}⭐ {data['rating_distribution'].get(stars, 0)}"
+                             for stars in range(1, 6))]
+    return "\n".join(lines)
 
 
 def _analytics_time_text(period: str, data: dict) -> str:
-    lines = [f"📅 <b>По времени · {_ANALYTICS_PERIODS[period]}</b>", ""]
+    lines = [f"📅 <b>По времени · {_ANALYTICS_PERIODS[period]}</b>",
+             "Местное время сервера.", ""]
     best = data["best_day"]
     if best:
-        lines += ["🏆 Лучший день наблюдения закрытий:",
+        lines += ["🏆 Лучший день продаж:",
                   f"{best['day']} — {best['orders']} заказов" +
                   (" / " + _analytics_money(best["usd_turnover"])
                    if best["usd_turnover"] is not None else "")]
@@ -1163,7 +1189,17 @@ def _analytics_time_text(period: str, data: dict) -> str:
         lines += ["", "💰 Максимум подтверждённого оборота за день:",
                   f"{best_money['day']} — {_analytics_money(best_money['usd_turnover'])}"]
     if not best:
-        lines.append("Нет дат наблюдения закрытий.")
+        lines.append("Нет известных дат продаж.")
+    weekdays = ("Воскресенье", "Понедельник", "Вторник", "Среда", "Четверг",
+                "Пятница", "Суббота")
+    if data["weekday"] is not None:
+        row = data["weekday"]
+        lines += ["", f"📆 Самый активный день недели: {weekdays[row['weekday']]} "
+                  f"({row['orders']} заказов)"]
+    if data["hour"] is not None:
+        row = data["hour"]
+        lines += [f"🕐 Самый активный час: {row['hour']:02d}:00 "
+                  f"({row['orders']} заказов)"]
     return "\n".join(lines)
 
 

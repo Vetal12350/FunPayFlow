@@ -51,23 +51,39 @@ def _decimal_compare(left: str, right: str) -> int:
 # or (all-time only) a sparse old CLOSED row with no trustworthy date.
 # The old bot hard-coded '$'; neither its currency nor the current settings
 # fallback proves USD. Only confirmed_currency may qualify an order for money.
-_USD_AMOUNT = "CASE WHEN o.confirmed_currency = 'USD' THEN COALESCE(o.amount, o.listed_price) END"
-_SALE_COLUMNS = ("o.order_id, o.product_description, o.subcategory_name, "
+_USD_AMOUNT = ("CASE WHEN o.confirmed_currency = 'USD' "
+               "AND o.official_status IS NOT 'partially_refunded' "
+               "THEN COALESCE(o.amount, o.listed_price) END")
+_SALE_COLUMNS = ("o.order_id, COALESCE(o.lot_summary, o.product_description) "
+                 "AS product_description, COALESCE(o.section_name, o.subcategory_name) "
+                 "AS subcategory_name, o.game_id, o.section_type_id, o.section_local_id, "
                  "o.buyer_id, o.buyer_username, " + _USD_AMOUNT + " AS usd_amount")
-_ARCHIVE_COLUMNS = ("l.record_key AS order_id, o.product_description, o.subcategory_name, "
+_ARCHIVE_COLUMNS = ("l.record_key AS order_id, "
+                    "COALESCE(o.lot_summary, o.product_description) AS product_description, "
+                    "COALESCE(o.section_name, o.subcategory_name) AS subcategory_name, "
+                    "o.game_id, o.section_type_id, o.section_local_id, "
                     "o.buyer_id, o.buyer_username, " + _USD_AMOUNT + " AS usd_amount")
 _SALES_CTE = (
     "sale_source AS ("
-    "SELECT " + _SALE_COLUMNS + ", s.first_observed_at AS sale_at "
+    "SELECT " + _SALE_COLUMNS + ", COALESCE(o.paid_at_utc, s.first_observed_at) AS sale_at "
     "FROM orders o JOIN order_status_observations s "
     "ON s.order_id = o.order_id AND s.status = 'CLOSED' "
-    "UNION ALL SELECT " + _ARCHIVE_COLUMNS + ", l.recorded_at AS sale_at "
+    "WHERE o.current_status = 'CLOSED' "
+    "AND (o.official_status IS NULL OR o.official_status NOT IN "
+    "('refunded', 'partially_refunded')) "
+    "UNION ALL SELECT " + _ARCHIVE_COLUMNS + ", "
+    "COALESCE(o.paid_at_utc, l.recorded_at) AS sale_at "
     "FROM legacy_stats l LEFT JOIN orders o ON o.order_id = l.record_key "
-    "WHERE l.kind = 'order' AND NOT EXISTS ("
+    "WHERE l.kind = 'order' AND (o.current_status IS NULL OR o.current_status != 'REFUNDED') "
+    "AND (o.official_status IS NULL OR o.official_status = 'closed') "
+    "AND NOT EXISTS ("
     "SELECT 1 FROM order_status_observations s "
     "WHERE s.order_id = l.record_key AND s.status = 'CLOSED') "
-    "UNION ALL SELECT " + _SALE_COLUMNS + ", NULL AS sale_at "
+    "UNION ALL SELECT " + _SALE_COLUMNS + ", "
+    "COALESCE(o.paid_at_utc, o.closed_at_utc) AS sale_at "
     "FROM orders o WHERE o.current_status = 'CLOSED' "
+    "AND (o.official_status IS NULL OR o.official_status NOT IN "
+    "('refunded', 'partially_refunded')) "
     "AND NOT EXISTS (SELECT 1 FROM order_status_observations s "
     "WHERE s.order_id = o.order_id AND s.status = 'CLOSED') "
     "AND NOT EXISTS (SELECT 1 FROM legacy_stats l "
@@ -80,7 +96,8 @@ _REFUNDS_CTE = (
     "SELECT order_id, first_observed_at AS refund_at FROM order_status_observations "
     "WHERE status = 'REFUNDED' "
     "UNION ALL SELECT o.order_id, NULL AS refund_at FROM orders o "
-    "WHERE o.current_status = 'REFUNDED' AND NOT EXISTS ("
+    "WHERE (o.current_status = 'REFUNDED' OR o.official_status = 'refunded') "
+    "AND NOT EXISTS ("
     "SELECT 1 FROM order_status_observations s "
     "WHERE s.order_id = o.order_id AND s.status = 'REFUNDED')"
     "), refunds AS (SELECT * FROM refund_source WHERE "
@@ -90,7 +107,8 @@ _REVIEWS_CTE = (
     "review_source AS ("
     "SELECT record_key AS order_id, recorded_at AS review_at FROM legacy_stats "
     "WHERE kind = 'review' "
-    "UNION ALL SELECT r.order_id, r.observed_at FROM review_observations r "
+    "UNION ALL SELECT r.order_id, "
+    "CASE WHEN r.time_known = 1 THEN r.observed_at END FROM review_observations r "
     "WHERE NOT EXISTS (SELECT 1 FROM legacy_stats l "
     "WHERE l.kind = 'review' AND l.record_key = r.order_id)"
     "), reviews AS (SELECT * FROM review_source WHERE "
@@ -184,6 +202,13 @@ class ReviewReceiptStore:
                         "product_description": "TEXT", "quantity": "INTEGER",
                         "subcategory_name": "TEXT", "funpay_order_date_local": "TEXT",
                         "listed_price": "TEXT", "confirmed_currency": "TEXT",
+                        "official_status": "TEXT", "created_at_utc": "INTEGER",
+                        "paid_at_utc": "INTEGER", "refunded_at_utc": "INTEGER",
+                        "partially_refunded_at_utc": "INTEGER",
+                        "game_id": "INTEGER", "game_name": "TEXT",
+                        "section_type_id": "TEXT", "section_local_id": "INTEGER",
+                        "section_name": "TEXT", "lot_summary": "TEXT",
+                        "lot_amount": "TEXT",
                     }
                     for name, sql_type in history_columns.items():
                         if name not in order_columns:
@@ -217,6 +242,13 @@ class ReviewReceiptStore:
                         "CREATE TABLE IF NOT EXISTS review_observations ("
                         "order_id TEXT PRIMARY KEY, observed_at INTEGER NOT NULL)"
                     )
+                    review_columns = {row[1] for row in connection.execute(
+                        "PRAGMA table_info(review_observations)")}
+                    if "rating" not in review_columns:
+                        connection.execute("ALTER TABLE review_observations ADD COLUMN rating INTEGER")
+                    if "time_known" not in review_columns:
+                        connection.execute(
+                            "ALTER TABLE review_observations ADD COLUMN time_known INTEGER NOT NULL DEFAULT 1")
                     connection.execute(
                         "CREATE TABLE IF NOT EXISTS review_requests ("
                         "order_id TEXT PRIMARY KEY, state TEXT NOT NULL "
@@ -404,7 +436,7 @@ class ReviewReceiptStore:
             raise StateError("Persistent state write failed.") from None
 
     def record_review_observation(
-        self, order_id: str, observed_at_utc: int | None = None,
+        self, order_id: str, observed_at_utc: int | None = None, rating: int | None = None,
     ) -> None:
         """Факт проверенного buyer review, независимо от Telegram delivery."""
         self._require_order_id(order_id)
@@ -412,12 +444,19 @@ class ReviewReceiptStore:
             observed_at_utc = int(time.time())
         if type(observed_at_utc) is not int or observed_at_utc < 0:
             raise StateError("Invalid review observation time.")
+        if rating is not None and (type(rating) is not int or not 1 <= rating <= 5):
+            rating = None
         try:
             with closing(self._connect()) as connection:
                 with connection:
                     connection.execute(
-                        "INSERT OR IGNORE INTO review_observations (order_id, observed_at) "
-                        "VALUES (?, ?)", (order_id, observed_at_utc),
+                        "INSERT INTO review_observations (order_id, observed_at, rating) "
+                        "VALUES (?, ?, ?) ON CONFLICT(order_id) DO UPDATE SET "
+                        "rating = COALESCE(excluded.rating, review_observations.rating), "
+                        "observed_at = CASE WHEN review_observations.time_known = 0 "
+                        "THEN excluded.observed_at ELSE review_observations.observed_at END, "
+                        "time_known = 1",
+                        (order_id, observed_at_utc, rating),
                     )
         except (sqlite3.Error, OSError):
             raise StateError("Persistent review observation write failed.") from None
@@ -676,7 +715,9 @@ class ReviewReceiptStore:
                 with connection:
                     count = connection.execute("SELECT COUNT(*) FROM orders" + where, params).fetchone()[0]
                     rows = connection.execute(
-                        "SELECT order_id, current_status, product_description, last_seen_at "
+                        "SELECT order_id, current_status, official_status, "
+                        "COALESCE(lot_summary, product_description) AS product_description, "
+                        "last_seen_at "
                         "FROM orders" + where + " ORDER BY last_seen_at DESC, order_id DESC "
                         "LIMIT 10 OFFSET ?", (*params, page * 10),
                     ).fetchall()
@@ -751,10 +792,14 @@ class ReviewReceiptStore:
                 else "usd_turnover COLLATE DECIMAL DESC, orders_count DESC, product_description")
         having = " HAVING COUNT(usd_amount) > 0" if sort == "turnover" else ""
         rows = connection.execute(
-            "WITH " + _SALES_CTE + " SELECT product_description, subcategory_name, "
+            "WITH " + _SALES_CTE + " SELECT product_description, "
+            "MIN(subcategory_name) AS subcategory_name, "
             "COUNT(*) AS orders_count, decimal_sum(usd_amount) AS usd_turnover "
             "FROM sales WHERE product_description IS NOT NULL "
-            "GROUP BY product_description, subcategory_name" + having +
+            "GROUP BY game_id, section_type_id, section_local_id, "
+            "product_description, CASE WHEN game_id IS NOT NULL "
+            "AND section_type_id IS NOT NULL AND section_local_id IS NOT NULL "
+            "THEN NULL ELSE subcategory_name END" + having +
             " ORDER BY " + rank + " LIMIT ?",
             (*ReviewReceiptStore._window_args(start, end), limit),
         ).fetchall()
@@ -815,6 +860,12 @@ class ReviewReceiptStore:
                     "UNION SELECT order_id FROM refunds))",
                     (*self._window_args(start, end), *self._window_args(start, end)),
                 ).fetchone()
+                partial_refunds = connection.execute(
+                    "SELECT COUNT(*) FROM orders WHERE official_status = 'partially_refunded' "
+                    "AND (? IS NULL OR (partially_refunded_at_utc >= ? "
+                    "AND partially_refunded_at_utc < ?))",
+                    self._window_args(start, end),
+                ).fetchone()[0]
                 reviews, reviewed_sales = connection.execute(
                     "WITH " + _SALES_CTE + ", " + _REVIEWS_CTE +
                     " SELECT (SELECT COUNT(*) FROM reviews), "
@@ -837,6 +888,7 @@ class ReviewReceiptStore:
                     "orders": orders, "usd_orders": usd_orders,
                     "usd_turnover": turnover if orders else "0",
                     "refunds": refunded, "terminal_orders": terminal,
+                    "partial_refunds": partial_refunds,
                     "reviews": reviews, "reviewed_sales": reviewed_sales,
                     "buyers": buyers, "repeat_buyers": repeat_buyers,
                     "top_product": next(iter(self._top_products(connection, start, end, limit=1)), None),
@@ -891,7 +943,19 @@ class ReviewReceiptStore:
                     "SELECT 1 FROM review_source r WHERE r.order_id = s.order_id))",
                     (*self._window_args(start, end), *self._window_args(start, end)),
                 ).fetchone()
-                return {"reviews": reviews, "closed_orders": closed, "reviewed_orders": reviewed}
+                rating_rows = connection.execute(
+                    "WITH " + _REVIEWS_CTE +
+                    " SELECT r.rating, COUNT(*) FROM reviews v "
+                    "JOIN review_observations r ON r.order_id = v.order_id "
+                    "WHERE r.rating BETWEEN 1 AND 5 GROUP BY r.rating",
+                    self._window_args(start, end),
+                ).fetchall()
+                distribution = {stars: count for stars, count in rating_rows}
+                rated = sum(distribution.values())
+                average = (sum(stars * count for stars, count in distribution.items()) / rated
+                           if rated else None)
+                return {"reviews": reviews, "closed_orders": closed, "reviewed_orders": reviewed,
+                        "average_rating": average, "rating_distribution": distribution}
         except (sqlite3.Error, OSError, InvalidOperation):
             raise StateError("Sales analytics read failed.") from None
 
@@ -900,8 +964,24 @@ class ReviewReceiptStore:
         try:
             with closing(self._analytics_connect()) as connection:
                 connection.execute("BEGIN")
+                weekday = connection.execute(
+                    "WITH " + _SALES_CTE +
+                    " SELECT CAST(strftime('%w', sale_at, 'unixepoch', 'localtime') AS INTEGER), "
+                    "COUNT(*) AS n FROM sales WHERE sale_at IS NOT NULL "
+                    "GROUP BY 1 ORDER BY n DESC, 1 LIMIT 1",
+                    self._window_args(start, end),
+                ).fetchone()
+                hour = connection.execute(
+                    "WITH " + _SALES_CTE +
+                    " SELECT CAST(strftime('%H', sale_at, 'unixepoch', 'localtime') AS INTEGER), "
+                    "COUNT(*) AS n FROM sales WHERE sale_at IS NOT NULL "
+                    "GROUP BY 1 ORDER BY n DESC, 1 LIMIT 1",
+                    self._window_args(start, end),
+                ).fetchone()
                 return {"best_day": self._best_day(connection, start, end),
-                        "best_turnover_day": self._best_day(connection, start, end, "turnover")}
+                        "best_turnover_day": self._best_day(connection, start, end, "turnover"),
+                        "weekday": {"weekday": weekday[0], "orders": weekday[1]} if weekday else None,
+                        "hour": {"hour": hour[0], "orders": hour[1]} if hour else None}
         except (sqlite3.Error, OSError, InvalidOperation):
             raise StateError("Sales analytics read failed.") from None
 
@@ -1153,13 +1233,22 @@ class ReviewReceiptStore:
             with closing(self._connect()) as connection:
                 connection.execute("BEGIN")
                 archived_orders = connection.execute(
-                    "SELECT amount, currency FROM legacy_stats "
-                    "WHERE kind = 'order' AND recorded_at BETWEEN ? AND ?",
+                    "SELECT COALESCE(o.amount, l.amount), "
+                    "COALESCE(o.confirmed_currency, o.currency, l.currency) "
+                    "FROM legacy_stats l LEFT JOIN orders o ON o.order_id = l.record_key "
+                    "WHERE l.kind = 'order' "
+                    "AND COALESCE(o.closed_at_utc, l.recorded_at) BETWEEN ? AND ? "
+                    "AND (o.current_status IS NULL OR o.current_status != 'REFUNDED') "
+                    "AND (o.official_status IS NULL OR o.official_status = 'closed')",
                     (start, now_utc),
                 ).fetchall()
                 current_orders = connection.execute(
-                    "SELECT o.amount, o.currency FROM orders AS o "
-                    "WHERE o.closed_at_utc BETWEEN ? AND ? AND NOT EXISTS ("
+                    "SELECT COALESCE(o.amount, o.listed_price), "
+                    "COALESCE(o.confirmed_currency, o.currency) FROM orders AS o "
+                    "WHERE o.current_status = 'CLOSED' "
+                    "AND (o.official_status IS NULL OR o.official_status NOT IN "
+                    "('refunded', 'partially_refunded')) "
+                    "AND o.closed_at_utc BETWEEN ? AND ? AND NOT EXISTS ("
                     "SELECT 1 FROM legacy_stats AS l WHERE l.kind = 'order' "
                     "AND l.record_key = o.order_id)",
                     (start, now_utc),

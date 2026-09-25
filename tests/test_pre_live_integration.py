@@ -265,6 +265,7 @@ class MessageLimitsTests(unittest.IsolatedAsyncioTestCase):
         await runtime["_fetch_and_send_review"](bot, client, "ABC12345")
         self.assertEqual(len(sent), 1)
         review.text = "Changed"
+        review.stars = 3
         await runtime["_fetch_and_send_review"](bot, client, "ABC12345")
         self.assertEqual(len(sent), 2)
         self.assertIn("Отзыв изменён", sent[1])
@@ -273,8 +274,11 @@ class MessageLimitsTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(db.execute(
                 "SELECT COUNT(*) FROM review_observations WHERE order_id = 'ABC12345'"
             ).fetchone()[0], 1)
+            self.assertEqual(db.execute(
+                "SELECT rating FROM review_observations WHERE order_id = 'ABC12345'"
+            ).fetchone()[0], 3)
         self.assertEqual(self.store.get_review_receipt("ABC12345")[1],
-                         runtime["_review_fingerprint"](5, "Changed"))
+                         runtime["_review_fingerprint"](3, "Changed"))
 
 
 class PrivacyTests(unittest.TestCase):

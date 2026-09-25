@@ -17,7 +17,8 @@ load_dotenv()
 import FunPayAPI
 from telegram import (dp, bot_settings, get_user_settings, get_all_recipients,
                       set_runtime_status_context, clear_runtime_status_context,
-                      disable_autobump, get_reply_keyboard, is_night_mode_enabled,
+                      disable_autobump, enable_autobump_on_startup,
+                      get_reply_keyboard, is_night_mode_enabled,
                       is_safe_mode_enabled, record_withdrawal_poll,
                       set_telegram_polling_state, _set_problem, _clear_problem,
                       _audit_action,
@@ -316,7 +317,8 @@ async def _fetch_and_send_review(
             if getattr(client, "_review_state_failed", False):
                 raise StateError("Persistent state unavailable.")
             await _review_state_operation(
-                client, client.review_state.record_review_observation, verified_order_id
+                client, client.review_state.record_review_observation,
+                verified_order_id, None, stars if type(stars) is int and 1 <= stars <= 5 else None,
             )
             if client._notified_reviews.get(verified_order_id) == fingerprint:
                 return
@@ -976,8 +978,6 @@ async def main():
             raise ValueError
     except ValueError:
         raise RuntimeError("ADMIN_ID и FUNPAY_USER_ID должны быть положительными числовыми ID.") from None
-    # Каждый новый process lifecycle требует явного ручного включения.
-    disable_autobump()
     # ОДИН общий клиент/аккаунт на весь бот - и для поднятия лотов, и для уведомлений.
     client = FunPayClient(golden_key)
 
@@ -1014,6 +1014,7 @@ async def main():
 
     runtime_ready = False
     try:
+        enable_autobump_on_startup()
         logger.success("Бот подключен к Telegram. Запуск фоновых процессов...")
         await _send_runtime_notice(bot, "🟢 Бот запущен.", restore_keyboard=True)
         runtime_ready = True
