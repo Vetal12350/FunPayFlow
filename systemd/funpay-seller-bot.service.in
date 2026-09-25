@@ -1,0 +1,19 @@
+[Unit]
+Description=FunPay Seller Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=@USER@
+WorkingDirectory=@CODE_DIR@
+EnvironmentFile=@ENV_FILE@
+Environment="FUNPAY_BOT_DATA_DIR=@DATA_VALUE@"
+ExecStart=@PYTHON@ @MAIN@
+KillSignal=SIGTERM
+TimeoutStopSec=40
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
