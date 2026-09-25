@@ -229,6 +229,7 @@ class RuntimeCoreTests(unittest.TestCase):
             "QueuedCriticalEvent": QueuedCriticalEvent, "ReviewCheckEvent": ReviewCheckEvent,
             "bot_settings": {"stats_currency": "USD", "review_request_enabled": False},
             "is_review_request_enabled": lambda: False,
+            "module_enabled": lambda feature_id: feature_id != "notifications",
             "_send_night_mode_reply": no_night_reply,
             "_fetch_and_send_review": no_review_check,
             "_send_scheduled_review_request": no_review_check,

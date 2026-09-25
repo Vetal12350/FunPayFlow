@@ -39,9 +39,13 @@ class OperationsTests(unittest.IsolatedAsyncioTestCase):
         self.original_file = ui.SETTINGS_FILE
         self.original_client = ui._runtime_client
         self.original_started = ui._runtime_started_at
+        self.original_effective = ui._effective_modules
         ui.SETTINGS_FILE = str(Path(self.tmp.name) / "settings.json")
         ui.bot_settings.clear()
         ui.bot_settings.update(copy.deepcopy(ui._DEFAULT_GLOBAL_SETTINGS))
+        ui.bot_settings["modules"] = ui.profile_modules("all")
+        ui.bot_settings["setup_completed"] = True
+        ui.configure_module_runtime(fresh_install=False)
         ui._user_settings.clear()
         ui._active_problems.clear()
         self.store = ReviewReceiptStore(Path(self.tmp.name) / "state.sqlite3",
@@ -64,6 +68,7 @@ class OperationsTests(unittest.IsolatedAsyncioTestCase):
         ui._user_settings.update(self.original_users)
         ui._runtime_client = self.original_client
         ui._runtime_started_at = self.original_started
+        ui._effective_modules = self.original_effective
         ui._active_problems.clear()
         self.tmp.cleanup()
 
@@ -156,6 +161,7 @@ class OperationsTests(unittest.IsolatedAsyncioTestCase):
                     if isinstance(n, ast.AsyncFunctionDef) and n.name == "auto_bump_loop")
         namespace = {"Bot": object, "FunPayClient": object, "asyncio": asyncio,
                      "bot_settings": ui.bot_settings, "is_safe_mode_enabled": ui.is_safe_mode_enabled,
+                     "restart_requested": lambda: False, "module_enabled": ui.module_enabled,
                      "_require_env": lambda key: "1", "get_all_recipients": lambda: [],
                      "_AmbiguousRaiseOutcome": type("_AmbiguousRaiseOutcome", (Exception,), {}),
                      "logger": SimpleNamespace(bump=lambda *args: None)}

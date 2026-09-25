@@ -13,6 +13,7 @@ from bs4 import BeautifulSoup
 import FunPayAPI
 from FunPayAPI.common.enums import SubCategoryTypes
 import logger
+from runtime_control import automatic_action_gate
 from runtime_events import (ActionEvent, ActionKind, QueuedCriticalEvent,
                             critical_snapshot, hydrate_critical, html_preview)
 
@@ -190,8 +191,12 @@ class FunPayClient:
 
         def action_gated_method(request_method, api_method, headers, payload, *args, **kwargs):
             allowed = getattr(self._raise_action_gate, "is_allowed", None)
-            if api_method == "lots/raise" and allowed is not None and not allowed():
-                raise _AutobumpActionCancelled()
+            if api_method == "lots/raise":
+                with automatic_action_gate() as restart_allowed:
+                    if not restart_allowed or (allowed is not None and not allowed()):
+                        raise _AutobumpActionCancelled()
+                    return original_account_method(
+                        request_method, api_method, headers, payload, *args, **kwargs)
             return original_account_method(request_method, api_method, headers, payload, *args, **kwargs)
 
         self.account.method = action_gated_method
@@ -235,24 +240,27 @@ class FunPayClient:
             account = self.account
             if not account.is_initiated:
                 raise FunPayAPI.exceptions.AccountNotInitiatedError()
-            with self._outgoing_echo_lock:
-                self._recent_outgoing_text[chat_id] = (text, time.monotonic())
-                if len(self._recent_outgoing_text) > 10000:
-                    self._recent_outgoing_text.pop(next(iter(self._recent_outgoing_text)))
             request = {"action": "chat_message", "data": {
                 "node": chat_id, "last_message": -1,
                 "content": f"{account.bot_character}{text}",
             }}
             objects = [{"type": "chat_node", "id": chat_id, "tag": "00000000",
                         "data": {"node": chat_id, "last_message": -1, "content": ""}}]
-            response = account.method(
-                "post", "runner/",
-                {"accept": "*/*", "content-type": "application/x-www-form-urlencoded; charset=UTF-8",
-                 "x-requested-with": "XMLHttpRequest"},
-                {"objects": json.dumps(objects), "request": json.dumps(request),
-                 "csrf_token": account.csrf_token},
-                raise_not_200=True,
-            )
+            with automatic_action_gate() as restart_allowed:
+                if not restart_allowed or (enabled_check is not None and not enabled_check()):
+                    return False
+                with self._outgoing_echo_lock:
+                    self._recent_outgoing_text[chat_id] = (text, time.monotonic())
+                    if len(self._recent_outgoing_text) > 10000:
+                        self._recent_outgoing_text.pop(next(iter(self._recent_outgoing_text)))
+                response = account.method(
+                    "post", "runner/",
+                    {"accept": "*/*", "content-type": "application/x-www-form-urlencoded; charset=UTF-8",
+                     "x-requested-with": "XMLHttpRequest"},
+                    {"objects": json.dumps(objects), "request": json.dumps(request),
+                     "csrf_token": account.csrf_token},
+                    raise_not_200=True,
+                )
             payload = response.json()
             confirmation = payload.get("response") if type(payload) is dict else None
             if type(confirmation) is not dict or not confirmation or confirmation.get("error") is not None:

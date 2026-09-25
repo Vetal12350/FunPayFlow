@@ -1,5 +1,6 @@
 """Synthetic SQLite sales analytics checks; no bot startup or network."""
 import log_isolation
+import copy
 import sqlite3
 import tempfile
 import time
@@ -10,7 +11,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import telegram as ui
-from state import ReviewReceiptStore
+from state import ReviewReceiptStore, StateError, normalize_reporting_currency
 
 
 class Callback:
@@ -34,13 +35,200 @@ class SalesAnalyticsTests(unittest.IsolatedAsyncioTestCase):
         self.store = ReviewReceiptStore(self.path, Path(self.tmp.name) / "missing.json")
         self.store.initialize()
         self.previous_client = ui._runtime_client
+        self.previous_currency = ui.bot_settings["stats_currency"]
+        self.previous_primary_currency = ui.bot_settings["primary_currency"]
+        self.previous_filter = dict(ui._analytics_currency_filters)
+        self.previous_settings = copy.deepcopy(ui.bot_settings)
+        self.previous_effective = ui._effective_modules
         ui._runtime_client = SimpleNamespace(review_state=self.store)
+        ui.bot_settings["modules"] = ui.profile_modules("all")
+        ui.bot_settings["setup_completed"] = True
+        ui.configure_module_runtime(fresh_install=False)
+        ui.bot_settings["stats_currency"] = "USD"
+        ui.bot_settings["primary_currency"] = "USD"
+        ui._analytics_currency_filters.clear()
         self.midnight = int(datetime(2026, 9, 24).timestamp())
         self.now = self.midnight + 18 * 3600
 
     async def asyncTearDown(self):
         ui._runtime_client = self.previous_client
+        ui.bot_settings["stats_currency"] = self.previous_currency
+        ui.bot_settings["primary_currency"] = self.previous_primary_currency
+        ui._analytics_currency_filters.clear()
+        ui._analytics_currency_filters.update(self.previous_filter)
+        ui.bot_settings.clear()
+        ui.bot_settings.update(self.previous_settings)
+        ui._effective_modules = self.previous_effective
         self.tmp.cleanup()
+
+    def test_configured_currency_selects_money_without_changing_counts_or_rows(self):
+        for order_id, amount, currency in (
+            ("AA000001", 10, "USD"), ("AA000002", 20, " rub "),
+            ("AA000003", 30, "eur"), ("AA000004", 40, "GBP"),
+            ("AA000005", 50, "XYZ"), ("AA000006", 60, None),
+        ):
+            self.sale(order_id, -100, price=amount, currency=currency,
+                      product=currency or "unknown")
+        for index, currency in enumerate(("USD", "$", "RUB", "EUR"), 1):
+            self.store.record_withdrawal_observation(
+                f"withdraw{index}", index, currency, self.now - 50)
+        with closing(sqlite3.connect(self.path)) as db:
+            before = db.execute(
+                "SELECT order_id, confirmed_currency, listed_price FROM orders ORDER BY order_id"
+            ).fetchall()
+        expected = {"USD": ("10", 2, "3"), "RUB": ("20", 1, "3"),
+                    "EUR": ("30", 1, "4"), "GBP": ("40", 0, "0"),
+                    "XYZ": ("50", 0, "0")}
+        for currency, (turnover, withdrawals, withdrawal_amount) in expected.items():
+            overview = self.store.get_sales_overview("today", self.now, currency=currency)
+            legacy = self.store.get_legacy_statistics("today", self.now, currency=currency)
+            self.assertEqual((overview["orders"], overview["usd_orders"],
+                              overview["usd_turnover"]), (6, 1, turnover))
+            self.assertEqual((legacy["orders_count"], legacy["withdrawals_count"],
+                              str(legacy["usd_turnover"]),
+                              str(legacy["usd_withdrawals"])),
+                             (6, 4, turnover, withdrawal_amount))
+            self.assertEqual(self.store.get_sales_records(currency)["most_expensive"]
+                             ["usd_amount"], turnover)
+            self.assertEqual(self.store.get_sales_top_products(
+                "today", "turnover", self.now, currency)[0]["usd_turnover"], turnover)
+        self.assertEqual(self.store.get_sales_reviews("today", self.now)["closed_orders"], 6)
+        with closing(sqlite3.connect(self.path)) as db:
+            after = db.execute(
+                "SELECT order_id, confirmed_currency, listed_price FROM orders ORDER BY order_id"
+            ).fetchall()
+        self.assertEqual(before, after)
+
+    def test_display_normalization_and_rejection(self):
+        self.assertEqual(normalize_reporting_currency(" eur "), "EUR")
+        for invalid in (None, "$", "EU1", "РУБ", "ßs", "USD'", "US D"):
+            with self.assertRaises(StateError):
+                normalize_reporting_currency(invalid)
+        for currency, display in (("USD", "$"), ("EUR", "€"),
+                                  ("GBP", "£"), ("UAH", "₴"),
+                                  ("RUB", "RUB"), ("XYZ", "XYZ")):
+            ui.bot_settings["stats_currency"] = currency
+            ui.bot_settings["primary_currency"] = currency
+            self.assertEqual(ui._analytics_money("12.5"), f"12.50 {display}")
+            text = ui.format_stats_text("today", {"orders_count": 1, "reviews_count": 0,
+                                                  "usd_turnover": 12.5,
+                                                  "withdrawals_count": 0,
+                                                  "usd_withdrawals": 0})
+            self.assertIn(f"12.50 {display}", text)
+
+    def test_money_period_comparison_uses_the_same_selected_currency(self):
+        self.sale("AA000001", -100, price=20, currency="RUB")
+        self.sale("AA000002", -100, price=900, currency="USD")
+        self.sale("AA000003", -86400, price=10, currency="RUB")
+        self.sale("AA000004", -86400, price=800, currency="USD")
+        rub = self.store.get_sales_overview("today", self.now, "RUB")
+        usd = self.store.get_sales_overview("today", self.now, "USD")
+        self.assertEqual((rub["orders"], rub["previous_orders"]), (2, 2))
+        self.assertEqual((rub["usd_turnover"], rub["previous_usd_turnover"]),
+                         ("20", "10"))
+        self.assertEqual((usd["usd_turnover"], usd["previous_usd_turnover"]),
+                         ("900", "800"))
+        self.assertEqual(self.store.get_sales_by_time("today", self.now, "RUB")
+                         ["best_turnover_day"]["usd_turnover"], "20")
+
+    async def test_telegram_uses_selected_currency_for_sales_query(self):
+        self.sale("AA000001", -100, price=10, currency="USD")
+        self.sale("AA000002", -100, price=20, currency="RUB")
+        ui.bot_settings["stats_currency"] = "RUB"
+        ui.bot_settings["primary_currency"] = "RUB"
+        callback = Callback("ana_over:all")
+        self.assertTrue(await ui._analytics_callback(callback, callback.data))
+        self.assertEqual(len(callback.edits), 1)
+        self.assertIn("20.00 RUB", callback.edits[0][0])
+        self.assertNotIn("30.00 RUB", callback.edits[0][0])
+
+    def test_historical_currencies_statistics_and_no_cross_currency_sum(self):
+        self.sale("AA000001", -100, price=10, currency="USD")
+        self.sale("AA000002", -100, price=20, currency=" rub ")
+        self.sale("AA000003", -100, price=999, currency="UNKNOWN")
+        self.store.record_withdrawal_observation("one", 3, "USD", self.now - 20)
+        self.store.record_withdrawal_observation("two", 4, "RUB", self.now - 20)
+        with closing(sqlite3.connect(self.path)) as db:
+            self.assertEqual(db.execute("SELECT confirmed_currency FROM orders "
+                                        "WHERE order_id = 'AA000002'").fetchone()[0], "rub")
+            before = db.execute("SELECT order_id, confirmed_currency FROM orders "
+                                "ORDER BY order_id").fetchall()
+        self.assertEqual(self.store.get_sales_currencies(), ["RUB", "USD"])
+        self.assertEqual(self.store.get_sales_turnover_by_currency("today", self.now),
+                         {"RUB": "20", "USD": "10"})
+        data = self.store.get_legacy_statistics("today", self.now)
+        self.assertEqual(data["orders_count"], 3)
+        self.assertEqual(data["turnover_by_currency"], {"USD": 10, "RUB": 20})
+        self.assertEqual(data["withdrawals_by_currency"], {"USD": 3, "RUB": 4})
+        text = ui.format_stats_text("today", data)
+        for expected in ("10.00 $", "20.00 RUB", "3.00 $", "4.00 RUB"):
+            self.assertIn(expected, text)
+        self.assertNotIn("30.00 $", text)
+        self.assertNotIn("7.00 $", text)
+        with closing(sqlite3.connect(self.path)) as db:
+            after = db.execute("SELECT order_id, confirmed_currency FROM orders "
+                               "ORDER BY order_id").fetchall()
+        self.assertEqual(before, after)
+
+    def test_one_currency_statistics_remain_compact(self):
+        self.sale("AA000001", -100, price=10, currency="USD")
+        data = self.store.get_legacy_statistics("today", self.now)
+        text = ui.format_stats_text("today", data)
+        self.assertIn("💰 Оборот: <b>10.00 $</b>", text)
+        self.assertNotIn("💰 Оборот:\n•", text)
+
+    async def test_currency_filter_all_is_data_driven_and_never_ranks_mixed_money(self):
+        self.sale("AA000001", -100, price=10, currency="USD", product="A", buyer="Buyer")
+        self.sale("AA000002", -100, price=20, currency="RUB", product="B", buyer="Buyer")
+        ui.bot_settings["primary_currency"] = "USD"
+        opening = Callback("analytics")
+        await ui._analytics_callback(opening, opening.data)
+        buttons = {button.text: button.callback_data
+                   for row in opening.edits[0][1]["reply_markup"].inline_keyboard
+                   for button in row}
+        self.assertEqual(buttons["✅ USD"], "ana_currency:USD:30d")
+        self.assertEqual(buttons["RUB"], "ana_currency:RUB:30d")
+        self.assertEqual(buttons["Все"], "ana_currency:all:30d")
+        self.assertEqual(ui._action_feature("ana_currency:RUB:30d"), "sales_analytics")
+
+        selected = Callback("ana_currency:RUB:all")
+        await ui._analytics_callback(selected, selected.data)
+        self.assertIn("20.00 RUB", selected.edits[0][0])
+        self.assertNotIn("10.00 $", selected.edits[0][0])
+        self.assertEqual(ui.bot_settings["primary_currency"], "USD")
+        selected = Callback("ana_currency:all:all")
+        await ui._analytics_callback(selected, selected.data)
+        all_text = selected.edits[0][0]
+        self.assertIn("Заказов: 2", all_text)
+        self.assertIn("USD: 10.00 $", all_text)
+        self.assertIn("RUB: 20.00 RUB", all_text)
+        self.assertNotIn("Средний чек", all_text)
+        self.assertNotIn("Самый дорогой", all_text)
+        self.assertNotIn("30.00", all_text)
+        self.assertEqual(ui.bot_settings["primary_currency"], "USD")
+        today = Callback("ana_currency:all:today")
+        await ui._analytics_callback(today, today.data)
+        self.assertNotIn("Лучший день продаж", today.edits[0][0])
+        top = Callback("ana_top:all:count")
+        await ui._analytics_callback(top, top.data)
+        self.assertNotIn("💰", top.edits[0][0])
+        self.assertNotIn("ana_top:all:turnover", {
+            button.callback_data for row in top.edits[0][1]["reply_markup"].inline_keyboard
+            for button in row})
+        records = Callback("ana_records")
+        await ui._analytics_callback(records, records.data)
+        self.assertNotIn("Самый дорогой", records.edits[0][0])
+        self.assertNotIn("максимальным оборотом", records.edits[0][0])
+
+    def test_best_day_only_for_multi_day_periods(self):
+        self.sale("AA000001", -100, price=10, currency="USD")
+        for period in ("today", "7d", "30d", "all"):
+            data = self.store.get_sales_overview(period, self.now)
+            text = ui._analytics_overview_text(period, data)
+            self.assertEqual("Лучший день продаж" in text, period != "today")
+            time_data = self.store.get_sales_by_time(period, self.now)
+            time_text = ui._analytics_time_text(period, time_data)
+            self.assertEqual("Лучший день продаж" in time_text, period != "today")
 
     def sale(self, order_id, offset, *, price=None, currency=None, product=None,
              subcategory=None, buyer_id=None, buyer=None):

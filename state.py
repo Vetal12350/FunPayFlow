@@ -49,20 +49,20 @@ def _decimal_compare(left: str, right: str) -> int:
 
 # A sale is a first observed CLOSED transition, an archived old-bot closure,
 # or (all-time only) a sparse old CLOSED row with no trustworthy date.
-# The old bot hard-coded '$'; neither its currency nor the current settings
-# fallback proves USD. Only confirmed_currency may qualify an order for money.
-_USD_AMOUNT = ("CASE WHEN o.confirmed_currency = 'USD' "
+# Only confirmed_currency may qualify an order for sales money. The SQL token
+# is replaced with a validated reporting currency, never with source data.
+_REPORTING_AMOUNT = ("CASE WHEN UPPER(TRIM(o.confirmed_currency)) = '__CURRENCY__' "
                "AND o.official_status IS NOT 'partially_refunded' "
                "THEN COALESCE(o.amount, o.listed_price) END")
 _SALE_COLUMNS = ("o.order_id, COALESCE(o.lot_summary, o.product_description) "
                  "AS product_description, COALESCE(o.section_name, o.subcategory_name) "
                  "AS subcategory_name, o.game_id, o.section_type_id, o.section_local_id, "
-                 "o.buyer_id, o.buyer_username, " + _USD_AMOUNT + " AS usd_amount")
+                 "o.buyer_id, o.buyer_username, " + _REPORTING_AMOUNT + " AS usd_amount")
 _ARCHIVE_COLUMNS = ("l.record_key AS order_id, "
                     "COALESCE(o.lot_summary, o.product_description) AS product_description, "
                     "COALESCE(o.section_name, o.subcategory_name) AS subcategory_name, "
                     "o.game_id, o.section_type_id, o.section_local_id, "
-                    "o.buyer_id, o.buyer_username, " + _USD_AMOUNT + " AS usd_amount")
+                    "o.buyer_id, o.buyer_username, " + _REPORTING_AMOUNT + " AS usd_amount")
 _SALES_CTE = (
     "sale_source AS ("
     "SELECT " + _SALE_COLUMNS + ", COALESCE(o.paid_at_utc, s.first_observed_at) AS sale_at "
@@ -91,6 +91,41 @@ _SALES_CTE = (
     "), sales AS (SELECT * FROM sale_source WHERE "
     "(? IS NULL OR (sale_at >= ? AND sale_at < ?)))"
 )
+
+
+def normalize_reporting_currency(value: str) -> str:
+    """Validate the explicitly selected ISO-style reporting code."""
+    if type(value) is not str:
+        raise StateError("Invalid reporting currency.")
+    raw = value.strip()
+    if re.fullmatch(r"[A-Za-z]{3}", raw) is None:
+        raise StateError("Invalid reporting currency.")
+    return raw.upper()
+
+
+def _sales_cte(currency: str) -> str:
+    return _SALES_CTE.replace("__CURRENCY__", normalize_reporting_currency(currency))
+
+
+def _matches_reporting_currency(raw: str | None, selected: str) -> bool:
+    if type(raw) is not str:
+        return False
+    code = raw.strip()
+    return ((re.fullmatch(r"[A-Za-z]{3}", code) is not None
+             and code.upper() == selected)
+            or (selected == "USD" and code == "$"))
+
+
+def _stored_currency(raw: str | None, *, allow_legacy_dollar: bool = True) -> str | None:
+    """Only explicit three-letter codes (and the old dollar alias) carry money."""
+    if raw == "$" and allow_legacy_dollar:
+        return "USD"
+    try:
+        return normalize_reporting_currency(raw)
+    except StateError:
+        return None
+
+
 _REFUNDS_CTE = (
     "refund_source AS ("
     "SELECT order_id, first_observed_at AS refund_at FROM order_status_observations "
@@ -782,22 +817,60 @@ class ReviewReceiptStore:
         return connection
 
     @staticmethod
-    def _sales_totals(connection, start, end):
+    def _sales_totals(connection, start, end, currency="USD"):
         return connection.execute(
-            "WITH " + _SALES_CTE + " SELECT COUNT(*), COUNT(usd_amount), "
+            "WITH " + _sales_cte(currency) + " SELECT COUNT(*), COUNT(usd_amount), "
             "decimal_sum(usd_amount) FROM sales",
             ReviewReceiptStore._window_args(start, end),
         ).fetchone()
 
+    def get_sales_currencies(self) -> list[str]:
+        """Currencies actually persisted on eligible historical sale orders."""
+        try:
+            with closing(self._connect()) as connection:
+                rows = connection.execute(
+                    "SELECT DISTINCT confirmed_currency FROM orders "
+                    "WHERE confirmed_currency IS NOT NULL "
+                    "AND (current_status IS NULL OR current_status = 'CLOSED') "
+                    "AND (official_status IS NULL OR official_status NOT IN "
+                    "('refunded', 'partially_refunded'))"
+                ).fetchall()
+            return sorted({code for (raw,) in rows
+                           if (code := _stored_currency(raw, allow_legacy_dollar=False)) is not None})
+        except (sqlite3.Error, OSError):
+            raise StateError("Sales currency read failed.") from None
+
+    def get_sales_turnover_by_currency(self, period: str,
+                                       now_utc: int | None = None) -> dict[str, str]:
+        """Separate confirmed turnover; never add monetary values across codes."""
+        start, end, _, _ = self._analytics_window(period, now_utc)
+        try:
+            with closing(self._analytics_connect()) as connection:
+                connection.execute("BEGIN")
+                rows = connection.execute(
+                    "SELECT DISTINCT confirmed_currency FROM orders "
+                    "WHERE confirmed_currency IS NOT NULL"
+                ).fetchall()
+                codes = sorted({code for (raw,) in rows
+                                if (code := _stored_currency(raw, allow_legacy_dollar=False)) is not None})
+                result = {}
+                for code in codes:
+                    _, count, amount = self._sales_totals(connection, start, end, code)
+                    if count:
+                        result[code] = amount
+                return result
+        except (sqlite3.Error, OSError, InvalidOperation):
+            raise StateError("Sales analytics read failed.") from None
+
     @staticmethod
-    def _top_products(connection, start, end, sort="count", limit=10):
+    def _top_products(connection, start, end, sort="count", limit=10, currency="USD"):
         if sort not in ("count", "turnover") or type(limit) is not int or not 1 <= limit <= 10:
             raise StateError("Invalid analytics sort.")
         rank = ("orders_count DESC, product_description, subcategory_name" if sort == "count"
                 else "usd_turnover COLLATE DECIMAL DESC, orders_count DESC, product_description")
         having = " HAVING COUNT(usd_amount) > 0" if sort == "turnover" else ""
         rows = connection.execute(
-            "WITH " + _SALES_CTE + " SELECT product_description, "
+            "WITH " + _sales_cte(currency) + " SELECT product_description, "
             "MIN(subcategory_name) AS subcategory_name, "
             "COUNT(*) AS orders_count, decimal_sum(usd_amount) AS usd_turnover "
             "FROM sales WHERE product_description IS NOT NULL "
@@ -812,9 +885,9 @@ class ReviewReceiptStore:
                 for row in rows]
 
     @staticmethod
-    def _top_buyers(connection, start, end, limit=10):
+    def _top_buyers(connection, start, end, limit=10, currency="USD"):
         rows = connection.execute(
-            "WITH " + _SALES_CTE + ", buyer_groups AS ("
+            "WITH " + _sales_cte(currency) + ", buyer_groups AS ("
             "SELECT CASE WHEN buyer_id IS NOT NULL THEN 'id:' || buyer_id "
             "ELSE 'name:' || buyer_username END AS buyer_key, "
             "MIN(buyer_username) AS username, COUNT(*) AS orders_count "
@@ -827,14 +900,14 @@ class ReviewReceiptStore:
         return [{"username": row[0], "orders": row[1]} for row in rows]
 
     @staticmethod
-    def _best_day(connection, start, end, sort="count"):
+    def _best_day(connection, start, end, sort="count", currency="USD"):
         if sort not in ("count", "turnover"):
             raise StateError("Invalid analytics sort.")
         having = " HAVING COUNT(usd_amount) > 0" if sort == "turnover" else ""
         rank = ("orders_count DESC, day DESC" if sort == "count"
                 else "usd_turnover COLLATE DECIMAL DESC, orders_count DESC, day DESC")
         row = connection.execute(
-            "WITH " + _SALES_CTE + " SELECT date(sale_at, 'unixepoch', 'localtime') AS day, "
+            "WITH " + _sales_cte(currency) + " SELECT date(sale_at, 'unixepoch', 'localtime') AS day, "
             "COUNT(*) AS orders_count, decimal_sum(usd_amount) AS usd_turnover "
             "FROM sales WHERE sale_at IS NOT NULL GROUP BY day" + having +
             " ORDER BY " + rank + " LIMIT 1",
@@ -843,23 +916,25 @@ class ReviewReceiptStore:
         return dict(zip(("day", "orders", "usd_turnover"), row)) if row else None
 
     @staticmethod
-    def _most_expensive(connection, start, end):
+    def _most_expensive(connection, start, end, currency="USD"):
         row = connection.execute(
-            "WITH " + _SALES_CTE + " SELECT order_id, product_description, usd_amount "
+            "WITH " + _sales_cte(currency) + " SELECT order_id, product_description, usd_amount "
             "FROM sales WHERE usd_amount IS NOT NULL "
             "ORDER BY usd_amount COLLATE DECIMAL DESC, order_id LIMIT 1",
             ReviewReceiptStore._window_args(start, end),
         ).fetchone()
         return dict(zip(("order_id", "product", "usd_amount"), row)) if row else None
 
-    def get_sales_overview(self, period: str, now_utc: int | None = None) -> dict:
+    def get_sales_overview(self, period: str, now_utc: int | None = None,
+                           currency: str = "USD") -> dict:
+        currency = normalize_reporting_currency(currency)
         start, end, previous_start, previous_end = self._analytics_window(period, now_utc)
         try:
             with closing(self._analytics_connect()) as connection:
                 connection.execute("BEGIN")
-                orders, usd_orders, turnover = self._sales_totals(connection, start, end)
+                orders, usd_orders, turnover = self._sales_totals(connection, start, end, currency)
                 refunded, terminal = connection.execute(
-                    "WITH " + _SALES_CTE + ", " + _REFUNDS_CTE +
+                    "WITH " + _sales_cte(currency) + ", " + _REFUNDS_CTE +
                     " SELECT (SELECT COUNT(*) FROM refunds), "
                     "(SELECT COUNT(*) FROM (SELECT order_id FROM sales "
                     "UNION SELECT order_id FROM refunds))",
@@ -872,14 +947,14 @@ class ReviewReceiptStore:
                     self._window_args(start, end),
                 ).fetchone()[0]
                 reviews, reviewed_sales = connection.execute(
-                    "WITH " + _SALES_CTE + ", " + _REVIEWS_CTE +
+                    "WITH " + _sales_cte(currency) + ", " + _REVIEWS_CTE +
                     " SELECT (SELECT COUNT(*) FROM reviews), "
                     "(SELECT COUNT(*) FROM sales s WHERE EXISTS ("
                     "SELECT 1 FROM review_source r WHERE r.order_id = s.order_id))",
                     (*self._window_args(start, end), *self._window_args(start, end)),
                 ).fetchone()
                 buyers, repeat_buyers = connection.execute(
-                    "WITH " + _SALES_CTE + ", buyer_groups AS ("
+                    "WITH " + _sales_cte(currency) + ", buyer_groups AS ("
                     "SELECT CASE WHEN buyer_id IS NOT NULL THEN 'id:' || buyer_id "
                     "ELSE 'name:' || buyer_username END AS buyer_key, "
                     "COUNT(*) AS orders_count FROM sales "
@@ -887,7 +962,7 @@ class ReviewReceiptStore:
                     "SELECT COUNT(*), COALESCE(SUM(orders_count >= 2), 0) FROM buyer_groups",
                     self._window_args(start, end),
                 ).fetchone()
-                previous = (self._sales_totals(connection, previous_start, previous_end)
+                previous = (self._sales_totals(connection, previous_start, previous_end, currency)
                             if previous_start is not None else None)
                 return {
                     "orders": orders, "usd_orders": usd_orders,
@@ -896,11 +971,13 @@ class ReviewReceiptStore:
                     "partial_refunds": partial_refunds,
                     "reviews": reviews, "reviewed_sales": reviewed_sales,
                     "buyers": buyers, "repeat_buyers": repeat_buyers,
-                    "top_product": next(iter(self._top_products(connection, start, end, limit=1)), None),
+                    "top_product": next(iter(self._top_products(
+                        connection, start, end, limit=1, currency=currency)), None),
                     "top_turnover_product": next(iter(self._top_products(
-                        connection, start, end, sort="turnover", limit=1)), None),
-                    "most_expensive": self._most_expensive(connection, start, end),
-                    "best_day": self._best_day(connection, start, end),
+                        connection, start, end, sort="turnover", limit=1,
+                        currency=currency)), None),
+                    "most_expensive": self._most_expensive(connection, start, end, currency),
+                    "best_day": self._best_day(connection, start, end, currency=currency),
                     "previous_orders": previous[0] if previous else None,
                     "previous_usd_turnover": (previous[2] if previous[0] else "0")
                     if previous else None,
@@ -909,22 +986,27 @@ class ReviewReceiptStore:
             raise StateError("Sales analytics read failed.") from None
 
     def get_sales_top_products(self, period: str, sort: str = "count",
-                               now_utc: int | None = None) -> list[dict]:
+                               now_utc: int | None = None,
+                               currency: str = "USD") -> list[dict]:
+        currency = normalize_reporting_currency(currency)
         start, end, _, _ = self._analytics_window(period, now_utc)
         try:
             with closing(self._analytics_connect()) as connection:
-                return self._top_products(connection, start, end, sort=sort)
+                return self._top_products(connection, start, end, sort=sort,
+                                          currency=currency)
         except (sqlite3.Error, OSError, InvalidOperation):
             raise StateError("Sales analytics read failed.") from None
 
-    def get_sales_buyers(self, period: str, now_utc: int | None = None) -> dict:
+    def get_sales_buyers(self, period: str, now_utc: int | None = None,
+                         currency: str = "USD") -> dict:
+        currency = normalize_reporting_currency(currency)
         start, end, _, _ = self._analytics_window(period, now_utc)
         try:
             with closing(self._analytics_connect()) as connection:
                 connection.execute("BEGIN")
-                rows = self._top_buyers(connection, start, end)
+                rows = self._top_buyers(connection, start, end, currency=currency)
                 totals = connection.execute(
-                    "WITH " + _SALES_CTE + ", buyer_groups AS ("
+                    "WITH " + _sales_cte(currency) + ", buyer_groups AS ("
                     "SELECT CASE WHEN buyer_id IS NOT NULL THEN 'id:' || buyer_id "
                     "ELSE 'name:' || buyer_username END AS buyer_key, "
                     "COUNT(*) AS n FROM sales WHERE buyer_id IS NOT NULL "
@@ -936,12 +1018,14 @@ class ReviewReceiptStore:
         except (sqlite3.Error, OSError, InvalidOperation):
             raise StateError("Sales analytics read failed.") from None
 
-    def get_sales_reviews(self, period: str, now_utc: int | None = None) -> dict:
+    def get_sales_reviews(self, period: str, now_utc: int | None = None,
+                          currency: str = "USD") -> dict:
+        currency = normalize_reporting_currency(currency)
         start, end, _, _ = self._analytics_window(period, now_utc)
         try:
             with closing(self._analytics_connect()) as connection:
                 reviews, closed, reviewed = connection.execute(
-                    "WITH " + _SALES_CTE + ", " + _REVIEWS_CTE +
+                    "WITH " + _sales_cte(currency) + ", " + _REVIEWS_CTE +
                     " SELECT (SELECT COUNT(*) FROM reviews), "
                     "(SELECT COUNT(*) FROM sales), "
                     "(SELECT COUNT(*) FROM sales s WHERE EXISTS ("
@@ -964,45 +1048,54 @@ class ReviewReceiptStore:
         except (sqlite3.Error, OSError, InvalidOperation):
             raise StateError("Sales analytics read failed.") from None
 
-    def get_sales_by_time(self, period: str, now_utc: int | None = None) -> dict:
+    def get_sales_by_time(self, period: str, now_utc: int | None = None,
+                          currency: str = "USD") -> dict:
+        currency = normalize_reporting_currency(currency)
         start, end, _, _ = self._analytics_window(period, now_utc)
         try:
             with closing(self._analytics_connect()) as connection:
                 connection.execute("BEGIN")
                 weekday = connection.execute(
-                    "WITH " + _SALES_CTE +
+                    "WITH " + _sales_cte(currency) +
                     " SELECT CAST(strftime('%w', sale_at, 'unixepoch', 'localtime') AS INTEGER), "
                     "COUNT(*) AS n FROM sales WHERE sale_at IS NOT NULL "
                     "GROUP BY 1 ORDER BY n DESC, 1 LIMIT 1",
                     self._window_args(start, end),
                 ).fetchone()
                 hour = connection.execute(
-                    "WITH " + _SALES_CTE +
+                    "WITH " + _sales_cte(currency) +
                     " SELECT CAST(strftime('%H', sale_at, 'unixepoch', 'localtime') AS INTEGER), "
                     "COUNT(*) AS n FROM sales WHERE sale_at IS NOT NULL "
                     "GROUP BY 1 ORDER BY n DESC, 1 LIMIT 1",
                     self._window_args(start, end),
                 ).fetchone()
-                return {"best_day": self._best_day(connection, start, end),
-                        "best_turnover_day": self._best_day(connection, start, end, "turnover"),
+                return {"best_day": self._best_day(connection, start, end,
+                                                    currency=currency),
+                        "best_turnover_day": self._best_day(
+                            connection, start, end, "turnover", currency),
                         "weekday": {"weekday": weekday[0], "orders": weekday[1]} if weekday else None,
                         "hour": {"hour": hour[0], "orders": hour[1]} if hour else None}
         except (sqlite3.Error, OSError, InvalidOperation):
             raise StateError("Sales analytics read failed.") from None
 
-    def get_sales_records(self) -> dict:
+    def get_sales_records(self, currency: str = "USD") -> dict:
+        currency = normalize_reporting_currency(currency)
         try:
             with closing(self._analytics_connect()) as connection:
                 connection.execute("BEGIN")
                 start = end = None
                 return {
-                    "most_expensive": self._most_expensive(connection, start, end),
-                    "top_product": next(iter(self._top_products(connection, start, end, limit=1)), None),
+                    "most_expensive": self._most_expensive(connection, start, end, currency),
+                    "top_product": next(iter(self._top_products(
+                        connection, start, end, limit=1, currency=currency)), None),
                     "top_turnover_product": next(iter(self._top_products(
-                        connection, start, end, sort="turnover", limit=1)), None),
-                    "best_day": self._best_day(connection, start, end),
-                    "best_turnover_day": self._best_day(connection, start, end, "turnover"),
-                    "top_buyer": next(iter(self._top_buyers(connection, start, end, limit=1)), None),
+                        connection, start, end, sort="turnover", limit=1,
+                        currency=currency)), None),
+                    "best_day": self._best_day(connection, start, end, currency=currency),
+                    "best_turnover_day": self._best_day(
+                        connection, start, end, "turnover", currency),
+                    "top_buyer": next(iter(self._top_buyers(
+                        connection, start, end, limit=1, currency=currency)), None),
                 }
         except (sqlite3.Error, OSError, InvalidOperation):
             raise StateError("Sales analytics read failed.") from None
@@ -1012,11 +1105,13 @@ class ReviewReceiptStore:
         """Only fixed action metadata is accepted; never persist message bodies."""
         allowed_actions = {
             "AUTOBUMP", "NIGHT_MODE", "REVIEW_REQUEST", "SAFE_MODE",
-            "REVIEW_REQUEST_SEND", "SETTINGS",
+            "REVIEW_REQUEST_SEND", "SETTINGS", "MODULES", "PROFILE", "RESTART",
         }
         allowed_results = {"ON", "OFF", "CREATED", "UPDATED", "DELETED",
-                           "SUCCESS", "FAILED", "BLOCKED", "AMBIGUOUS"}
-        allowed_targets = {"global", "order", "settings"}
+                           "SUCCESS", "FAILED", "BLOCKED", "AMBIGUOUS",
+                           "SAVED", "APPLIED", "REQUESTED"}
+        allowed_targets = {"global", "order", "settings", "configuration",
+                           "minimal", "seller", "all", "manual"}
         if (not (actor in ("system", "automation") or
                  (type(actor) is str and re.fullmatch(r"telegram:[1-9][0-9]{0,19}", actor)))
                 or action not in allowed_actions or target not in allowed_targets
@@ -1222,8 +1317,10 @@ class ReviewReceiptStore:
 
     def get_legacy_statistics(
         self, period: str, now_utc: int | float | None = None,
+        currency: str = "USD",
     ) -> dict:
         """Архив старого бота + новые закрытия и проверенные buyer reviews."""
+        currency = normalize_reporting_currency(currency)
         if period not in ("today", "week", "month"):
             raise StateError("Invalid statistics period.")
         if now_utc is None:
@@ -1285,24 +1382,40 @@ class ReviewReceiptStore:
                     "AND l.record_key = w.transaction_id)",
                     (start, now_utc),
                 ).fetchall()
-                # Только подтверждённый USD: не переводим другие/неизвестные валюты.
+                # Legacy result keys retain their names for existing callers. Their
+                # amounts now refer only to the selected reporting currency.
                 usd_turnover = sum(
-                    (Decimal(amount) for amount, currency in archived_orders + current_orders
-                     if amount is not None and currency in ("USD", "$")),
+                    (Decimal(amount) for amount, source_currency in
+                     archived_orders + current_orders
+                     if amount is not None
+                     and _matches_reporting_currency(source_currency, currency)),
                     Decimal(0),
                 )
                 usd_withdrawals = sum(
-                    (Decimal(amount) for amount, currency in
+                    (Decimal(amount) for amount, source_currency in
                      archived_withdrawals + current_withdrawals
-                     if amount is not None and currency in ("USD", "$")),
+                     if amount is not None
+                     and _matches_reporting_currency(source_currency, currency)),
                     Decimal(0),
                 )
+                turnover_by_currency = {}
+                withdrawals_by_currency = {}
+                for rows, target in ((archived_orders + current_orders, turnover_by_currency),
+                                     (archived_withdrawals + current_withdrawals,
+                                      withdrawals_by_currency)):
+                    for amount, raw_currency in rows:
+                        code = _stored_currency(raw_currency)
+                        if code is None or amount is None:
+                            continue
+                        target[code] = target.get(code, Decimal(0)) + Decimal(amount)
                 return {
                     "orders_count": len(archived_orders) + len(current_orders),
                     "reviews_count": archived_reviews + current_reviews,
                     "usd_turnover": usd_turnover,
                     "withdrawals_count": len(archived_withdrawals) + len(current_withdrawals),
                     "usd_withdrawals": usd_withdrawals,
+                    "turnover_by_currency": turnover_by_currency,
+                    "withdrawals_by_currency": withdrawals_by_currency,
                 }
         except (sqlite3.Error, OSError):
             raise StateError("Persistent statistics read failed.") from None

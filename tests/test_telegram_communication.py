@@ -12,6 +12,7 @@ from unittest.mock import patch
 
 import telegram as ui
 from runtime_events import ActionEvent, ActionKind
+from runtime_control import automatic_action_gate, restart_requested
 
 
 class FakeMessage:
@@ -64,11 +65,13 @@ class CommunicationTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.previous_settings = copy.deepcopy(ui.bot_settings)
+        self.previous_effective = ui._effective_modules
         self.previous_client = ui._runtime_client
         self.previous_file = ui.SETTINGS_FILE
         ui.SETTINGS_FILE = str(Path(self.tmp.name) / "settings.json")
         ui.bot_settings.clear()
         ui.bot_settings.update(copy.deepcopy(ui._DEFAULT_GLOBAL_SETTINGS))
+        ui.configure_module_runtime(fresh_install=False)
         ui._interaction_state.clear()
         self.account = FakeAccount()
         ui._runtime_client = SimpleNamespace(
@@ -79,6 +82,7 @@ class CommunicationTests(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self):
         ui.bot_settings.clear()
         ui.bot_settings.update(self.previous_settings)
+        ui._effective_modules = self.previous_effective
         ui.SETTINGS_FILE = self.previous_file
         ui._runtime_client = self.previous_client
         ui._interaction_state.clear()
@@ -113,6 +117,9 @@ class CommunicationTests(unittest.IsolatedAsyncioTestCase):
                      "ActionEvent": ActionEvent, "ActionKind": ActionKind,
                      "is_night_mode_enabled": ui.is_night_mode_enabled,
                      "is_safe_mode_enabled": ui.is_safe_mode_enabled,
+                     "restart_requested": restart_requested,
+                     "automatic_action_gate": automatic_action_gate,
+                     "module_enabled": ui.module_enabled,
                      "get_night_mode_reply_text": ui.get_night_mode_reply_text,
                      "logger": SimpleNamespace(notify=lambda *args: None,
                                                warning=lambda *args: None)}
@@ -136,6 +143,9 @@ class CommunicationTests(unittest.IsolatedAsyncioTestCase):
                      "ActionEvent": ActionEvent, "ActionKind": ActionKind,
                      "is_night_mode_enabled": ui.is_night_mode_enabled,
                      "is_safe_mode_enabled": ui.is_safe_mode_enabled,
+                     "restart_requested": restart_requested,
+                     "automatic_action_gate": automatic_action_gate,
+                     "module_enabled": ui.module_enabled,
                      "get_night_mode_reply_text": ui.get_night_mode_reply_text,
                      "logger": SimpleNamespace(notify=lambda *args: None,
                                                warning=lambda *args: None)}

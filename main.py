@@ -7,8 +7,10 @@ import re
 import sys
 import atexit
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from html import escape
+from pathlib import Path
 from dotenv import load_dotenv
 from aiogram import Bot
 
@@ -23,11 +25,15 @@ from telegram import (dp, bot_settings, get_user_settings, get_all_recipients,
                       set_telegram_polling_state, _set_problem, _clear_problem,
                       _audit_action,
                       get_night_mode_reply_text,
-                      expand_review_request_text, is_review_request_enabled)
+                      expand_review_request_text, is_review_request_enabled,
+                      configure_module_runtime, module_enabled, save_settings, SETTINGS_FILE)
+from feature_registry import is_fresh_install
 from funpay import FunPayClient, _AmbiguousRaiseOutcome
 from runtime_events import (ActionEvent, ActionKind, QueuedCriticalEvent,
                             ReviewCheckEvent, html_preview)
-from state import ReviewReceiptStore, StateError
+from runtime_control import (RuntimeAction, automatic_action_gate,
+                             begin_runtime_cycle, restart_requested, wait_for_restart)
+from state import ReviewReceiptStore, StateError, DEFAULT_DB_PATH
 import logger
 
 
@@ -137,7 +143,7 @@ async def auto_bump_loop(bot: Bot, client: FunPayClient):
         # 1. Проверяем, изменилось ли состояние (Включили или Выключили)
         if current_state != last_state:
             # Рассылаем всем авторизованным пользователям, у которых включён notify_bump
-            for recipient_id in get_all_recipients():
+            for recipient_id in (get_all_recipients() if module_enabled("notifications") else []):
                 u = get_user_settings(recipient_id)
                 if u.get("notify_bump", True):
                     try:
@@ -151,7 +157,7 @@ async def auto_bump_loop(bot: Bot, client: FunPayClient):
             last_state = current_state
 
         # 2. Если тумблер включен - запускаем работу
-        if current_state and is_safe_mode_enabled():
+        if current_state and (is_safe_mode_enabled() or restart_requested()):
             await asyncio.sleep(1)
             continue
         if current_state:
@@ -163,7 +169,8 @@ async def auto_bump_loop(bot: Bot, client: FunPayClient):
                     user_id,
                     is_cancelled=lambda: (client.runner_stop_requested()
                                           or not bot_settings["auto_bump"]
-                                          or is_safe_mode_enabled()),
+                                          or is_safe_mode_enabled()
+                                          or restart_requested()),
                 )
             except _AmbiguousRaiseOutcome:
                 persistence_failed = False
@@ -202,7 +209,7 @@ async def auto_bump_loop(bot: Bot, client: FunPayClient):
             # message_text пустой, если все лоты были на кулдауне — в этом случае ничего не шлём.
             if bot_settings["auto_bump"] and message_text:
                 logger.bump(_strip_html(message_text))
-                for recipient_id in get_all_recipients():
+                for recipient_id in (get_all_recipients() if module_enabled("notifications") else []):
                     u = get_user_settings(recipient_id)
                     if u.get("notifications_enabled", True) and u.get("notify_bump", True):
                         try:
@@ -320,6 +327,8 @@ async def _fetch_and_send_review(
                 client, client.review_state.record_review_observation,
                 verified_order_id, None, stars if type(stars) is int and 1 <= stars <= 5 else None,
             )
+            if not module_enabled("notifications"):
+                return
             if client._notified_reviews.get(verified_order_id) == fingerprint:
                 return
             exists, previous = await _review_state_operation(
@@ -382,13 +391,16 @@ async def _send_night_mode_reply(
     client: FunPayClient, action: ActionEvent,
 ) -> None:
     """Старый автоответ, с повторной проверкой тумблера под Account RLock."""
-    if not is_night_mode_enabled() or is_safe_mode_enabled():
+    if (not module_enabled("night_mode") or not is_night_mode_enabled()
+            or is_safe_mode_enabled() or restart_requested()):
         return
     kind = "message" if action.kind is ActionKind.NIGHT_MESSAGE else "order"
 
     def send_if_enabled() -> bool:
         with client._account_lock:
-            if client.runner_stop_requested() or not is_night_mode_enabled() or is_safe_mode_enabled():
+            if (client.runner_stop_requested() or not module_enabled("night_mode")
+                    or not is_night_mode_enabled() or is_safe_mode_enabled()
+                    or restart_requested()):
                 return False
             if action.kind is ActionKind.NIGHT_MESSAGE:
                 chat_id = action.chat_id
@@ -407,13 +419,16 @@ async def _send_night_mode_reply(
                 return False
             if type(chat_id) is not int or chat_id <= 0:
                 return False
-            if client.runner_stop_requested() or not is_night_mode_enabled() or is_safe_mode_enabled():
-                return False
-            client.account.send_message(
-                chat_id,
-                get_night_mode_reply_text(kind),
-                update_last_saved_message=True,
-            )
+            with automatic_action_gate() as restart_allowed:
+                if (not restart_allowed or client.runner_stop_requested()
+                        or not module_enabled("night_mode")
+                        or not is_night_mode_enabled() or is_safe_mode_enabled()):
+                    return False
+                client.account.send_message(
+                    chat_id,
+                    get_night_mode_reply_text(kind),
+                    update_last_saved_message=True,
+                )
             return True
 
     try:
@@ -437,10 +452,14 @@ async def _send_scheduled_review_request(
     client: FunPayClient, order_id: str, buyer: str, scheduled_at: int,
 ) -> None:
     """Pending survives restart; claim becomes ambiguous before the one send attempt."""
+    if not module_enabled("review_request"):
+        return
     await asyncio.sleep(max(0, scheduled_at - time.time()))
     store = client.review_state
     while True:
-        if client.runner_stop_requested():
+        if not module_enabled("review_request"):
+            return
+        if client.runner_stop_requested() or restart_requested():
             return
         if not is_review_request_enabled():
             await asyncio.to_thread(store.discard_pending_review_request, order_id)
@@ -484,6 +503,8 @@ async def _send_scheduled_review_request(
             return
         if is_safe_mode_enabled():
             continue
+        if not module_enabled("review_request") or restart_requested():
+            return
         # Never repeat a send after a crash or ambiguous transport result.
         if not await asyncio.to_thread(store.claim_review_request, order_id, int(time.time())):
             return
@@ -495,14 +516,17 @@ async def _send_scheduled_review_request(
         try:
             sent = await asyncio.to_thread(
                 client.send_review_request_once, chat_id, value,
-                enabled_check=lambda: is_review_request_enabled() and not is_safe_mode_enabled(),
+                enabled_check=lambda: (module_enabled("review_request")
+                                       and is_review_request_enabled()
+                                       and not is_safe_mode_enabled()
+                                       and not restart_requested()),
             )
         except Exception as e:
             logger.warning(f"Review request result ambiguous: {type(e).__name__}.")
             await asyncio.to_thread(_audit_action, "automation", "REVIEW_REQUEST_SEND", "order", "AMBIGUOUS")
             return
         if sent is False:
-            if client.runner_stop_requested():
+            if client.runner_stop_requested() or restart_requested():
                 await asyncio.to_thread(store.release_unstarted_review_request, order_id)
                 return
             if is_safe_mode_enabled() and is_review_request_enabled():
@@ -558,6 +582,7 @@ def _order_history_fields(order) -> dict:
 
 async def _schedule_closed_review_request(client, event, observation, first_closed, start_task) -> None:
     if (observation is None or observation[1] != "CLOSED" or not first_closed
+            or not module_enabled("review_request")
             or event.type is not FunPayAPI.enums.EventTypes.ORDER_STATUS_CHANGED
             or not is_review_request_enabled()):
         return
@@ -628,6 +653,8 @@ async def notifications_loop(bot: Bot, client: FunPayClient):
         task.add_done_callback(review_done)
 
     def start_review_request(order_id: str, buyer: str, scheduled_at: int) -> None:
+        if not module_enabled("review_request"):
+            return
         if order_id in request_tasks:
             return
         if len(request_tasks) >= max_review_tasks:
@@ -667,10 +694,11 @@ async def notifications_loop(bot: Bot, client: FunPayClient):
 
     client.start_runner()
     try:
-        for order_id, buyer, scheduled_at in await asyncio.to_thread(
-            client.review_state.pending_review_requests
-        ):
-            start_review_request(order_id, buyer, scheduled_at)
+        if module_enabled("review_request"):
+            for order_id, buyer, scheduled_at in await asyncio.to_thread(
+                client.review_state.pending_review_requests
+            ):
+                start_review_request(order_id, buyer, scheduled_at)
         while True:
             if client.runner_stop_requested():
                 return
@@ -724,8 +752,7 @@ async def notifications_loop(bot: Bot, client: FunPayClient):
                         client.review_state.record_order_observation, *observation,
                         amount=(getattr(order, "price", None) or getattr(order, "sum", None))
                         if closed else None,
-                        currency=(event_currency if event_currency is not None
-                                  else bot_settings.get("stats_currency")) if closed else None,
+                        currency=event_currency if closed else None,
                         **_order_history_fields(order),
                     )
                 except StateError:
@@ -742,9 +769,12 @@ async def notifications_loop(bot: Bot, client: FunPayClient):
 
             for action in client.describe_event(event):
                 if action.kind is ActionKind.NIGHT_MESSAGE:
-                    await _send_night_mode_reply(client, action)
+                    if module_enabled("night_mode"):
+                        await _send_night_mode_reply(client, action)
                     continue
                 if action.kind is ActionKind.NIGHT_ORDER:
+                    if not module_enabled("night_mode"):
+                        continue
                     if backlog_id is not None:
                         try:
                             if not await asyncio.to_thread(
@@ -778,6 +808,8 @@ async def notifications_loop(bot: Bot, client: FunPayClient):
                 # уведомление, а в CMD было тихо. Теперь то же самое, что летит в
                 # Telegram, сразу видно и в консоли (без HTML-тегов, одной строкой).
                 logger.notify(_strip_html(text))
+                if not module_enabled("notifications"):
+                    continue
 
                 # Рассылаем каждому авторизованному пользователю согласно его
                 # персональным настройкам уведомлений
@@ -888,17 +920,23 @@ async def _supervise_tasks(bot: Bot, client: FunPayClient):
         "telegram_polling": asyncio.create_task(
             dp.start_polling(bot, close_bot_session=False), name="telegram_polling"
         ),
-        "auto_bump": asyncio.create_task(auto_bump_loop(bot, client), name="auto_bump"),
         "notifications": asyncio.create_task(notifications_loop(bot, client), name="notifications"),
-        "withdrawals": asyncio.create_task(withdrawals_poll_loop(client), name="withdrawals"),
         "session_refresh": asyncio.create_task(session_refresh_loop(client), name="session_refresh"),
     }
+    if module_enabled("autobump"):
+        tasks["auto_bump"] = asyncio.create_task(auto_bump_loop(bot, client), name="auto_bump")
+    if module_enabled("withdrawals"):
+        tasks["withdrawals"] = asyncio.create_task(withdrawals_poll_loop(client), name="withdrawals")
+    restart_wait = asyncio.create_task(wait_for_restart(), name="restart_wait")
     set_telegram_polling_state(True)
     polling = tasks["telegram_polling"]
     failed = False
     primary_error = None
+    restart_ready = False
     try:
-        done, _ = await asyncio.wait(tasks.values(), return_when=asyncio.FIRST_COMPLETED)
+        done, _ = await asyncio.wait((*tasks.values(), restart_wait),
+                                     return_when=asyncio.FIRST_COMPLETED)
+        restart_ready = restart_wait in done and restart_requested()
         for name, task in tasks.items():
             if task in done:
                 if not task.cancelled() and task.exception() is not None:
@@ -909,6 +947,7 @@ async def _supervise_tasks(bot: Bot, client: FunPayClient):
                     _set_problem("CRITICAL_TASK")
                     failed = True
     finally:
+        restart_wait.cancel()
         client.stop_runner()
         try:
             for task in tasks.values():
@@ -925,7 +964,8 @@ async def _supervise_tasks(bot: Bot, client: FunPayClient):
             finally:
                 if not polling.done():
                     polling.cancel()
-                results = await asyncio.gather(*tasks.values(), return_exceptions=True)
+                results = await asyncio.gather(*tasks.values(), restart_wait,
+                                               return_exceptions=True)
                 for name, result in zip(tasks, results):
                     if isinstance(result, asyncio.CancelledError):
                         continue
@@ -952,6 +992,7 @@ async def _supervise_tasks(bot: Bot, client: FunPayClient):
         set_telegram_polling_state(False)
         raise RuntimeError("Runtime остановлен из-за завершения критической задачи.") from None
     set_telegram_polling_state(False)
+    return RuntimeAction.RESTART if restart_ready else RuntimeAction.NONE
 
 
 def _validate_funpay_user_id(client: FunPayClient) -> None:
@@ -971,6 +1012,13 @@ def _validate_funpay_user_id(client: FunPayClient) -> None:
 
 async def main():
 
+    begin_runtime_cycle()
+
+    fresh_install = is_fresh_install(
+        Path(SETTINGS_FILE), DEFAULT_DB_PATH, DEFAULT_DB_PATH.with_name("stats_log.json")
+    )
+    configure_module_runtime(fresh_install=fresh_install)
+
     golden_key = _require_env("FUNPAY_GOLDEN_KEY")
     bot_token = _require_env("BOT_TOKEN")
     try:
@@ -978,6 +1026,10 @@ async def main():
             raise ValueError
     except ValueError:
         raise RuntimeError("ADMIN_ID и FUNPAY_USER_ID должны быть положительными числовыми ID.") from None
+    if fresh_install:
+        # Persist the incomplete-setup marker before Account/SQLite can create
+        # artifacts; an interrupted first boot must never migrate as legacy.
+        save_settings(required=True)
     # ОДИН общий клиент/аккаунт на весь бот - и для поднятия лотов, и для уведомлений.
     client = FunPayClient(golden_key)
 
@@ -1013,19 +1065,21 @@ async def main():
     bot = Bot(token=bot_token)
 
     runtime_ready = False
+    action = RuntimeAction.NONE
     try:
-        enable_autobump_on_startup()
+        if module_enabled("autobump"):
+            enable_autobump_on_startup()
         logger.success("Бот подключен к Telegram. Запуск фоновых процессов...")
         await _send_runtime_notice(bot, "🟢 Бот запущен.", restore_keyboard=True)
         runtime_ready = True
         set_runtime_status_context(client)
-        await _supervise_tasks(bot, client)
+        action = await _supervise_tasks(bot, client)
     finally:
         clear_runtime_status_context()
         primary_type = sys.exc_info()[0]
         unwinding_exception = primary_type is not None
         try:
-            if runtime_ready:
+            if runtime_ready and action is not RuntimeAction.RESTART:
                 message = ("⚠️ Бот остановлен из-за критической ошибки."
                            if primary_type is not None and not issubclass(primary_type, asyncio.CancelledError)
                            else "🔴 Бот остановлен.")
@@ -1044,13 +1098,30 @@ async def main():
                     raise
             except Exception as e:
                 logger.error(f"Не удалось закрыть сессию Telegram: {type(e).__name__}.")
+    return action
+
+
+async def _application_loop() -> None:
+    """Keep the OS process lock while replacing one fully stopped runtime."""
+    loop = asyncio.get_running_loop()
+    executor = ThreadPoolExecutor()
+    loop.set_default_executor(executor)
+    while True:
+        if await main() is not RuntimeAction.RESTART:
+            return
+        # Cancelled to_thread awaits do not stop their underlying work. Drain
+        # every old-cycle worker before constructing another Account/Runner.
+        replacement = ThreadPoolExecutor()
+        loop.set_default_executor(replacement)
+        await loop.run_in_executor(replacement, executor.shutdown, True)
+        executor = replacement
 
 
 def run():
     """Точка входа для `uv run funpay-bot` (project.scripts)."""
     try:
         acquire_lock()
-        asyncio.run(main())
+        asyncio.run(_application_loop())
     except KeyboardInterrupt:
         pass
     except Exception as e:
