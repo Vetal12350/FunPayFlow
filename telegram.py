@@ -1,12 +1,16 @@
 import asyncio
+import hashlib
 import hmac
 import os
 import json
 import math
 import re
+import secrets
 import threading
 import time
 import tempfile
+import zipfile
+from pathlib import Path
 from html import escape
 from string import Formatter
 import unicodedata
@@ -17,6 +21,7 @@ from aiogram import Dispatcher, F
 from aiogram.filters import Command
 from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, ReplyKeyboardMarkup, KeyboardButton, FSInputFile
 from funpay import FunPayClient, NIGHT_MODE_MESSAGE_TEXT, NIGHT_MODE_ORDER_TEXT
+from import_funpay_sales import import_zip
 from state import StateError
 import logger
 
@@ -326,6 +331,11 @@ bot_settings: dict = dict(_DEFAULT_GLOBAL_SETTINGS)
 _night_mode_state_lock = threading.Lock()
 _night_reply_echoes = deque([NIGHT_MODE_MESSAGE_TEXT, NIGHT_MODE_ORDER_TEXT], maxlen=8)
 _interaction_state: dict[int, dict] = {}
+_sales_import_lock = asyncio.Lock()
+_sales_import_session: dict | None = None
+_MAX_SALES_ZIP_BYTES = 19_000_000
+_MAX_SALES_CSV_BYTES = 512_000_000
+_SALES_IMPORT_TTL = 15 * 60
 
 # Персональные настройки: {user_id (int): {notify_*, notifications_enabled}}
 _user_settings: dict[int, dict] = {}
@@ -1090,6 +1100,7 @@ def _analytics_keyboard(period: str, *, detail=False):
         [_button("📅 Сегодня", "ana_over:today"), _button("🗓 7 дней", "ana_over:7d")],
         [_button("🗓 30 дней", "ana_over:30d"), _button("♾ Всё время", "ana_over:all")],
         *_analytics_sections(period),
+        [_button("📥 Импорт продаж", "sales_import_open")],
         [_button("🔙 Назад", "menu_main")],
     ])
 
@@ -1288,6 +1299,265 @@ async def _analytics_callback(callback: CallbackQuery, action: str) -> bool:
     return True
 
 
+class _LimitedSalesDownload:
+    """Bound actual bytes even when Telegram did not supply file_size."""
+
+    def __init__(self, destination):
+        self.destination = destination
+        self.size = 0
+
+    def write(self, chunk):
+        self.size += len(chunk)
+        if self.size > _MAX_SALES_ZIP_BYTES:
+            raise ValueError("Sales ZIP exceeds the download limit.")
+        return self.destination.write(chunk)
+
+    def flush(self):
+        self.destination.flush()
+
+
+def _sales_import_cleanup() -> None:
+    """Call only while holding _sales_import_lock."""
+    global _sales_import_session
+    session, _sales_import_session = _sales_import_session, None
+    if session is None:
+        return
+    timer = session.get("timer")
+    if timer is not None and timer is not asyncio.current_task():
+        timer.cancel()
+    path = session.get("path")
+    if path is not None:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError as error:
+            logger.warning(f"Sales import temp cleanup failed: {type(error).__name__}.")
+
+
+async def _sales_import_expire(nonce: str) -> None:
+    try:
+        await asyncio.sleep(_SALES_IMPORT_TTL)
+        async with _sales_import_lock:
+            if (_sales_import_session is not None
+                    and _sales_import_session["nonce"] == nonce
+                    and _sales_import_session["phase"] == "ready"):
+                _sales_import_cleanup()
+    except asyncio.CancelledError:
+        pass
+
+
+def _sales_import_check_zip(path: Path) -> None:
+    """Inspect ZIP metadata; never extract archive members."""
+    if not zipfile.is_zipfile(path):
+        raise ValueError("Not a ZIP archive.")
+    with zipfile.ZipFile(path) as archive:
+        members = [item for item in archive.infolist() if not item.is_dir()]
+        if len(members) != 1 or not members[0].filename.lower().endswith(".csv"):
+            raise ValueError("Expected one CSV member.")
+        item = members[0]
+        parts = item.filename.split("/")
+        if (item.filename.startswith("/") or "\\" in item.filename
+                or any(part in {"", ".", ".."} for part in parts)
+                or ":" in parts[0] or item.flag_bits & 1
+                or item.file_size > _MAX_SALES_CSV_BYTES):
+            raise ValueError("Unsafe sales ZIP member.")
+
+
+def _sales_import_digest(path: Path) -> bytes:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.digest()
+
+
+async def _run_sales_import(path: Path, db_path: Path, *, dry_run: bool):
+    """Do not release/delete a ZIP while its worker thread is still reading it."""
+    operation = asyncio.create_task(
+        asyncio.to_thread(import_zip, path, db_path, dry_run=dry_run))
+    try:
+        return await asyncio.shield(operation)
+    except asyncio.CancelledError:
+        try:
+            await asyncio.shield(operation)
+        except Exception:
+            pass
+        raise
+
+
+def _sales_import_preview(report: dict) -> str:
+    first = datetime.strptime(report["first_date"], "%Y-%m-%d").strftime("%d.%m.%Y")
+    last = datetime.strptime(report["last_date"], "%Y-%m-%d").strftime("%d.%m.%Y")
+    unchanged = (f"✅ Без изменений: {report['unchanged']}\n"
+                 if report.get("unchanged") else "")
+    return ("🔍 <b>Проверка экспорта завершена</b>\n\n"
+            f"📦 Заказов: {report['unique_order_ids']}\n"
+            f"🆕 Новых: {report['predicted_inserts']}\n"
+            f"🔄 Будет обновлено: {report['predicted_updates']}\n"
+            f"{unchanged}"
+            f"⚠️ Конфликтов: {report['conflicts']}\n"
+            f"❌ Ошибок: {report['parse_errors']}\n\n"
+            f"💵 USD: {report['currencies'].get('USD', 0)}\n"
+            f"⭐ Оценок: {report['ratings']}\n\n"
+            f"📅 Период: {first} — {last}\n\n"
+            "Данные пока НЕ импортированы.")
+
+
+def _sales_import_result(report: dict) -> str:
+    unchanged = (f"✅ Без изменений: {report['unchanged']}\n"
+                 if report.get("unchanged") else "")
+    return ("✅ <b>История FunPay импортирована</b>\n\n"
+            f"📦 Обработано: {report['unique_order_ids']}\n"
+            f"🆕 Добавлено: {report['predicted_inserts']}\n"
+            f"🔄 Обновлено: {report['predicted_updates']}\n"
+            f"{unchanged}"
+            f"⚠️ Конфликтов: {report['conflicts']}\n"
+            f"❌ Ошибок: {report['parse_errors']}\n\n"
+            "📊 Статистика и аналитика обновлены.")
+
+
+async def _sales_import_callback(callback: CallbackQuery, action: str, user_id: int) -> bool:
+    global _sales_import_session
+    if not action.startswith("sales_import_"):
+        return False
+    if (_sales_import_session is not None
+            and _sales_import_session["phase"] in {"checking", "importing"}):
+        await callback.answer("Проверка или импорт уже выполняется.", show_alert=True)
+        return True
+    async with _sales_import_lock:
+        session = _sales_import_session
+        if action == "sales_import_open":
+            if session is not None and session["owner"] != user_id:
+                await callback.answer("Импорт уже открыт.", show_alert=True)
+                return True
+            if session is not None and session["phase"] in {"checking", "importing"}:
+                await callback.answer("Импорт уже выполняется.", show_alert=True)
+                return True
+            _sales_import_cleanup()
+            nonce = secrets.token_hex(8)
+            _sales_import_session = {"owner": user_id, "nonce": nonce,
+                                     "phase": "upload", "path": None}
+            _interaction_state.pop(user_id, None)
+            await callback.answer()
+            await callback.message.edit_text(
+                "📥 <b>Импорт истории FunPay</b>\n\n"
+                "Выгрузите историю продаж на FunPay и отправьте сюда ZIP-файл.\n\n"
+                "Рекомендуется:\n• нужный период или «За всё время»\n"
+                "• включить «Добавить поля лота»\n\n"
+                "Сначала файл будет только проверен.\n"
+                "Данные запишутся только после подтверждения.",
+                reply_markup=_menu([[_button("❌ Отмена", f"sales_import_cancel:{nonce}")]]),
+                parse_mode="HTML",
+            )
+            return True
+
+        parts = action.split(":")
+        if (len(parts) != 2 or session is None or session["owner"] != user_id
+                or session["nonce"] != parts[1]):
+            await callback.answer("Действие устарело.", show_alert=True)
+            return True
+        if parts[0] == "sales_import_cancel" and session["phase"] in {"upload", "ready"}:
+            _sales_import_cleanup()
+            await callback.answer("Импорт отменён.")
+            await callback.message.edit_text(
+                "📈 <b>Аналитика продаж</b>\nВыберите период или раздел.\n\n" + _ANALYTICS_NOTE,
+                reply_markup=_analytics_keyboard("30d"), parse_mode="HTML")
+            return True
+        if parts[0] != "sales_import_confirm" or session["phase"] != "ready":
+            await callback.answer("Действие устарело.", show_alert=True)
+            return True
+
+        session["phase"] = "importing"  # Claim before any DB write or await.
+        try:
+            await callback.answer("Импортирую историю продаж...")
+            try:
+                await callback.message.edit_text("⏳ Импортирую историю продаж...")
+            except Exception:
+                pass
+            path = session["path"]
+            if _sales_import_digest(path) != session["digest"]:
+                raise ValueError("Checked ZIP changed before import.")
+            db_path = _orders_store().path
+            report = await _run_sales_import(path, db_path, dry_run=False)
+            text = _sales_import_result(report)
+        except Exception as error:
+            logger.warning(f"Sales import write failed: {type(error).__name__}.")
+            text = "⚠️ Не удалось импортировать историю. Данные проверьте через CLI перед повтором."
+        finally:
+            _sales_import_cleanup()
+        await callback.message.edit_text(text, reply_markup=_analytics_keyboard("30d"),
+                                         parse_mode="HTML")
+        return True
+
+
+async def _sales_import_document(message: Message, user_id: int) -> bool:
+    """Return True only while this owner's import-upload flow owns the message."""
+    global _sales_import_session
+    if (_sales_import_session is not None and _sales_import_session["owner"] == user_id
+            and _sales_import_session["phase"] in {"checking", "importing"}):
+        await message.answer("⏳ Проверка или импорт уже выполняется.")
+        return True
+    async with _sales_import_lock:
+        session = _sales_import_session
+        if session is None or session["owner"] != user_id:
+            return False
+        if session["phase"] in {"checking", "importing"}:
+            await message.answer("⏳ Проверка или импорт уже выполняется.")
+            return True
+        document = message.document
+        if document is None:
+            await message.answer("Отправьте ZIP как документ или нажмите «❌ Отмена».")
+            return True
+        filename = getattr(document, "file_name", None)
+        if not isinstance(filename, str) or not filename.lower().endswith(".zip"):
+            await message.answer("Нужен ZIP-файл с официальной историей продаж FunPay.")
+            return True
+        size = getattr(document, "file_size", None)
+        if type(size) is int and size > _MAX_SALES_ZIP_BYTES:
+            await message.answer(
+                "⚠️ Файл слишком большой для загрузки через стандартный Telegram Bot API.\n\n"
+                "Используйте импорт через командную строку:\n"
+                "uv run python import_funpay_sales.py <путь-к-файлу>")
+            return True
+        if session["phase"] == "ready":
+            _sales_import_cleanup()  # The old confirmation token is now stale.
+            session = {"owner": user_id, "nonce": secrets.token_hex(8),
+                       "phase": "upload", "path": None}
+            _sales_import_session = session
+        session["phase"] = "checking"
+        path = None
+        try:
+            with tempfile.NamedTemporaryFile(prefix="funpay-sales-", suffix=".zip",
+                                             delete=False) as temporary:
+                path = Path(temporary.name)
+            session["path"] = path
+            with path.open("wb") as destination:
+                writer = _LimitedSalesDownload(destination)
+                await message.bot.download(document, destination=writer, seek=False)
+            _sales_import_check_zip(path)
+            db_path = _orders_store().path
+            report = await _run_sales_import(path, db_path, dry_run=True)
+            if (not report["unique_order_ids"] or report["parse_errors"]
+                    or report["duplicates"]):
+                raise ValueError("Sales ZIP has invalid or duplicate rows.")
+            session["digest"] = _sales_import_digest(path)
+            session["phase"] = "ready"
+            session["timer"] = asyncio.create_task(_sales_import_expire(session["nonce"]))
+            await message.answer(
+                _sales_import_preview(report),
+                reply_markup=_menu([
+                    [_button("✅ Импортировать", f"sales_import_confirm:{session['nonce']}")],
+                    [_button("❌ Отмена", f"sales_import_cancel:{session['nonce']}")],
+                ]), parse_mode="HTML")
+        except asyncio.CancelledError:
+            _sales_import_cleanup()
+            raise
+        except Exception as error:
+            logger.warning(f"Sales import check failed: {type(error).__name__}.")
+            _sales_import_cleanup()
+            await message.answer("⚠️ Не удалось проверить ZIP-экспорт. Импорт не выполнялся.")
+        return True
+
+
 def _system_screen() -> tuple[str, InlineKeyboardMarkup]:
     safe = "✅" if is_safe_mode_enabled() else "⛔"
     return "⚙️ <b>Система</b>\nУправление и диагностика:", _menu([
@@ -1456,6 +1726,11 @@ NOTIFICATIONS_MENU_TEXT = "🔔 <b>Мои настройки уведомлен�
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
     user_id = message.from_user.id
+    if (_sales_import_session is not None
+            and _sales_import_session["phase"] in {"upload", "ready"}):
+        async with _sales_import_lock:
+            if _sales_import_session is not None and _sales_import_session["owner"] == user_id:
+                _sales_import_cleanup()
     _interaction_state.pop(user_id, None)
     if is_authorized(user_id):
         await message.answer(
@@ -1543,6 +1818,15 @@ async def callback_handler(callback: CallbackQuery):
         return
 
     action = callback.data or ""
+    if await _sales_import_callback(callback, action, user_id):
+        return
+    if (_sales_import_session is not None
+            and _sales_import_session["phase"] in {"upload", "ready"}):
+        async with _sales_import_lock:
+            if (_sales_import_session is not None
+                    and _sales_import_session["owner"] == user_id
+                    and _sales_import_session["phase"] in {"upload", "ready"}):
+                _sales_import_cleanup()
     _interaction_state.pop(user_id, None)
     if await _night_callback(callback, action, user_id):
         return
@@ -1694,6 +1978,11 @@ async def text_handler(message: Message):
     if is_authorized(user_id):
         # Если нажата кнопка вызова контекстного меню
         if message.text == "🛠 Главное меню":
+            if (_sales_import_session is not None
+                    and _sales_import_session["phase"] in {"upload", "ready"}):
+                async with _sales_import_lock:
+                    if _sales_import_session is not None and _sales_import_session["owner"] == user_id:
+                        _sales_import_cleanup()
             _interaction_state.pop(user_id, None)
             await message.answer(
                 MAIN_MENU_TEXT,
@@ -1702,8 +1991,15 @@ async def text_handler(message: Message):
             )
             return
         if message.text == "❌ Отмена":
+            if (_sales_import_session is not None
+                    and _sales_import_session["phase"] in {"upload", "ready"}):
+                async with _sales_import_lock:
+                    if _sales_import_session is not None and _sales_import_session["owner"] == user_id:
+                        _sales_import_cleanup()
             _interaction_state.pop(user_id, None)
             await message.answer("Отменено.", reply_markup=get_main_keyboard(user_id))
+            return
+        if await _sales_import_document(message, user_id):
             return
         pending = _interaction_state.get(user_id)
         if pending:

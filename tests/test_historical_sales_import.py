@@ -22,8 +22,9 @@ REPORT_AT = int(datetime(2026, 9, 25, 1, tzinfo=timezone.utc).timestamp())
 
 
 def make_row(order_id, status="closed", *, currency="USD", amount="10.25",
-             summary="A lot", section="1", buyer="7", rating="5"):
+             summary="A lot", section="1", buyer="7", rating="5", hidden=""):
     row = {key: "" for key in REQUIRED}
+    row["review_hidden"] = hidden
     row.update(order_uid=order_id, game_id="10", game_name="Game",
                section_type_id="digital", section_local_id=section,
                section_name="Section", buyer_user_id=buyer, buyer_name="Buyer",
@@ -44,7 +45,7 @@ def make_row(order_id, status="closed", *, currency="USD", amount="10.25",
 
 def make_zip(path, rows):
     text = io.StringIO(newline="")
-    writer = csv.DictWriter(text, fieldnames=sorted(REQUIRED))
+    writer = csv.DictWriter(text, fieldnames=sorted(REQUIRED | {"review_hidden"}))
     writer.writeheader()
     writer.writerows(rows)
     with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
@@ -91,7 +92,8 @@ class HistoricalImportTests(unittest.TestCase):
         make_zip(self.zip, rows)
         first = import_zip(self.zip, self.db)
         second = import_zip(self.zip, self.db)
-        self.assertEqual((first["predicted_inserts"], second["predicted_updates"]), (5, 5))
+        self.assertEqual((first["predicted_inserts"], second["predicted_updates"],
+                          second["unchanged"]), (5, 0, 5))
         self.assertTrue((self.root / second["backup"]).is_file())
         self.assertEqual(self.db_rows("orders"), 5)
         self.assertEqual(self.db_rows("review_observations"), 2)
@@ -118,6 +120,83 @@ class HistoricalImportTests(unittest.TestCase):
                          10.25)
         self.assertIn("Частичный возврат", ui._order_card_screen(
             self.store.get_order_history("AA000004"), "all", 0)[0])
+
+    def test_45_inserts_7_updates_then_identical_export_is_noop(self):
+        self.store.initialize()
+        rows = [make_row(f"C{i:07d}") for i in range(52)]
+        for row in rows[:7]:
+            self.store.record_order_observation(
+                row["order_uid"], "CLOSED", REPORT_AT,
+                product_description="Known live product")
+        make_zip(self.zip, rows)
+        preview = import_zip(self.zip, self.db, dry_run=True)
+        self.assertEqual((preview["predicted_inserts"], preview["predicted_updates"],
+                          preview["unchanged"]), (45, 7, 0))
+        first = import_zip(self.zip, self.db)
+        self.assertEqual((first["predicted_inserts"], first["predicted_updates"],
+                          first["unchanged"]), (45, 7, 0))
+
+        def business_snapshot():
+            with closing(sqlite3.connect(self.db)) as connection:
+                return tuple(tuple(connection.execute(
+                    f"SELECT * FROM {table} ORDER BY {sort}").fetchall())
+                    for table, sort in (("orders", "order_id"),
+                                        ("order_status_observations", "order_id, status"),
+                                        ("review_observations", "order_id")))
+
+        before = business_snapshot()
+        turnover = self.store.get_sales_overview("all")["usd_turnover"]
+        with closing(sqlite3.connect(self.db)) as connection:
+            with connection:
+                connection.execute("CREATE TABLE write_probe (table_name TEXT)")
+                for table in ("orders", "order_status_observations", "review_observations"):
+                    connection.execute(
+                        f"CREATE TRIGGER probe_{table} AFTER UPDATE ON {table} "
+                        f"BEGIN INSERT INTO write_probe VALUES ('{table}'); END")
+        dry_again = import_zip(self.zip, self.db, dry_run=True)
+        self.assertEqual((dry_again["predicted_inserts"], dry_again["predicted_updates"],
+                          dry_again["unchanged"]), (0, 0, 52))
+        second = import_zip(self.zip, self.db)
+        self.assertEqual((second["predicted_inserts"], second["predicted_updates"],
+                          second["unchanged"]), (0, 0, 52))
+        self.assertEqual(business_snapshot(), before)
+        self.assertEqual(self.store.get_sales_overview("all")["usd_turnover"], turnover)
+        with closing(sqlite3.connect(self.db)) as connection:
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM write_probe").fetchone()[0], 0)
+
+    def test_authoritative_change_counts_once_and_null_keeps_known_value(self):
+        make_zip(self.zip, [make_row("AA000001")])
+        import_zip(self.zip, self.db)
+        changed = make_row("AA000001", amount="20.25", summary="")
+        make_zip(self.zip, [changed])
+        preview = import_zip(self.zip, self.db, dry_run=True)
+        self.assertEqual((preview["predicted_updates"], preview["unchanged"]), (1, 0))
+        result = import_zip(self.zip, self.db)
+        self.assertEqual((result["predicted_updates"], result["unchanged"]), (1, 0))
+        with closing(sqlite3.connect(self.db)) as connection:
+            self.assertEqual(connection.execute(
+                "SELECT amount, lot_summary FROM orders WHERE order_id='AA000001'").fetchone(),
+                ("20.25", "A lot"))
+        again = import_zip(self.zip, self.db, dry_run=True)
+        self.assertEqual((again["predicted_updates"], again["unchanged"]), (0, 1))
+
+    def test_missing_observation_is_updated_without_order_row_update(self):
+        make_zip(self.zip, [make_row("AA000001")])
+        import_zip(self.zip, self.db)
+        with closing(sqlite3.connect(self.db)) as connection:
+            with connection:
+                connection.execute("DELETE FROM order_status_observations "
+                                   "WHERE order_id='AA000001' AND status='CLOSED'")
+                connection.execute("CREATE TABLE write_probe (n INTEGER)")
+                connection.execute("CREATE TRIGGER probe_orders AFTER UPDATE ON orders "
+                                   "BEGIN INSERT INTO write_probe VALUES (1); END")
+        self.assertEqual(import_zip(self.zip, self.db, dry_run=True)["predicted_updates"], 1)
+        self.assertEqual(import_zip(self.zip, self.db)["predicted_updates"], 1)
+        with closing(sqlite3.connect(self.db)) as connection:
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM write_probe").fetchone()[0], 0)
+            self.assertEqual(connection.execute(
+                "SELECT COUNT(*) FROM order_status_observations "
+                "WHERE order_id='AA000001' AND status='CLOSED'").fetchone()[0], 1)
 
     def test_live_merge_and_archive_overlap(self):
         self.store.initialize()
@@ -191,6 +270,107 @@ class HistoricalImportTests(unittest.TestCase):
         self.store.record_review_observation("AA000001", 200, 5)
         self.assertEqual(self.db_rows("review_observations"), 1)
         self.assertEqual(self.store.get_sales_reviews("all")["rating_distribution"], {5: 1})
+
+    def test_hidden_reviews_persist_but_visible_analytics_exclude_them(self):
+        rows = [make_row(f"D{i:07d}", rating="1", hidden="1" if i < 50 else "0")
+                for i in range(52)]
+        rows.append(make_row("E0000001", rating="5", hidden="1"))
+        rows.append(make_row("E0000002", rating="", hidden=""))
+        make_zip(self.zip, rows)
+        import_zip(self.zip, self.db)
+        self.assertEqual(self.db_rows("review_observations"), 53)
+        with closing(sqlite3.connect(self.db)) as connection:
+            self.assertEqual(connection.execute(
+                "SELECT COUNT(*) FROM review_observations WHERE review_hidden = 1"
+            ).fetchone()[0], 51)
+        reviews = self.store.get_sales_reviews("all")
+        self.assertEqual((reviews["reviews"], reviews["closed_orders"],
+                          reviews["reviewed_orders"]), (2, 54, 2))
+        self.assertEqual(reviews["rating_distribution"], {1: 2})
+        self.assertEqual(reviews["average_rating"], 1.0)
+        text = ui._analytics_reviews_text("all", reviews)
+        self.assertIn("Получено отзывов: 2", text)
+        self.assertIn("1⭐ 2", text)
+        self.assertIn("5⭐ 0", text)
+        self.assertIn("3.7%", text)  # 2 visible reviews / 54 closed orders.
+        self.assertEqual(self.store.get_sales_overview("all")["reviews"], 2)
+
+    def test_null_legacy_visibility_keeps_review_and_hidden_archive_overlap_excluded(self):
+        self.store.initialize()
+        self.store.record_order_observation("AA000001", "CLOSED", REPORT_AT - 100)
+        self.store.record_review_observation("AA000001", REPORT_AT - 90, 3)
+        with closing(sqlite3.connect(self.db)) as connection:
+            self.assertIsNone(connection.execute(
+                "SELECT review_hidden FROM review_observations WHERE order_id='AA000001'"
+            ).fetchone()[0])
+        reviews = self.store.get_sales_reviews("all")
+        self.assertEqual((reviews["reviews"], reviews["reviewed_orders"],
+                          reviews["rating_distribution"]), (1, 1, {3: 1}))
+        self.assertEqual(self.store.get_legacy_statistics("week", REPORT_AT)["reviews_count"], 1)
+
+        make_zip(self.zip, [make_row("AA000002", rating="1", hidden="1")])
+        import_zip(self.zip, self.db)
+        with closing(sqlite3.connect(self.db)) as connection:
+            with connection:
+                connection.execute("INSERT INTO legacy_stats "
+                                   "(kind, record_key, recorded_at) VALUES ('review', 'AA000002', ?)",
+                                   (REPORT_AT - 80,))
+        self.assertEqual(self.store.get_sales_reviews("all")["reviews"], 1)
+        self.assertEqual(self.store.get_legacy_statistics("week", REPORT_AT)["reviews_count"], 1)
+
+    def test_review_visibility_column_migrates_old_observation_as_unknown(self):
+        with closing(sqlite3.connect(self.db)) as connection:
+            with connection:
+                connection.execute("CREATE TABLE review_observations ("
+                                   "order_id TEXT PRIMARY KEY, observed_at INTEGER NOT NULL, "
+                                   "rating INTEGER, time_known INTEGER NOT NULL DEFAULT 1)")
+                connection.execute("INSERT INTO review_observations "
+                                   "(order_id, observed_at, rating) VALUES ('AA000001', ?, 4)",
+                                   (REPORT_AT - 90,))
+        self.store.initialize()
+        with closing(sqlite3.connect(self.db)) as connection:
+            self.assertEqual(connection.execute(
+                "SELECT rating, review_hidden FROM review_observations "
+                "WHERE order_id='AA000001'").fetchone(), (4, None))
+        self.assertEqual(self.store.get_sales_reviews("all")["rating_distribution"], {4: 1})
+
+    def test_hidden_flag_preserved_without_review_body_or_rating(self):
+        make_zip(self.zip, [make_row("AA000001", rating="", hidden="1")])
+        import_zip(self.zip, self.db)
+        self.assertEqual(self.db_rows("review_observations"), 1)
+        self.assertEqual(self.store.get_sales_reviews("all")["reviews"], 0)
+        make_zip(self.zip, [make_row("AA000001", rating="", hidden="0")])
+        self.assertEqual(import_zip(self.zip, self.db)["predicted_updates"], 1)
+        self.assertEqual(self.store.get_sales_reviews("all")["reviews"], 1)
+
+    def test_new_official_visibility_updates_without_duplicate_review(self):
+        make_zip(self.zip, [make_row("AA000001", rating="1", hidden="0")])
+        import_zip(self.zip, self.db)
+        self.assertEqual(self.store.get_sales_reviews("all")["reviews"], 1)
+        make_zip(self.zip, [make_row("AA000001", rating="1", hidden="1")])
+        preview = import_zip(self.zip, self.db, dry_run=True)
+        self.assertEqual((preview["predicted_updates"], preview["unchanged"]), (1, 0))
+        result = import_zip(self.zip, self.db)
+        self.assertEqual((result["predicted_updates"], result["unchanged"]), (1, 0))
+        self.assertEqual(self.db_rows("review_observations"), 1)
+        self.assertEqual(self.store.get_sales_reviews("all")["reviews"], 0)
+        self.assertEqual(self.store.get_sales_reviews("all")["rating_distribution"], {})
+        self.assertEqual(import_zip(self.zip, self.db, dry_run=True)["unchanged"], 1)
+
+        make_zip(self.zip, [make_row("AA000001", rating="1", hidden="")])
+        self.assertEqual(import_zip(self.zip, self.db)["unchanged"], 1)
+        self.assertEqual(self.store.get_sales_reviews("all")["reviews"], 0)
+        make_zip(self.zip, [make_row("AA000001", rating="1", hidden="0")])
+        self.assertEqual(import_zip(self.zip, self.db)["predicted_updates"], 1)
+        self.assertEqual(self.store.get_sales_reviews("all")["reviews"], 1)
+        self.assertEqual(self.db_rows("review_observations"), 1)
+        make_zip(self.zip, [make_row("AA000001", rating="", hidden="1")])
+        self.assertEqual(import_zip(self.zip, self.db)["predicted_updates"], 1)
+        self.assertEqual(self.store.get_sales_reviews("all")["reviews"], 0)
+        with closing(sqlite3.connect(self.db)) as connection:
+            self.assertEqual(connection.execute(
+                "SELECT rating, review_hidden FROM review_observations "
+                "WHERE order_id='AA000001'").fetchone(), (1, 1))
 
     def test_import_crosses_batch_boundary(self):
         make_zip(self.zip, [make_row(f"B{i:07d}", rating="") for i in range(1001)])
