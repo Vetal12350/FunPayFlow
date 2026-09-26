@@ -100,7 +100,6 @@ class ConfigurationTests(unittest.TestCase):
                 self.assertTrue(ui.rich)
                 self.assertEqual(console_ui._secret_mask(True), "●" * 12)
                 self.assertEqual(console_ui._secret_mask(False), "")
-                self.assertIn(console_ui._COPY[language]["hidden"], screen)
                 narrow = io.StringIO()
                 fallback = console_ui.InstallerConsole(language, stream=narrow,
                                                        width=28, force_rich=True)
@@ -120,6 +119,37 @@ class ConfigurationTests(unittest.TestCase):
                     self.assertFalse(no_color.rich)
                     self.assertEqual(no_color.read_secret("Optional: ",
                         lambda prompt, changed: ""), "")
+
+    def test_secret_field_renderables_show_help_and_fixed_mask(self):
+        for language, paste_hint, hidden_hint in (
+            ("ru", "Ctrl+V поддерживается", "значение скрыто"),
+            ("en", "Ctrl+V supported", "value hidden"),
+        ):
+            with self.subTest(language=language), patch.dict(
+                    os.environ, {"TERM": "xterm-256color"}):
+                os.environ.pop("NO_COLOR", None)
+                output = io.StringIO()
+                ui = console_ui.InstallerConsole(language, stream=output, width=72,
+                                                 force_rich=True)
+                self.assertTrue(ui.rich)
+                ui.console.print(ui._secret_title_renderable("Golden Key: "))
+                ui.console.print(ui._secret_field_renderable(True))
+                ui.console.print(ui._secret_help_renderable())
+                raw = output.getvalue()
+                visible = _without_ansi(raw)
+                for expected in ("Golden Key", "›", paste_hint, hidden_hint,
+                                 console_ui._COPY[language]["hidden"], "●" * 12):
+                    self.assertIn(expected, visible)
+                self.assertEqual(visible.count("●"), 12)
+                self.assertNotIn("SYNTHETIC_SECRET", raw)
+
+                empty_output = io.StringIO()
+                empty_ui = console_ui.InstallerConsole(language, stream=empty_output,
+                                                       width=72, force_rich=True)
+                empty_ui.console.print(empty_ui._secret_field_renderable(False))
+                empty_visible = _without_ansi(empty_output.getvalue())
+                self.assertIn("›", empty_visible)
+                self.assertNotIn("●", empty_visible)
 
     def test_rich_landing_has_bilingual_selector_and_welcome(self):
         for language, welcome, subtitle, selected in (
@@ -151,17 +181,25 @@ class ConfigurationTests(unittest.TestCase):
                     ui = console_ui.InstallerConsole(language, stream=screen,
                                                      width=72, force_rich=True)
                     keys = iter(("a", "\b", "\x16", "\r"))
-                    value = ui.read_secret("Golden Key: ", lambda prompt, changed:
-                        setup_config._windows_secret_input(
+                    changes = []
+
+                    def read_secret(prompt, changed):
+                        def record_change(has_value):
+                            changes.append(has_value)
+                            if changed is not None:
+                                changed(has_value)
+
+                        return setup_config._windows_secret_input(
                             prompt, language=language, getch=lambda: next(keys),
                             clipboard=lambda: "SYNTHETIC_PASTED_SECRET",
-                            stream=io.StringIO(), on_change=changed))
+                            stream=io.StringIO(), on_change=record_change)
+
+                    value = ui.read_secret("Golden Key: ", read_secret)
                     self.assertEqual(value, "SYNTHETIC_PASTED_SECRET")
+                    self.assertEqual(changes, [True, False, True])
                     self.assertNotIn(value, screen.getvalue())
                     self.assertEqual(console_ui._secret_mask(True), "●" * 12)
                     self.assertEqual(console_ui._secret_mask(False), "")
-                    self.assertIn(console_ui._COPY[language]["hidden"],
-                                  _without_ansi(screen.getvalue()))
 
                     blank_keys = iter(("\r",))
                     blank = ui.read_secret("Optional: ", lambda prompt, changed:

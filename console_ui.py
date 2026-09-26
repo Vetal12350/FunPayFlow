@@ -223,25 +223,30 @@ class InstallerConsole:
         self.console.print(Text(prompt.rstrip(": "), style="bold bright_cyan"))
         return input("› ")
 
+    def _secret_title_renderable(self, prompt: str) -> "Text":
+        return Text(prompt.rstrip(": "), style="bold bright_cyan")
+
+    def _secret_field_renderable(self, has_value: bool) -> "Panel":
+        return Panel(Text("› " + _secret_mask(has_value), style="bright_magenta"),
+                     border_style="bright_magenta", box=box.ROUNDED,
+                     width=min(self.width - 2, 52), padding=(0, 1))
+
+    def _secret_help_renderable(self) -> "Text":
+        return Text(self.copy["hidden"], style="dim")
+
     def read_secret(self, prompt: str,
                     reader: Callable[[str, Callable[[bool], None] | None], str]) -> str:
         if not self.rich or os.name != "nt":
             return reader(prompt, None)
-        self.console.print(Text(prompt.rstrip(": "), style="bold bright_cyan"))
-        def field(has_value: bool) -> Panel:
-            return Panel(Text("› " + _secret_mask(has_value),
-                              style="bright_magenta"),
-                         border_style="bright_magenta", box=box.ROUNDED,
-                         width=min(self.width - 2, 52), padding=(0, 1))
-
-        with Live(field(False), console=self.console, auto_refresh=False,
+        self.console.print(self._secret_title_renderable(prompt))
+        with Live(self._secret_field_renderable(False), console=self.console, auto_refresh=False,
                   redirect_stdout=False, redirect_stderr=False) as live:
             def changed(has_value: bool) -> None:
-                live.update(field(has_value), refresh=True)
+                live.update(self._secret_field_renderable(has_value), refresh=True)
 
             value = reader("", changed)
             changed(bool(value))
-        self.console.print(Text(self.copy["hidden"], style="dim"))
+        self.console.print(self._secret_help_renderable())
         return value
 
     def run_saving(self, action: Callable[[], _RESULT]) -> _RESULT:
