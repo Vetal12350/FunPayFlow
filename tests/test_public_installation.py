@@ -65,6 +65,11 @@ class PrivatePathTests(unittest.TestCase):
 
 
 class ConfigurationTests(unittest.TestCase):
+    def test_ansi_normalization_preserves_visible_unicode(self):
+        styled = "\x1b[96mCtrl+V\x1b[0m поддерживается · \x1b[1;32mзначение скрыто\x1b[0m ✓ ●"
+        self.assertEqual(_without_ansi(styled),
+                         "Ctrl+V поддерживается · значение скрыто ✓ ●")
+
     def test_rich_presentation_and_narrow_plain_fallback(self):
         for language, heading, error_text in (
             ("ru", "ШАГ 1 ИЗ 4", "Значение не может быть пустым."),
@@ -82,7 +87,8 @@ class ConfigurationTests(unittest.TestCase):
                     ui.read_secret("Golden Key (hidden): ", lambda _, changed: "SYNTHETIC_SECRET")
                     result = ui.run_saving(lambda: "saved")
                 self.assertEqual(result, "saved")
-                screen = captured.getvalue()
+                raw_screen = captured.getvalue()
+                screen = _without_ansi(raw_screen)
                 self.assertIn("FUNPAYFLOW", screen)
                 self.assertIn("v1.0.0", screen)
                 self.assertIn(console_ui._COPY[language]["tagline"], screen)
@@ -90,7 +96,7 @@ class ConfigurationTests(unittest.TestCase):
                 self.assertIn(heading, screen)
                 self.assertIn("25%", screen)
                 self.assertIn(error_text, screen)
-                self.assertNotIn("SYNTHETIC_SECRET", screen)
+                self.assertNotIn("SYNTHETIC_SECRET", raw_screen)
                 self.assertTrue(ui.rich)
                 self.assertEqual(console_ui._secret_mask(True), "●" * 12)
                 self.assertEqual(console_ui._secret_mask(False), "")
@@ -154,7 +160,8 @@ class ConfigurationTests(unittest.TestCase):
                     self.assertNotIn(value, screen.getvalue())
                     self.assertEqual(console_ui._secret_mask(True), "●" * 12)
                     self.assertEqual(console_ui._secret_mask(False), "")
-                    self.assertIn(console_ui._COPY[language]["hidden"], screen.getvalue())
+                    self.assertIn(console_ui._COPY[language]["hidden"],
+                                  _without_ansi(screen.getvalue()))
 
                     blank_keys = iter(("\r",))
                     blank = ui.read_secret("Optional: ", lambda prompt, changed:
@@ -747,10 +754,16 @@ class InstallerStaticTests(unittest.TestCase):
         self.assertIn('chmod 600 -- "$data_dir/.env"', source)
         self.assertIn('"$code_dir/setup_config.py" --data-dir "$data_dir"', source)
         self.assertNotIn("eval ", source)
-        if shutil.which("bash"):
-            result = subprocess.run(["bash", "-n", str(script)], capture_output=True,
+        self.assertNotIn(b"\r", script.read_bytes())
+        bash = shutil.which("bash")
+        if os.name == "nt":
+            git_bash = Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "Git" / "bin" / "bash.exe"
+            if git_bash.is_file():
+                bash = str(git_bash)
+        if bash:
+            result = subprocess.run([bash, "-n", str(script)], capture_output=True,
                                     text=True, encoding="utf-8", check=False)
-            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.returncode, 0, f"{bash}: {result.stderr!r}")
 
 
 if __name__ == "__main__":
