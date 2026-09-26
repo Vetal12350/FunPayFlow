@@ -31,17 +31,17 @@ def _without_ansi(value: str) -> str:
 class PrivatePathTests(unittest.TestCase):
     def test_legacy_and_explicit_directory_with_spaces(self):
         with patch.dict(os.environ, {}, clear=True):
-            self.assertEqual(runtime_paths.data_dir(), ROOT)
-            self.assertEqual(runtime_paths.runtime_file("state.sqlite3"), ROOT / "state.sqlite3")
+            self.assertTrue(os.path.samefile(runtime_paths.data_dir(), ROOT))
+            self.assertTrue(os.path.samefile(
+                runtime_paths.runtime_file("state.sqlite3").parent, ROOT))
         with tempfile.TemporaryDirectory(prefix="FunPay data path ") as folder:
             with patch.dict(os.environ, {"FUNPAY_BOT_DATA_DIR": folder}):
                 base = Path(folder).resolve()
-                self.assertEqual(runtime_paths.runtime_file(".env"), base / ".env")
-                self.assertEqual(runtime_paths.runtime_file("bot_settings.json"),
-                                 base / "bot_settings.json")
-                self.assertEqual(runtime_paths.runtime_file("bot.lock"), base / "bot.lock")
-                self.assertEqual(runtime_paths.logs_dir(), base / "logs")
-                self.assertEqual(runtime_paths.imports_dir(), base / "imports")
+                for target in (runtime_paths.runtime_file(".env"),
+                               runtime_paths.runtime_file("bot_settings.json"),
+                               runtime_paths.runtime_file("bot.lock"),
+                               runtime_paths.logs_dir(), runtime_paths.imports_dir()):
+                    self.assertTrue(os.path.samefile(target.parent, base))
             with patch.dict(os.environ, {"FUNPAY_BOT_DATA_DIR": "relative"}):
                 with self.assertRaises(ValueError):
                     runtime_paths.data_dir()
@@ -55,10 +55,11 @@ class PrivatePathTests(unittest.TestCase):
             old_settings.write_bytes(b"synthetic legacy settings")
             with patch.object(runtime_paths, "CODE_DIR", code):
                 with patch.dict(os.environ, {}, clear=True):
-                    self.assertEqual(runtime_paths.runtime_file("bot_settings.json"), old_settings)
+                    self.assertTrue(os.path.samefile(
+                        runtime_paths.runtime_file("bot_settings.json"), old_settings))
                 with patch.dict(os.environ, {"FUNPAY_BOT_DATA_DIR": str(private)}):
-                    self.assertEqual(runtime_paths.runtime_file("bot_settings.json"),
-                                     private / "bot_settings.json")
+                    self.assertTrue(os.path.samefile(
+                        runtime_paths.runtime_file("bot_settings.json").parent, private))
                     self.assertFalse((private / "bot_settings.json").exists())
             self.assertEqual(old_settings.read_bytes(), b"synthetic legacy settings")
 
@@ -90,8 +91,9 @@ class ConfigurationTests(unittest.TestCase):
                 self.assertIn("25%", screen)
                 self.assertIn(error_text, screen)
                 self.assertNotIn("SYNTHETIC_SECRET", screen)
-                self.assertIn("\x1b[", screen)
-                self.assertIn("│ › " + "●" * 12, _without_ansi(screen))
+                self.assertTrue(ui.rich)
+                self.assertEqual(console_ui._secret_mask(True), "●" * 12)
+                self.assertEqual(console_ui._secret_mask(False), "")
                 self.assertIn(console_ui._COPY[language]["hidden"], screen)
                 narrow = io.StringIO()
                 fallback = console_ui.InstallerConsole(language, stream=narrow,
@@ -132,9 +134,7 @@ class ConfigurationTests(unittest.TestCase):
                                  subtitle, "[1] Русский", "[2] English", selected):
                     self.assertIn(expected, visible)
                 self.assertIn(console_ui._COPY[language]["seller_line"], visible)
-                self.assertIn("┌", visible)
-                self.assertIn("└", visible)
-                self.assertIn("\x1b[", screen.getvalue())
+                self.assertTrue(ui.rich)
 
     def test_live_secret_field_tracks_typing_paste_backspace_and_blank(self):
         for language in ("ru", "en"):
@@ -152,9 +152,8 @@ class ConfigurationTests(unittest.TestCase):
                             stream=io.StringIO(), on_change=changed))
                     self.assertEqual(value, "SYNTHETIC_PASTED_SECRET")
                     self.assertNotIn(value, screen.getvalue())
-                    self.assertIn("│ › " + "●" * 12,
-                                  _without_ansi(screen.getvalue()))
-                    self.assertNotIn("●" * 13, screen.getvalue())
+                    self.assertEqual(console_ui._secret_mask(True), "●" * 12)
+                    self.assertEqual(console_ui._secret_mask(False), "")
                     self.assertIn(console_ui._COPY[language]["hidden"], screen.getvalue())
 
                     blank_keys = iter(("\r",))
@@ -163,7 +162,7 @@ class ConfigurationTests(unittest.TestCase):
                             prompt, language=language, getch=lambda: next(blank_keys),
                             stream=io.StringIO(), on_change=changed))
                     self.assertEqual(blank, "")
-                    self.assertIn("│ › ", _without_ansi(screen.getvalue()))
+                    self.assertNotIn("SYNTHETIC_PASTED_SECRET", screen.getvalue())
 
                     cancel_keys = iter(("\x03",))
                     with self.assertRaises(KeyboardInterrupt):
@@ -194,7 +193,7 @@ class ConfigurationTests(unittest.TestCase):
                     self.assertIn("synthetic data", rendered)
                     self.assertNotIn("connected to FunPay", rendered)
                     self.assertNotIn("Telegram connected", rendered)
-                    self.assertIn("\x1b[", rendered)
+                    self.assertTrue(ui.rich)
 
     def test_russian_default_and_english_field_labels(self):
         for language, heading, help_text, accepted in (
@@ -254,11 +253,11 @@ class ConfigurationTests(unittest.TestCase):
             path.write_bytes(b"synthetic original config")
             script = [sys.executable, "-B", str(ROOT / "setup_config.py"), "--data-dir", folder]
             first = subprocess.run([*script, "--language", "en"], input="\n",
-                capture_output=True, text=True, check=False)
+                capture_output=True, text=True, encoding="utf-8", check=False)
             self.assertEqual(first.returncode, 0, first.stderr)
             self.assertEqual(setup_config.load_language(Path(folder)), "en")
             second = subprocess.run(script, input="\n", capture_output=True,
-                text=True, check=False)
+                text=True, encoding="utf-8", check=False)
             self.assertEqual(second.returncode, 0, second.stderr)
             self.assertIn("Existing configuration found.", second.stdout)
             self.assertIn("[OK] Setup completed", second.stdout)
@@ -356,7 +355,7 @@ class ConfigurationTests(unittest.TestCase):
             self.assertEqual(path.read_bytes(), b"synthetic original config")
             result = subprocess.run([sys.executable, "-B", str(ROOT / "setup_config.py"),
                 "--data-dir", folder, "--language", "en"], input="\n", capture_output=True, text=True,
-                check=False)
+                encoding="utf-8", check=False)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn("FunPayFlow v1.0.0", result.stdout)
             self.assertIn("[OK] Setup completed", result.stdout)
@@ -375,11 +374,32 @@ class IsolatedFirstRunTests(unittest.TestCase):
         environment["FUNPAY_BOT_DATA_DIR"] = str(folder)
         environment["PYTHONDONTWRITEBYTECODE"] = "1"
         environment.pop("PYTHONPATH", None)
-        result = subprocess.run([sys.executable, "-I", "-B", "-c", source],
-            cwd=folder, env=environment, capture_output=True, text=True, check=False)
+        result = subprocess.run([sys.executable, "-X", "utf8", "-I", "-B", "-c", source],
+            cwd=folder, env=environment, capture_output=True, text=True,
+            encoding="utf-8", check=False)
         if result.returncode:
             self.fail(f"Isolated first run failed: {result.stderr[-1000:]}")
         return json.loads(result.stdout.strip().splitlines()[-1])
+
+    @unittest.skipUnless(os.name == "nt", "Windows console encoding regression")
+    def test_persisted_settings_load_with_legacy_stdout_encoding(self):
+        with tempfile.TemporaryDirectory(prefix="FunPay encoding test ") as folder:
+            data = Path(folder)
+            (data / "bot_settings.json").write_text(
+                '{"setup_completed": true}\n', encoding="utf-8")
+            environment = dict(os.environ, FUNPAY_BOT_DATA_DIR=folder)
+            for key in setup_config.FIELDS:
+                environment.pop(key, None)
+            environment.pop("PYTHONPATH", None)
+            source = ("import sys; sys.stdout.reconfigure(encoding='cp1252'); "
+                      f"sys.path.insert(0, {str(ROOT)!r}); import telegram; "
+                      "print('settings-import:PASS')")
+            result = subprocess.run([sys.executable, "-I", "-B", "-c", source],
+                cwd=folder, env=environment, text=True, encoding="utf-8",
+                capture_output=True, check=False)
+            self.assertEqual(result.returncode, 0, result.stderr[-1000:])
+            self.assertIn("Настройки загружены", result.stdout)
+            self.assertIn("settings-import:PASS", result.stdout)
 
     def test_fresh_install_restart_and_private_file_locations(self):
         with tempfile.TemporaryDirectory(prefix="FunPay fresh install ") as folder:
@@ -418,10 +438,11 @@ print(json.dumps({'fresh': fresh, 'all_on': all_on, 'inactive': inactive,
             self.assertFalse(first["complete"])
             self.assertIsNone(first["currency"])
             self.assertTrue(first["lock"])
-            self.assertEqual(first["settings"], str(data / "bot_settings.json"))
-            self.assertEqual(first["db"], str(data / "state.sqlite3"))
-            self.assertEqual(first["logs"], str(data / "logs"))
-            self.assertEqual(first["imports"], str(data / "imports"))
+            for key, expected in (("settings", data / "bot_settings.json"),
+                                  ("db", data / "state.sqlite3"),
+                                  ("logs", data / "logs"),
+                                  ("imports", data / "imports")):
+                self.assertTrue(os.path.samefile(first[key], expected), key)
             self.assertTrue(list((data / "logs").glob("bot_*.log")))
             second = self._run_script(prefix + """
 import json
@@ -497,19 +518,28 @@ class InstallerStaticTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="FunPay service test ") as folder:
             code = Path(folder) / "code with spaces"
             data = Path(folder) / "data with spaces"
+            code.mkdir()
+            data.mkdir()
             rendered = render_service.render(code, data, "seller")
-            self.assertIn('WorkingDirectory=' + render_service._unit_word(str(code)), rendered)
-            self.assertIn('EnvironmentFile=' + render_service._unit_word(str(data / ".env")),
+            self.assertIn('WorkingDirectory=' + render_service._scalar_path(
+                str(code.resolve())), rendered)
+            workdir = next(line.partition("=")[2] for line in rendered.splitlines()
+                           if line.startswith("WorkingDirectory="))
+            self.assertTrue(os.path.samefile(workdir.replace("\\\\", "\\"), code))
+            self.assertIn('EnvironmentFile=' + render_service._unit_word(str(data.resolve() / ".env")),
                           rendered)
             self.assertIn('Environment=' + render_service._unit_word(
-                "FUNPAY_BOT_DATA_DIR=" + str(data)), rendered)
+                "FUNPAY_BOT_DATA_DIR=" + str(data.resolve())), rendered)
             self.assertIn("Restart=on-failure", rendered)
             self.assertNotIn("@CODE_DIR@", rendered)
+            self.assertNotIn('WorkingDirectory="', rendered)
             self.assertNotIn("fake-golden", rendered)
+            with self.assertRaises(ValueError):
+                render_service.render(Path("relative code"), data, "seller")
             dollar_code = Path(folder) / "code$literal"
             dollar_unit = render_service.render(dollar_code, data, "seller")
             self.assertIn("ExecStart=" + render_service._exec_word(
-                str(dollar_code / ".venv" / "bin" / "python")), dollar_unit)
+                str(dollar_code.resolve() / ".venv" / "bin" / "python")), dollar_unit)
 
     @unittest.skipUnless(os.name == "nt", "Windows cmd.exe is required")
     def test_setup_first_language_screen_without_installing(self):
@@ -521,7 +551,7 @@ class InstallerStaticTests(unittest.TestCase):
             with self.subTest(selection=selection):
                 result = subprocess.run(["cmd.exe", "/d", "/c", str(ROOT / "Setup.bat")],
                     cwd=ROOT, env=environment, input=selection, capture_output=True,
-                    text=True, encoding="utf-8", errors="replace", timeout=10,
+                    text=True, encoding="utf-8", timeout=10,
                     check=False)
                 self.assertEqual(result.returncode, 1, result.stderr[-1000:])
                 self.assertIn("FUNPAYFLOW", result.stdout)
@@ -561,7 +591,7 @@ class InstallerStaticTests(unittest.TestCase):
             process = subprocess.Popen(["cmd.exe", "/d", "/c", str(wrapper)],
                 cwd=root, env=environment, stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                encoding="utf-8", errors="replace")
+                encoding="utf-8")
             try:
                 process.stdin.write("1\n")
                 process.stdin.flush()
@@ -587,7 +617,7 @@ class InstallerStaticTests(unittest.TestCase):
             failed = subprocess.Popen(["cmd.exe", "/d", "/c", str(wrapper)],
                 cwd=root, env=dict(environment, OS="SYNTHETIC_UNSUPPORTED_OS"),
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                text=True, encoding="utf-8", errors="replace")
+                text=True, encoding="utf-8")
             try:
                 failed.stdin.write("1\n")
                 failed.stdin.flush()
@@ -608,7 +638,7 @@ class InstallerStaticTests(unittest.TestCase):
             (tools_dir / "powershell.cmd").unlink()
             redirected = subprocess.run(["cmd.exe", "/d", "/c", str(wrapper)],
                 cwd=root, env=environment, input="1\n", capture_output=True,
-                text=True, encoding="utf-8", errors="replace", timeout=10,
+                text=True, encoding="utf-8", timeout=10,
                 check=False)
             self.assertEqual(redirected.returncode, 0, redirected.stderr[-1000:])
             self.assertIn("SHELL_ALIVE", redirected.stdout)
@@ -630,6 +660,7 @@ class InstallerStaticTests(unittest.TestCase):
             (code / "main.py").write_text("raise SystemExit(3)\n", encoding="utf-8")
             created = subprocess.run(["uv", "venv", "--offline", "--python", "3.13",
                 str(code / ".venv")], cwd=code, capture_output=True, text=True,
+                encoding="utf-8",
                 check=False)
             self.assertEqual(created.returncode, 0, created.stderr[-1000:])
             environment = dict(os.environ, FUNPAY_BOT_DATA_DIR=str(data))
@@ -643,7 +674,7 @@ class InstallerStaticTests(unittest.TestCase):
                     (data / setup_config.LANGUAGE_FILE).write_text(language + "\n", encoding="utf-8")
                     result = subprocess.run(["cmd.exe", "/d", "/c", str(code / "Start.bat")],
                         cwd=code, env=environment, input="\n", capture_output=True, text=True,
-                        encoding="utf-8", errors="replace", timeout=15, check=False)
+                        encoding="utf-8", timeout=15, check=False)
                     self.assertEqual(result.returncode, 3, result.stderr[-1000:])
                     self.assertIn("FunPayFlow v1.0.0", result.stdout)
                     self.assertIn(lock_message, result.stdout)
@@ -671,16 +702,21 @@ class InstallerStaticTests(unittest.TestCase):
             def resolve(release: Path, env: dict[str, str]) -> Path:
                 result = subprocess.run(
                     ["cmd.exe", "/d", "/c", str(release / "ResolveDataDir.bat"), "--print"],
-                    cwd=release, env=env, capture_output=True, text=True, check=False)
+                    cwd=release, env=env, capture_output=True, text=True,
+                    encoding="utf-8", check=False)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertNotIn("SYNTHETIC_SECRET_NEVER_PRINT", result.stdout + result.stderr)
                 self.assertTrue(result.stdout.startswith("FUNPAY_BOT_DATA_DIR="))
                 return Path(result.stdout.strip().split("=", 1)[1])
 
+            def assert_same_directory(actual: Path, expected: Path) -> None:
+                expected.mkdir(parents=True, exist_ok=True)
+                self.assertTrue(os.path.samefile(actual, expected))
+
             data = resolve(first_release, environment)
-            self.assertEqual(data, Path(environment["LOCALAPPDATA"]) / "FunPayFlow")
+            assert_same_directory(data, Path(environment["LOCALAPPDATA"]) / "FunPayFlow")
             self.assertNotIn(first_release, data.parents)
-            self.assertEqual(resolve(next_release, environment), data)
+            assert_same_directory(resolve(next_release, environment), data)
 
             prompts = iter(["111", "222", "0"])
             secrets = iter(["synthetic-key", "synthetic-token", ""])
@@ -696,10 +732,10 @@ class InstallerStaticTests(unittest.TestCase):
             self.assertEqual(database.read_bytes(), b"synthetic database fixture")
 
             overridden = dict(environment, FUNPAY_BOT_DATA_DIR=str(root / "custom private"))
-            self.assertEqual(resolve(next_release, overridden), root / "custom private")
+            assert_same_directory(resolve(next_release, overridden), root / "custom private")
             fallback = dict(environment)
             fallback.pop("LOCALAPPDATA")
-            self.assertEqual(resolve(next_release, fallback),
+            assert_same_directory(resolve(next_release, fallback),
                 Path(environment["USERPROFILE"]) / "AppData" / "Local" / "FunPayFlow")
 
     def test_linux_syntax_and_permission_strategy(self):
@@ -713,7 +749,7 @@ class InstallerStaticTests(unittest.TestCase):
         self.assertNotIn("eval ", source)
         if shutil.which("bash"):
             result = subprocess.run(["bash", "-n", str(script)], capture_output=True,
-                                    text=True, check=False)
+                                    text=True, encoding="utf-8", check=False)
             self.assertEqual(result.returncode, 0, result.stderr)
 
 

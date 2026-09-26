@@ -21,7 +21,7 @@ MODULES = {
 
 def _run(*args: str, cwd: Path, env: dict[str, str]) -> None:
     result = subprocess.run(args, cwd=cwd, env=env, text=True,
-                            capture_output=True, check=False)
+                            encoding="utf-8", capture_output=True, check=False)
     if result.returncode:
         raise RuntimeError(f"{args[0]} {args[1]} failed:\n{result.stderr[-3000:]}")
 
@@ -43,6 +43,8 @@ def _private_artifact(name: str) -> bool:
 def main() -> None:
     environment = dict(os.environ)
     environment["UV_OFFLINE"] = "1"
+    environment["PYTHONUTF8"] = "1"
+    environment["PYTHONIOENCODING"] = "utf-8"
     environment.pop("PYTHONPATH", None)
     with tempfile.TemporaryDirectory(prefix="funpay-package-smoke-") as folder:
         temporary = Path(folder).resolve()

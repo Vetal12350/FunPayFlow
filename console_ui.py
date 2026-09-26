@@ -86,7 +86,12 @@ def project_version(code_dir: Path | None = None) -> str:
 def use_utf8_console() -> None:
     """Match the UTF-8 code page set by the Windows batch entry points."""
     if os.name == "nt" and hasattr(sys.stdout, "reconfigure"):
-        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stdout.reconfigure(encoding="utf-8", errors="strict")
+
+
+def _secret_mask(has_value: bool) -> str:
+    """A fixed mask avoids revealing the entered secret's length."""
+    return "●" * 12 if has_value else ""
 
 
 class InstallerConsole:
@@ -224,7 +229,7 @@ class InstallerConsole:
             return reader(prompt, None)
         self.console.print(Text(prompt.rstrip(": "), style="bold bright_cyan"))
         def field(has_value: bool) -> Panel:
-            return Panel(Text("› " + ("●" * 12 if has_value else ""),
+            return Panel(Text("› " + _secret_mask(has_value),
                               style="bright_magenta"),
                          border_style="bright_magenta", box=box.ROUNDED,
                          width=min(self.width - 2, 52), padding=(0, 1))

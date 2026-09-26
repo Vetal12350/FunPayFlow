@@ -24,15 +24,22 @@ def _exec_word(value: str) -> str:
     return _unit_word(value).replace("$", "$$")
 
 
+def _scalar_path(value: str) -> str:
+    """WorkingDirectory is one scalar path; quotes become literal characters."""
+    if not value or any(ord(char) < 32 or ord(char) == 127 for char in value):
+        raise ValueError("Invalid systemd path.")
+    return value.replace("\\", "\\\\").replace("%", "%%")
+
+
 def render(code_dir: Path, data_dir: Path, user: str) -> str:
-    code, data = Path(code_dir).resolve(), Path(data_dir).resolve()
-    if not code.is_absolute() or not data.is_absolute():
+    if not Path(code_dir).is_absolute() or not Path(data_dir).is_absolute():
         raise ValueError("Absolute paths required.")
+    code, data = Path(code_dir).resolve(), Path(data_dir).resolve()
     if re.fullmatch(r"[a-z_][a-z0-9_-]*", user) is None:
         raise ValueError("Invalid service user.")
     values = {
         "@USER@": user,
-        "@CODE_DIR@": _unit_word(str(code)),
+        "@CODE_DIR@": _scalar_path(str(code)),
         "@ENV_FILE@": _unit_word(str(data / ".env")),
         "@DATA_VALUE@": str(data).replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%"),
         "@PYTHON@": _exec_word(str(code / ".venv" / "bin" / "python")),

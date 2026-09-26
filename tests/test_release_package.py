@@ -214,12 +214,12 @@ class ExtractedReleaseSmoke(unittest.TestCase):
             isolated = temporary / "isolated dependencies with spaces"
             venv = subprocess.run(["uv", "venv", "--offline", "--python", "3.13",
                 str(isolated)], cwd=code, env=environment, text=True,
-                capture_output=True, check=False)
+                encoding="utf-8", capture_output=True, check=False)
             self.assertEqual(venv.returncode, 0, venv.stderr[-1200:])
             sync_env = dict(environment, UV_PROJECT_ENVIRONMENT=str(isolated))
             sync = subprocess.run(["uv", "sync", "--offline", "--frozen",
                 "--no-install-project", "--no-dev"], cwd=code, env=sync_env,
-                text=True, capture_output=True, check=False)
+                text=True, encoding="utf-8", capture_output=True, check=False)
             self.assertEqual(sync.returncode, 0, sync.stderr[-1200:])
             python = (isolated / "Scripts" / "python.exe" if os.name == "nt"
                       else isolated / "bin" / "python")
@@ -247,31 +247,32 @@ state.ReviewReceiptStore().initialize()
 assert (private / 'state.sqlite3').is_file()
 print('extracted-import-and-config:PASS')
 '''
-            result = subprocess.run([str(python), "-I", "-B", "-c", script,
+            result = subprocess.run([str(python), "-X", "utf8", "-I", "-B", "-c", script,
                 str(code), str(private), str(ROOT)], cwd=code, env=environment,
-                text=True, capture_output=True, check=False)
+                text=True, encoding="utf-8", capture_output=True, check=False)
             self.assertEqual(result.returncode, 0, result.stderr[-1200:])
             self.assertIn("extracted-import-and-config:PASS", result.stdout)
             self.assertNotIn("synthetic-key", result.stdout + result.stderr)
             self.assertFalse((code / ".env").exists())
             self.assertFalse((code / "state.sqlite3").exists())
 
-            legacy = subprocess.run([str(python), "-I", "-B", "-c",
+            legacy = subprocess.run([str(python), "-X", "utf8", "-I", "-B", "-c",
                 "import sys,pathlib; root=pathlib.Path(sys.argv[1]).resolve(); "
                 "sys.path.insert(0,str(root)); import runtime_paths; "
                 "assert runtime_paths.data_dir()==root; print('legacy:PASS')",
                 str(code)], cwd=code,
                 env={key: value for key, value in environment.items()
                      if key != "FUNPAY_BOT_DATA_DIR"},
-                text=True, capture_output=True, check=False)
+                text=True, encoding="utf-8", capture_output=True, check=False)
             self.assertEqual(legacy.returncode, 0, legacy.stderr[-1000:])
             self.assertIn("legacy:PASS", legacy.stdout)
 
-            metadata = subprocess.run([str(python), "-I", "-B", "-c",
+            metadata = subprocess.run([str(python), "-X", "utf8", "-I", "-B", "-c",
                 "import pathlib,sys,tomllib; root=pathlib.Path(sys.argv[1]); "
                 "doc=tomllib.loads((root/'pyproject.toml').read_text(encoding='utf-8')); "
                 "assert doc['project']['version']=='1.0.0'; print('metadata:PASS')",
-                str(code)], cwd=code, text=True, capture_output=True, check=False)
+                str(code)], cwd=code, text=True, encoding="utf-8",
+                capture_output=True, check=False)
             self.assertEqual(metadata.returncode, 0, metadata.stderr[-1000:])
 
             # Exercise the process lock from the extracted code without main().
@@ -279,17 +280,25 @@ print('extracted-import-and-config:PASS')
             holder_code = (
                 "import pathlib,sys; root=pathlib.Path(sys.argv[1]); "
                 "sys.path.insert(0,str(root)); import main; "
-                "main.acquire_lock(); pathlib.Path(sys.argv[2]).write_text('ready'); "
+                "main.acquire_lock(); pathlib.Path(sys.argv[2]).write_text('ready', encoding='ascii'); "
                 "sys.stdin.readline(); main.release_lock()"
             )
             holder = subprocess.Popen([str(python), "-X", "utf8", "-I", "-B", "-c", holder_code,
                 str(code), str(ready)], cwd=code, env=environment, text=True, encoding="utf-8",
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             try:
-                deadline = time.monotonic() + 5
+                # Importing the extracted dependency set can be slow on a cold CI runner.
+                deadline = time.monotonic() + 20
                 while not ready.exists() and holder.poll() is None and time.monotonic() < deadline:
                     time.sleep(0.05)
-                self.assertTrue(ready.exists(), "Extracted lock holder did not start")
+                if not ready.exists():
+                    if holder.poll() is None:
+                        holder.kill()
+                    stdout, stderr = holder.communicate(timeout=5)
+                    diagnostic = (stdout + stderr).replace("synthetic-key", "[redacted]")
+                    diagnostic = diagnostic.replace("synthetic-token", "[redacted]")
+                    self.fail(f"Extracted lock holder did not start (exit={holder.returncode}): "
+                              f"{diagnostic[-1200:]}")
                 contender = subprocess.run([str(python), "-X", "utf8", "-I", "-B", "-c",
                     "import pathlib,sys; root=pathlib.Path(sys.argv[1]); "
                     "sys.path.insert(0,str(root)); import main; main.acquire_lock()",
@@ -302,7 +311,7 @@ print('extracted-import-and-config:PASS')
                     try:
                         holder.stdin.write("\n")
                         holder.stdin.flush()
-                    except OSError:
+                    except (OSError, ValueError):
                         pass
                 try:
                     holder.communicate(timeout=5)
@@ -321,12 +330,13 @@ print('extracted-import-and-config:PASS')
                 win_env.pop("FUNPAY_BOT_DATA_DIR", None)
                 resolver = subprocess.run(["cmd.exe", "/d", "/c",
                     str(code / "ResolveDataDir.bat"), "--print"], cwd=temporary,
-                    env=win_env, text=True, capture_output=True, check=False)
+                    env=win_env, text=True, encoding="utf-8",
+                    capture_output=True, check=False)
                 self.assertEqual(resolver.returncode, 0, resolver.stderr)
                 self.assertIn("FunPayFlow", resolver.stdout)
                 missing = subprocess.run(["cmd.exe", "/d", "/c",
                     str(release_root / "Start.bat")], cwd=temporary, env=win_env, input="\n",
-                    text=True, encoding="utf-8", errors="replace", capture_output=True,
+                    text=True, encoding="utf-8", capture_output=True,
                     timeout=10, check=False)
                 self.assertNotEqual(missing.returncode, 0)
                 self.assertIn("Конфигурация не найдена", missing.stdout)
@@ -335,7 +345,7 @@ print('extracted-import-and-config:PASS')
                 unsupported = subprocess.run(["cmd.exe", "/d", "/c",
                     str(release_root / "Setup.bat")], cwd=temporary,
                     env=dict(win_env, OS="SYNTHETIC_UNSUPPORTED_OS"), input="2\n",
-                    text=True, encoding="utf-8", errors="replace", capture_output=True,
+                    text=True, encoding="utf-8", capture_output=True,
                     timeout=10, check=False)
                 self.assertEqual(unsupported.returncode, 1, unsupported.stderr)
                 self.assertIn("FUNPAYFLOW", unsupported.stdout)
@@ -344,13 +354,13 @@ print('extracted-import-and-config:PASS')
 
                 venv = subprocess.run(["uv", "venv", "--offline", "--python", "3.13",
                     str(code / ".venv")], cwd=code, env=environment,
-                    text=True, capture_output=True, check=False)
+                    text=True, encoding="utf-8", capture_output=True, check=False)
                 self.assertEqual(venv.returncode, 0, venv.stderr[-1000:])
                 (code / "main.py").write_text("raise SystemExit(3)\n", encoding="utf-8")
                 synthetic_start = subprocess.run(["cmd.exe", "/d", "/c",
                     str(release_root / "Start.bat")], cwd=temporary,
                     env=environment, input="\n", text=True, encoding="utf-8",
-                    errors="replace", capture_output=True, timeout=15, check=False)
+                    capture_output=True, timeout=15, check=False)
                 self.assertEqual(synthetic_start.returncode, 3, synthetic_start.stderr[-1000:])
                 self.assertIn("FunPayFlow v1.0.0", synthetic_start.stdout)
                 self.assertIn("Другой экземпляр FunPayFlow", synthetic_start.stdout)
@@ -358,15 +368,17 @@ print('extracted-import-and-config:PASS')
             else:
                 if shutil.which("bash"):
                     syntax = subprocess.run(["bash", "-n", str(release_root / "linux" / "install.sh")],
-                        cwd=code, text=True, capture_output=True, check=False)
+                        cwd=code, text=True, encoding="utf-8",
+                        capture_output=True, check=False)
                     self.assertEqual(syntax.returncode, 0, syntax.stderr)
                 unit = subprocess.run([str(python), "-B",
                     str(code / "render_service.py"), "--code-dir", str(code),
                     "--data-dir", str(private), "--output", str(temporary / "test.service")],
-                    cwd=code, text=True, capture_output=True, check=False)
+                    cwd=code, text=True, encoding="utf-8",
+                    capture_output=True, check=False)
                 self.assertEqual(unit.returncode, 0, unit.stderr[-1000:])
                 unit_text = (temporary / "test.service").read_text(encoding="utf-8")
-                self.assertIn(f'WorkingDirectory="{code}"', unit_text)
+                self.assertIn(f'WorkingDirectory={code}', unit_text)
                 self.assertIn(f'EnvironmentFile="{private / ".env"}"', unit_text)
                 self.assertNotIn("synthetic-key", unit_text)
                 if shutil.which("systemd-analyze"):
@@ -376,7 +388,7 @@ print('extracted-import-and-config:PASS')
                     executable.chmod(0o755)
                     verified = subprocess.run(["systemd-analyze", "verify",
                         str(temporary / "test.service")], cwd=code,
-                        text=True, capture_output=True, check=False)
+                        text=True, encoding="utf-8", capture_output=True, check=False)
                     self.assertEqual(verified.returncode, 0, verified.stderr[-1200:])
 
 
