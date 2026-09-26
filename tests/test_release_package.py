@@ -26,10 +26,11 @@ def _copy_allowlist(destination: Path) -> None:
 
 class ReleaseBuilderTests(unittest.TestCase):
     def test_bilingual_readmes_describe_same_core_features(self):
-        english = (ROOT / "README.md").read_text(encoding="utf-8")
-        russian = (ROOT / "README.ru.md").read_text(encoding="utf-8")
-        self.assertTrue(english.startswith("[Русский](README.ru.md) | English"))
-        self.assertTrue(russian.startswith("Русский | [English](README.md)"))
+        english = (ROOT / "README.en.md").read_text(encoding="utf-8")
+        russian = (ROOT / "README.md").read_text(encoding="utf-8")
+        self.assertTrue(english.startswith("[Русский](README.md) | English"))
+        self.assertTrue(russian.startswith("Русский | [English](README.en.md)"))
+        self.assertFalse((ROOT / "README.ru.md").exists())
         for feature in ("autobump", "notifications", "night_mode", "review_request",
                         "order_history", "statistics", "sales_analytics", "sales_import",
                         "withdrawals", "logs_ui", "SAFE_MODE", "FUNPAY_BOT_DATA_DIR"):
@@ -42,8 +43,9 @@ class ReleaseBuilderTests(unittest.TestCase):
         self.assertIn("# FunPayFlow", russian)
         self.assertIn("independent open-source project", english)
         self.assertIn("not affiliated with\nor endorsed by FunPay", english)
+        self.assertIn("бот для продавцов FunPay", russian)
         self.assertIn("независимый open-source проект", russian)
-        self.assertIn("не являющийся официальным", russian)
+        self.assertIn("не является официальным", russian)
         self.assertIn("FunPayFlow is released under the MIT License. See LICENSE.", english)
         self.assertIn("FunPayFlow распространяется по лицензии MIT. См. LICENSE.", russian)
         for concept in ("Telegram", "statistics", "sales analytics"):
@@ -65,6 +67,9 @@ class ReleaseBuilderTests(unittest.TestCase):
         self.assertIn("FunPayFlow-${GITHUB_REF_NAME}.zip", workflow)
         self.assertIn("FunPayFlow-${GITHUB_REF_NAME}.zip.sha256", workflow)
         self.assertIn('FunPayFlow ${GITHUB_REF_NAME}', workflow)
+        self.assertIn("--notes-file CHANGELOG.md", workflow)
+        self.assertTrue((ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+                        .startswith("# Изменения"))
         self.assertNotIn("python main.py", workflow)
 
     def test_public_package_and_service_names(self):
@@ -74,6 +79,7 @@ class ReleaseBuilderTests(unittest.TestCase):
             encoding="utf-8"))["project"]
         self.assertEqual(project["name"], "funpayflow")
         self.assertEqual(project["version"], "1.0.0")
+        self.assertEqual(project["readme"], "README.md")
         self.assertEqual(release.project_version(), "1.0.0")
         installer = (ROOT / "install.sh").read_text(encoding="utf-8")
         self.assertIn("service_name=funpayflow.service", installer)
@@ -88,9 +94,13 @@ class ReleaseBuilderTests(unittest.TestCase):
         self.assertIn("Copyright (c) 2026 Vetal12350", license_text)
         self.assertIn("Permission is hereby granted, free of charge", license_text)
         self.assertIn("THE SOFTWARE IS PROVIDED \"AS IS\"", license_text)
-        self.assertIn("Private\nVulnerability Reporting", security)
-        self.assertIn("когда владелец включит", security)
+        self.assertIn("GitHub Private Vulnerability Reporting", security.replace("\n", " "))
+        self.assertIn("включённый", security)
         self.assertIn("GitHub Issues", security)
+        for private_name in (".env", "FUNPAY_GOLDEN_KEY", "BOT_TOKEN", "PHPSESSID",
+                             "CSRF", "state.sqlite3", "логи", "экспорты продаж",
+                             "резервные копии", "SSH"):
+            self.assertIn(private_name, security)
 
     def test_allowlist_top_folder_checksum_and_determinism(self):
         with tempfile.TemporaryDirectory(prefix="FunPay release test ") as folder:
@@ -114,11 +124,23 @@ class ReleaseBuilderTests(unittest.TestCase):
                             for name in release.archive_files(release.REQUIRED_FILES)}
                 self.assertEqual(set(archive.namelist()), expected)
                 self.assertIn("FunPayFlow-v1.0.0/README.md", expected)
-                self.assertIn("FunPayFlow-v1.0.0/README.ru.md", expected)
+                self.assertIn("FunPayFlow-v1.0.0/README.en.md", expected)
+                self.assertNotIn("FunPayFlow-v1.0.0/README.ru.md", expected)
                 self.assertIn("FunPayFlow-v1.0.0/LICENSE", expected)
+                self.assertIn("FunPayFlow-v1.0.0/SECURITY.md", expected)
                 self.assertIn("FunPayFlow-v1.0.0/app/main.py", expected)
                 self.assertIn("FunPayFlow-v1.0.0/linux/install.sh", expected)
                 self.assertNotIn("FunPayFlow-v1.0.0/main.py", expected)
+                russian_readme = archive.read("FunPayFlow-v1.0.0/README.md")
+                english_readme = archive.read("FunPayFlow-v1.0.0/README.en.md")
+                self.assertIn("Русский | [English](README.en.md)",
+                              russian_readme.decode("utf-8"))
+                self.assertIn("бот для продавцов FunPay", russian_readme.decode("utf-8"))
+                self.assertIn("[Русский](README.md) | English",
+                              english_readme.decode("utf-8"))
+                self.assertIn("FunPayFlow is an open-source", english_readme.decode("utf-8"))
+                self.assertEqual(russian_readme,
+                                 archive.read("FunPayFlow-v1.0.0/app/README.md"))
                 self.assertTrue(all(info.date_time == (2020, 1, 1, 0, 0, 0)
                                     for info in archive.infolist()))
             self.assertEqual(checksum.read_text(encoding="ascii").split()[0],
@@ -193,10 +215,11 @@ class ExtractedReleaseSmoke(unittest.TestCase):
             release_root = extraction / "FunPayFlow-v1.0.0"
             code = release_root / "app"
             self.assertTrue((code / ".env.example").is_file())
-            self.assertIn("[Русский](README.ru.md) | English",
+            self.assertIn("Русский | [English](README.en.md)",
                           (release_root / "README.md").read_text(encoding="utf-8"))
-            self.assertIn("Русский | [English](README.md)",
-                          (release_root / "README.ru.md").read_text(encoding="utf-8"))
+            self.assertIn("[Русский](README.md) | English",
+                          (release_root / "README.en.md").read_text(encoding="utf-8"))
+            self.assertFalse((release_root / "README.ru.md").exists())
             for name in ("Setup.bat", "Start.bat", "app/ResolveDataDir.bat",
                          "linux/install.sh", "linux/systemd/funpayflow.service.in",
                          "app/render_service.py", "app/README.md"):

@@ -1,104 +1,102 @@
-[Русский](README.ru.md) | English
+Русский | [English](README.en.md)
 
 # FunPayFlow
 
-FunPayFlow is an open-source automation and analytics toolkit for FunPay
-sellers, with Telegram-based management. This FunPay bot supports seller
-automation through lot autobump, order notifications, sales history,
-statistics, sales analytics, and official export import. The public installer
-supports Windows 10/11 and Ubuntu-like Linux VPS hosts with Python 3.13.
+FunPayFlow — бесплатный бот для продавцов FunPay с открытым исходным кодом.
+Автоматизация FunPay включает автоподнятие лотов,
+уведомления о заказах, история продаж, статистика продаж, аналитика продаж
+и импорт официальной истории. Управление доступно через Telegram.
+Поддерживаются Windows 10/11 и Linux/VPS на базе Ubuntu с Python 3.13.
 
-FunPayFlow is an independent open-source project and is not affiliated with
-or endorsed by FunPay.
+FunPayFlow — независимый open-source проект и не является официальным
+продуктом FunPay.
+Интерфейс управления в Telegram в v1.0 доступен только на русском языке.
+Выбор языка при установке меняет только сообщения `Setup.bat` и `Start.bat`.
 
-**Quick links:** [Windows](#windows) · [Linux/VPS](#linuxvps) ·
-[First Telegram launch](#first-telegram-launch).
+**Быстрый старт:** [Windows](#установка-на-windows) ·
+[Linux/VPS](#установка-на-linux) · [Первый запуск](#первоначальная-настройка).
 
-Recommended path after publication: **GitHub Releases →
-`FunPayFlow-v1.0.0.zip` → extract → `Setup.bat` → `Start.bat`**.
-Source-based installation is covered under [Development](#development-and-manual-installation).
+Рекомендуемый путь после публикации: **GitHub Releases →
+`FunPayFlow-v1.0.0.zip` → распаковать → `Setup.bat` → `Start.bat`**.
+Установка из исходников описана отдельно в разделе разработки.
 
-The extracted release keeps `Setup.bat`, `Start.bat`, and these guides at the
-top level. Python code and its `.venv` live under `app/`; Linux installation
-files live under `linux/`. The data-directory resolver is internal to `app/`.
-Keep these folders together when moving the release.
+В распакованном релизе `Setup.bat`, `Start.bat` и инструкции находятся в корне,
+Python-код и `.venv` — в `app/`, файлы установки Linux — в `linux/`. При
+переносе релиза сохраняйте эти папки вместе. Внутренний скрипт определения
+каталога данных находится в `app/`.
 
-**The Telegram management interface is Russian-only in v1.0.** The RU/EN
-choice in Setup changes installer and Start messages only.
+Автоматизация изменяет ваш FunPay-аккаунт. Проверяйте тексты автоответов и
+правила площадки. `SAFE_MODE` блокирует автоматические изменяющие действия.
+<!-- Перед публикацией: только обезличенные скриншоты Main Menu, Modules,
+Statistics и Analytics; без имён аккаунтов, заказов и сумм владельца. -->
 
-Automation can modify your FunPay account. Review auto-reply text and the
-platform rules. `SAFE_MODE` blocks automatic modifying actions.
-<!-- Before publication: use only anonymized Main Menu, Modules, Statistics,
-and Analytics screenshots; never include owner, order, or sales data. -->
+## Возможности
 
-## Features
+- 🧩 Десять встроенных модулей с выбором профиля и применением после перезапуска.
+- 🚀 Автоподнятие с учётом времени ожидания и ограниченными повторами.
+- 📦 История заказов, 🔔 уведомления о заказах, сообщениях и отзывах.
+- 📊 Статистика и 📈 аналитика продаж из SQLite; фильтр по валюте.
+- 📥 Импорт официального ZIP-экспорта FunPay с предварительным просмотром и без дублей.
+- ⭐ Запрос отзыва и 😴 ночной автоответ: отдельные тумблеры и тексты.
+- ⚙️ Статус, проблемы, журнал действий, логи, `SAFE_MODE`.
+- 🔄 Штатный перезапуск из Telegram.
 
-- Ten built-in modules with setup profiles; changes take effect after restart.
-- Lot auto-bump with cooldown tracking and bounded retries.
-- Persistent order history and notifications for orders, messages, and reviews.
-- SQLite-backed statistics and sales analytics with currency filtering.
-- Preview and deduplicated import of the official FunPay ZIP export.
-- Review requests and night auto-replies with separate switches and messages.
-- Status, issues, action journal, logs, and `SAFE_MODE` in Telegram.
-- Graceful restart from Telegram.
+## Установка на Windows
 
-## Windows
+1. После публикации скачайте ZIP из GitHub Releases и распакуйте его в постоянную папку,
+   например `C:\FunPayFlow`. Не запускайте прямо из ZIP.
+2. Запустите `Setup.bat` и выберите русский (по умолчанию) или английский. Он использует установленный `uv` либо официальный
+   пакет `astral-sh.uv` через `winget`; затем устанавливает Python 3.13,
+   синхронизирует `uv.lock` и открывает локальную настройку. Администраторские
+   права обычно не нужны. Если `winget` недоступен, установите `uv` вручную по
+   [инструкции Astral](https://docs.astral.sh/uv/getting-started/installation/).
+3. `Setup.bat` создаст постоянную папку данных `%LOCALAPPDATA%\FunPayFlow`
+   **вне** распакованной папки программы. Введите ключ авторизации FunPay,
+   токен Telegram-бота и числовые `ADMIN_ID`/
+   `FUNPAY_USER_ID`. Секреты вводятся скрыто и не проверяются через сеть.
+   В Windows-консоли ключ и токен можно вставить через `Ctrl+V`:
+   значение не появится на экране. При успешной установке выводится краткий
+   ход работы; если установка зависимостей не удалась, подробности сохраняются
+   в `%TEMP%\FunPayFlow-setup.log`; точный путь показывается в окне.
+   После начального экрана Rich показывает цветные панели шагов и
+   реальное сохранение. Фиксированная маска не раскрывает секрет или его длину;
+   узкий или простой терминал получает читаемый текстовый вывод.
+4. Запустите `Start.bat`, оставьте окно открытым, отправьте боту `/start`.
 
-1. Once the GitHub Release ZIP is published, extract it to a permanent folder,
-   such as `C:\FunPayFlow`. Do not run it from inside the ZIP.
-2. Run `Setup.bat` and choose Russian (default) or English. Setup uses an
-   installed `uv`, or the official `astral-sh.uv` package via `winget`, then
-   installs Python 3.13, syncs `uv.lock`, and opens local configuration.
-   Administrator privileges are normally unnecessary. If `winget` is missing,
-   install `uv` using the [Astral instructions](https://docs.astral.sh/uv/getting-started/installation/).
-3. Setup stores private data in `%LOCALAPPDATA%\FunPayFlow`, **outside**
-   the extracted program folder. Enter the FunPay Golden Key, Telegram bot
-   token, numeric `ADMIN_ID`, and numeric `FUNPAY_USER_ID`. Secret fields are
-   hidden and no online credential check occurs during setup. In a Windows
-   console, you can paste a hidden secret with `Ctrl+V`.
-   After the small bootstrap screen, Rich displays colored step panels and
-   the real save operation. Its fixed secret mask reveals neither the value
-   nor its length; narrow or basic terminals receive readable plain text.
-4. Run `Start.bat`, leave its window open, and send `/start` to your bot.
+После успешной настройки нажмите Enter, чтобы закрыть окно Setup. При запуске
+из открытой консоли сама консоль останется открытой.
 
-After successful Setup, press Enter to close its window. When Setup is run
-from an existing shell, that shell remains open.
+Повторный запуск Setup предлагает оставить существующий `.env` (выбрано по умолчанию),
+отредактировать его или отменить настройку. Start использует тот же каталог данных,
+проверяет конфигурацию и `.venv`; блокировка не даёт запустить второй процесс
+с этими данными.
+Язык установщика сохраняется отдельно в приватном `installer_language.txt`;
+он не меняет язык Telegram-панели.
+Start показывает понятную ошибку второго экземпляра и не объявляет подключение
+к FunPay или Telegram до подтверждения работающим ботом.
+Если `%LOCALAPPDATA%` недоступна, используется
+`%USERPROFILE%\AppData\Local\FunPayFlow`. Продвинутый пользователь может
+явно задать абсолютный `FUNPAY_BOT_DATA_DIR`. Отдельного `Update.bat` нет.
 
-On a rerun, Setup offers to keep the current `.env` (the default), edit it,
-or cancel. The chosen installer language is saved separately in the private
-`installer_language.txt`, which Start reads on later launches. Successful
-dependency installation displays only short stages. If it fails, Setup shows
-the location of `%TEMP%\FunPayFlow-setup.log` for detailed diagnostics.
-Start uses the same presentation for local checks and a friendly
-second-instance message. It does not claim a FunPay or Telegram connection
-before the runtime confirms one.
+## Установка на Linux
 
-Setup and Start use the same stable data directory. Start checks `.env` and
-`.venv`; a process lock prevents a second bot instance from using that data.
-If `%LOCALAPPDATA%` is unavailable, the path falls back to
-`%USERPROFILE%\AppData\Local\FunPayFlow`. Advanced users can set an
-absolute `FUNPAY_BOT_DATA_DIR` explicitly. There is no separate `Update.bat`.
-
-## Linux/VPS
-
-Extract the release or clone the project to a permanent location. Use an
-ordinary account, not root:
+Распакуйте релиз или клонируйте проект в постоянную папку. Работайте под
+обычным пользователем, не под root:
 
 ```bash
 bash linux/install.sh --code-dir "/home/seller/FunPayFlow/app" \
   --data-dir "/home/seller/.local/share/funpayflow"
 ```
 
-Without flags, the script asks for both paths. It sets directory mode `700`
-and `.env` mode `600`, installs `uv` and Python 3.13, syncs dependencies from
-`uv.lock`, and runs local setup (Russian by default; `setup_config.py`
-supports `--language en`). If `uv` is missing, the bootstrap is downloaded
-from `https://astral.sh/uv/install.sh` into a file before execution. This
-requires trusting Astral as the installer provider.
+Без флагов скрипт спросит оба пути. Он выставит `700` на каталог данных и
+`600` на `.env`, поставит `uv`, Python 3.13, зависимости из `uv.lock` и
+запустит настройку. Если `uv` отсутствует, установщик загружается в файл
+только с официального `https://astral.sh/uv/install.sh` и затем выполняется;
+доверие к Astral как поставщику инструмента установки необходимо.
 
-The optional `--systemd` flag installs a service with `sudo`. An existing
-unit is not overwritten, and the new unit is enabled only after successful
-setup. Manage it with:
+Флаг `--systemd` дополнительно устанавливает службу через `sudo`.
+Служба включается только после успешной настройки; существующий unit-файл не
+перезаписывается. Управление установленным сервисом:
 
 ```bash
 sudo systemctl start funpayflow
@@ -108,77 +106,80 @@ sudo systemctl status funpayflow
 sudo journalctl -u funpayflow -f
 ```
 
-The template `linux/systemd/funpayflow.service.in` sets an explicit working
-directory, executable, and private EnvironmentFile. It runs as the selected
-non-root user. SIGTERM shuts down cleanly; failures restart after 10 seconds.
-The Telegram restart control restarts the runtime within the same process.
+Шаблон `linux/systemd/funpayflow.service.in` содержит явные WorkingDirectory,
+ExecStart и приватный EnvironmentFile. Процесс работает от выбранного
+обычного пользователя. `SIGTERM` завершает его штатно; авария приводит к
+повторному старту через 10 секунд. Telegram-кнопка перезапуска обновляет работу бота
+внутри одного процесса; systemd не создаёт второй экземпляр.
 
-## First Telegram launch
+## Первоначальная настройка
 
-Send `/start`. The **Russian-only** wizard offers Minimal, Seller, All, or
-manual module selection. All ten modules are selected by default on a fresh
-installation, but start working only after configuration is saved and the
-runtime restarts. Auto-bump is enabled automatically on the next startup of
-an active module; `SAFE_MODE` still blocks its HTTP action. Night auto-reply
-and review request each need their own switch. Set the primary currency in
-Statistics or Analytics, not in Modules.
+Напишите `/start`. Мастер предложит профили «Минимальный», «Продавец», «Всё»
+или ручной выбор. Для новой установки все десять модулей **выбраны** по
+умолчанию, но начинают работу только после сохранения и перезапуска.
+Автоподнятие при следующем старте активного модуля включится автоматически;
+`SAFE_MODE` всё равно блокирует его HTTP-действие. Ночной автоответ и запрос
+отзыва требуют включения собственных тумблеров. Основная валюта задаётся в
+«Статистика» или «Аналитика», а не в «Модули».
 
-## Modules and currencies
+## Модули и валюты
 
-Modules: `autobump`, `notifications`, `night_mode`, `review_request`,
-`order_history`, `statistics`, `sales_analytics`, `sales_import`,
-`withdrawals`, and `logs_ui`. Disabling a module takes effect after restart.
-`order.currency` is the order's historical currency;
-`primary_currency` is the current preferred currency. Analytics filters
-USD, RUB, other observed currencies, or All. It never adds amounts from
-different currencies or converts them. Reimporting an identical official
-export does not duplicate sales or turnover.
+`autobump`, `notifications`, `night_mode`, `review_request`, `order_history`,
+`statistics`, `sales_analytics`, `sales_import`, `withdrawals`, `logs_ui`.
+Выключение модуля вступает в силу после перезапуска. `order.currency` —
+историческая валюта заказа; `primary_currency` — текущая предпочтительная.
+Аналитика фильтрует USD/RUB/другие найденные валюты или «Все», но **не
+складывает** разные валюты и не конвертирует их. Повтор одинакового
+официального экспорта не создаёт дублей продаж или оборота.
 
-## Private data, backup, and updates
+## Где хранятся данные
 
-An **absolute** `FUNPAY_BOT_DATA_DIR` contains `.env`, `bot_settings.json`,
-`installer_language.txt`, `state.sqlite3` and WAL/SHM files, an optional
-`stats_log.json`, `bot.lock`, `logs/`, and temporary ZIPs under `imports/`.
-Windows Setup/Start derive the same stable location from the user profile and
-set the variable before Python starts. The Linux unit sets it via Environment.
-Manual development launches without the variable retain the old code-local
-layout. **Legacy data is not migrated automatically.** Stop the bot, back up
-the full data directory, and move all data together if changing layouts.
+`FUNPAY_BOT_DATA_DIR` задаёт **абсолютный** путь для `.env`,
+`bot_settings.json`, `installer_language.txt`, `state.sqlite3` и её WAL/SHM, `stats_log.json` при
+наличии, `bot.lock`, `logs/` и временных ZIP в `imports/`. Windows Setup/Start
+вычисляют один и тот же стабильный путь из локального профиля и задают эту
+переменную до запуска Python. Linux unit задаёт путь через Environment.
+При ручном запуске без переменной сохраняется прежнее размещение данных рядом с кодом.
+**Автоматического переноса legacy-данных нет.**
+Для перехода остановите бот, сделайте резервную копию и переместите все данные вместе.
 
-Before updating, stop the process or systemd service and copy the **entire**
-data directory to a protected backup. On Windows, extract the new Release ZIP
-to a new folder, run its `Setup.bat`, then `Start.bat`; the old `.env`,
-settings, SQLite, and logs remain in `%LOCALAPPDATA%\FunPayFlow` and need
-no manual copying. On Linux, install new code with the same `--data-dir`,
-render a new unit with `render_service.py`, review and install it with
-`sudo install`, then run `daemon-reload` and `restart`. Keep the old code and
-backup until the update is verified. There is no hidden migration or online
-self-update.
+## Обновление
 
-## Troubleshooting
+Перед обновлением остановите процесс или службу systemd и скопируйте **весь**
+каталог данных в защищённое место. Для обычной Windows-установки распакуйте
+новый ZIP-релиз в новую папку, запустите новый `Setup.bat`, затем новый
+`Start.bat`: прежние `.env`, настройки, SQLite и логи в
+`%LOCALAPPDATA%\FunPayFlow` будут найдены без копирования. На Linux
+установите новый код с прежним `--data-dir`, вручную создайте через
+`render_service.py` новый unit-файл,
+проверьте и установите его через `sudo install`, затем выполните
+`daemon-reload` и `restart`. Сохраните старый код и резервную копию до проверки.
+Скрытой миграции и интернет-автообновления нет.
 
-| Symptom | Check |
+## Решение проблем
+
+| Симптом | Что проверить |
 | --- | --- |
-| `winget`/`uv` missing | Install `uv` from Astral's official instructions and rerun Setup. |
-| Start cannot find `.env` or `.venv` | Rerun Setup and check the private data directory. |
-| Process lock / second instance | Stop the old process; do not remove an active bot's lock. |
-| Telegram 409 Conflict | A token must be used by only one bot instance. |
-| Incorrect FunPay ID/key | Edit local `.env`; never post values in an issue. |
-| SQLite/settings unavailable | Check permissions, disk space, and your backup. |
-| Monetary metrics unavailable | Choose a primary currency in Statistics/Analytics. |
+| `winget`/`uv` отсутствует | Установите `uv` по официальной инструкции, повторите Setup. |
+| Start не находит `.env` или `.venv` | Повторите Setup и проверьте папку данных. |
+| Блокировка / второй экземпляр | Остановите прежний процесс; не удаляйте `bot.lock` у работающего бота. |
+| Telegram 409 Conflict | Один токен должен использоваться одним экземпляром. |
+| Неверный FunPay ID/ключ | Исправьте локальный `.env`; не присылайте значения в публичное обращение. |
+| SQLite/настройки недоступны | Проверьте права, диск и резервную копию каталога данных. |
+| Денежные показатели не видны | Выберите основную валюту в статистике/аналитике. |
 
-## Architecture
+## Архитектура
 
 ```mermaid
 flowchart LR
     FP[FunPay] --> A[FunPayAPI Account]
     A --> R[Runner polling]
     A --- L[Account RLock]
-    R --> Q[Bounded event queue]
-    Q --> B[Durable SQLite backlog]
-    Q --> P[Event processing]
+    R --> Q[Ограниченная event queue]
+    Q --> B[Durable backlog в SQLite]
+    Q --> P[Обработка событий]
     B --> P
-    P --> DB[(SQLite: orders, reviews, audit)]
+    P --> DB[(SQLite: заказы, отзывы, аудит)]
     T[Telegram UI] --> F[Feature Registry]
     T --> RC[Runtime Control]
     F --> W[Optional workers]
@@ -188,14 +189,14 @@ flowchart LR
     DB --> T
 ```
 
-The Runner and account operations share one Account and RLock. Events pass
-through a bounded queue; critical observations are retained in a durable
-SQLite backlog. Runtime Control manages restarts and the late action gate.
+Один Account и RLock используются Runner и операциями аккаунта. События
+проходят через ограниченную очередь, критические наблюдения сохраняются
+в SQLite backlog. Runtime Control управляет перезапуском и late action gate.
 
-## Development and manual installation
+## Разработка и ручная установка
 
-Install [uv](https://docs.astral.sh/uv/getting-started/installation/)
-and Python 3.13:
+Установите [uv](https://docs.astral.sh/uv/getting-started/installation/)
+и Python 3.13:
 
 ```text
 uv sync --locked --dev
@@ -203,19 +204,25 @@ uv run --no-sync pytest -q
 uv run --no-sync python tests/packaging_smoke.py
 ```
 
-For a manual installation, set an absolute `FUNPAY_BOT_DATA_DIR`, create
-`.env` with `uv run --no-sync python setup_config.py --data-dir <path>` or
-use `.env.example`, then run `uv run --no-sync python main.py`. The official
-ZIP CLI import uses the same SQLite database in the data directory.
+Для ручной установки задайте `FUNPAY_BOT_DATA_DIR` абсолютным путём, создайте
+`.env` через `uv run --no-sync python setup_config.py --data-dir <путь>` или
+по `.env.example`, затем запускайте `uv run --no-sync python main.py`.
+CLI-импорт официального ZIP использует ту же SQLite в папке данных.
 
-## Security and privacy
+## Безопасность
 
-Never publish `.env`, settings, SQLite, exports, logs, or backups. Enter
-secrets locally, never through Telegram. `.env` is written atomically; on
-Linux it has mode `600`. Windows directory permissions depend on the user
-account and filesystem. Setup does not contact FunPay or Telegram; the
-running bot does after startup.
+Не публикуйте `.env`, настройки, SQLite, экспорт, логи и резервные копии. Секреты
+вводятся локально, не через Telegram. `.env` сохраняется атомарно; на Linux
+права `600`. Windows-права папки зависят от вашей учётной записи и ФС.
+Настройка не обращается к FunPay/Telegram; рабочий бот обращается к ним после
+запуска.
 
-## License
+## Статус поддержки
 
-FunPayFlow is released under the MIT License. See LICENSE.
+В v1.0 интерфейс управления в Telegram доступен на русском языке; установщик
+Windows поддерживает русский и английский. Обычные ошибки и предложения можно
+сообщить через GitHub Issues, уязвимости — приватно по инструкции в SECURITY.md.
+
+## Лицензия
+
+FunPayFlow распространяется по лицензии MIT. См. LICENSE.

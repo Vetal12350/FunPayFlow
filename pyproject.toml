@@ -1,7 +1,7 @@
 [project]
 name = "funpayflow"
 version = "1.0.0"
-description = "FunPayFlow — automation and analytics for FunPay sellers"
+description = "FunPayFlow — автоматизация и аналитика для продавцов FunPay"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
