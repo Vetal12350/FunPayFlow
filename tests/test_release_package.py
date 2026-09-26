@@ -1,8 +1,10 @@
 """Offline release ZIP security, reproducibility and extracted-copy smoke."""
 
 import hashlib
+import importlib.util
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -11,10 +13,11 @@ import time
 import unittest
 import zipfile
 
-from scripts import build_release as release
-
-
 ROOT = Path(__file__).resolve().parents[1]
+_spec = importlib.util.spec_from_file_location("build_release", ROOT / "scripts" / "build_release.py")
+assert _spec is not None and _spec.loader is not None
+release = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(release)
 
 
 def _copy_allowlist(destination: Path) -> None:
@@ -25,6 +28,24 @@ def _copy_allowlist(destination: Path) -> None:
 
 
 class ReleaseBuilderTests(unittest.TestCase):
+    def test_public_documentation_links(self):
+        for source in (ROOT / "README.md", ROOT / "README.en.md",
+                       ROOT / "docs/VPS_INSTALL.md"):
+            content = source.read_text(encoding="utf-8")
+            self.assertNotIn("README.ru.md", content)
+            for target in re.findall(r"(?<!!)\[[^\]]+\]\(([^)]+)\)", content):
+                if target.startswith(("https://", "http://")):
+                    continue
+                path, _, anchor = target.partition("#")
+                destination = (source.parent / path).resolve() if path else source
+                self.assertTrue(destination.is_file(), f"{source.name}: {target}")
+                if anchor and destination.suffix == ".md":
+                    headings = re.findall(r"^#{1,6} (.+)$",
+                        destination.read_text(encoding="utf-8"), re.MULTILINE)
+                    slugs = {re.sub(r"[^\w\- ]", "", heading.lower()).replace(" ", "-")
+                             for heading in headings}
+                    self.assertIn(anchor, slugs, f"{source.name}: {target}")
+
     def test_bilingual_readmes_describe_same_core_features(self):
         english = (ROOT / "README.en.md").read_text(encoding="utf-8")
         russian = (ROOT / "README.md").read_text(encoding="utf-8")
@@ -81,10 +102,10 @@ class ReleaseBuilderTests(unittest.TestCase):
         self.assertEqual(project["version"], "1.0.0")
         self.assertEqual(project["readme"], "README.md")
         self.assertEqual(release.project_version(), "1.0.0")
-        installer = (ROOT / "install.sh").read_text(encoding="utf-8")
+        installer = (ROOT / "linux/install.sh").read_text(encoding="utf-8")
         self.assertIn("service_name=funpayflow.service", installer)
-        self.assertTrue((ROOT / "systemd" / "funpayflow.service.in").is_file())
-        self.assertIn("Description=FunPayFlow", (ROOT / "systemd" / "funpayflow.service.in")
+        self.assertTrue((ROOT / "linux/systemd/funpayflow.service.in").is_file())
+        self.assertIn("Description=FunPayFlow", (ROOT / "linux/systemd/funpayflow.service.in")
                       .read_text(encoding="utf-8"))
 
     def test_mit_license_and_private_reporting_policy(self):
@@ -128,7 +149,12 @@ class ReleaseBuilderTests(unittest.TestCase):
                 self.assertNotIn("FunPayFlow-v1.0.0/README.ru.md", expected)
                 self.assertIn("FunPayFlow-v1.0.0/LICENSE", expected)
                 self.assertIn("FunPayFlow-v1.0.0/SECURITY.md", expected)
-                self.assertIn("FunPayFlow-v1.0.0/app/main.py", expected)
+                self.assertIn("FunPayFlow-v1.0.0/docs/VPS_INSTALL.md", expected)
+                self.assertIn("FunPayFlow-v1.0.0/app/docs/VPS_INSTALL.md", expected)
+                for name in ("README.en.md", "SECURITY.md", "LICENSE"):
+                    self.assertIn(f"FunPayFlow-v1.0.0/app/{name}", expected)
+                self.assertIn("FunPayFlow-v1.0.0/app/src/funpayflow/main.py", expected)
+                self.assertIn("FunPayFlow-v1.0.0/app/src/funpayflow/__init__.py", expected)
                 self.assertIn("FunPayFlow-v1.0.0/linux/install.sh", expected)
                 self.assertNotIn("FunPayFlow-v1.0.0/main.py", expected)
                 russian_readme = archive.read("FunPayFlow-v1.0.0/README.md")
@@ -141,6 +167,8 @@ class ReleaseBuilderTests(unittest.TestCase):
                 self.assertIn("FunPayFlow is an open-source", english_readme.decode("utf-8"))
                 self.assertEqual(russian_readme,
                                  archive.read("FunPayFlow-v1.0.0/app/README.md"))
+                self.assertEqual(archive.read("FunPayFlow-v1.0.0/docs/VPS_INSTALL.md"),
+                                 archive.read("FunPayFlow-v1.0.0/app/docs/VPS_INSTALL.md"))
                 self.assertTrue(all(info.date_time == (2020, 1, 1, 0, 0, 0)
                                     for info in archive.infolist()))
             self.assertEqual(checksum.read_text(encoding="ascii").split()[0],
@@ -220,9 +248,9 @@ class ExtractedReleaseSmoke(unittest.TestCase):
             self.assertIn("[Русский](README.md) | English",
                           (release_root / "README.en.md").read_text(encoding="utf-8"))
             self.assertFalse((release_root / "README.ru.md").exists())
-            for name in ("Setup.bat", "Start.bat", "app/ResolveDataDir.bat",
+            for name in ("Setup.bat", "Start.bat", "docs/VPS_INSTALL.md", "app/ResolveDataDir.bat",
                          "linux/install.sh", "linux/systemd/funpayflow.service.in",
-                         "app/render_service.py", "app/README.md"):
+                         "app/src/funpayflow/render_service.py", "app/README.md"):
                 self.assertTrue((release_root / name).is_file(), name)
             self.assertFalse((release_root / "ResolveDataDir.bat").exists())
             private = temporary / "fresh private data with spaces"
@@ -241,7 +269,7 @@ class ExtractedReleaseSmoke(unittest.TestCase):
             self.assertEqual(venv.returncode, 0, venv.stderr[-1200:])
             sync_env = dict(environment, UV_PROJECT_ENVIRONMENT=str(isolated))
             sync = subprocess.run(["uv", "sync", "--offline", "--frozen",
-                "--no-install-project", "--no-dev"], cwd=code, env=sync_env,
+                "--no-dev"], cwd=code, env=sync_env,
                 text=True, encoding="utf-8", capture_output=True, check=False)
             self.assertEqual(sync.returncode, 0, sync.stderr[-1200:])
             python = (isolated / "Scripts" / "python.exe" if os.name == "nt"
@@ -252,8 +280,7 @@ root = pathlib.Path(sys.argv[1]).resolve()
 private = pathlib.Path(sys.argv[2]).resolve()
 checkout = pathlib.Path(sys.argv[3]).resolve()
 assert root != checkout and checkout not in [pathlib.Path(p).resolve() for p in sys.path if p]
-sys.path.insert(0, str(root))
-import main, telegram, state, runtime_paths, setup_config, console_ui, render_service
+from funpayflow import main, telegram, state, runtime_paths, setup_config, console_ui, render_service
 for module in (main, telegram, state, runtime_paths, setup_config, console_ui, render_service):
     assert pathlib.Path(module.__file__).resolve().is_relative_to(root)
 assert runtime_paths.data_dir() == private
@@ -281,7 +308,7 @@ print('extracted-import-and-config:PASS')
 
             legacy = subprocess.run([str(python), "-X", "utf8", "-I", "-B", "-c",
                 "import sys,pathlib; root=pathlib.Path(sys.argv[1]).resolve(); "
-                "sys.path.insert(0,str(root)); import runtime_paths; "
+                "from funpayflow import runtime_paths; "
                 "assert runtime_paths.data_dir()==root; print('legacy:PASS')",
                 str(code)], cwd=code,
                 env={key: value for key, value in environment.items()
@@ -302,7 +329,7 @@ print('extracted-import-and-config:PASS')
             ready = private / "lock-test-ready"
             holder_code = (
                 "import pathlib,sys; root=pathlib.Path(sys.argv[1]); "
-                "sys.path.insert(0,str(root)); import main; "
+                "from funpayflow import main; "
                 "main.acquire_lock(); pathlib.Path(sys.argv[2]).write_text('ready', encoding='ascii'); "
                 "sys.stdin.readline(); main.release_lock()"
             )
@@ -324,7 +351,7 @@ print('extracted-import-and-config:PASS')
                               f"{diagnostic[-1200:]}")
                 contender = subprocess.run([str(python), "-X", "utf8", "-I", "-B", "-c",
                     "import pathlib,sys; root=pathlib.Path(sys.argv[1]); "
-                    "sys.path.insert(0,str(root)); import main; main.acquire_lock()",
+                    "from funpayflow import main; main.acquire_lock()",
                     str(code)], cwd=code, env=environment,
                     text=True, encoding="utf-8", capture_output=True, timeout=10, check=False)
                 self.assertEqual(contender.returncode, 3, contender.stderr[-1000:])
@@ -379,7 +406,12 @@ print('extracted-import-and-config:PASS')
                     str(code / ".venv")], cwd=code, env=environment,
                     text=True, encoding="utf-8", capture_output=True, check=False)
                 self.assertEqual(venv.returncode, 0, venv.stderr[-1000:])
-                (code / "main.py").write_text("raise SystemExit(3)\n", encoding="utf-8")
+                installed = subprocess.run(["uv", "sync", "--offline", "--frozen", "--no-dev"],
+                    cwd=code, env=environment, text=True, encoding="utf-8",
+                    capture_output=True, check=False)
+                self.assertEqual(installed.returncode, 0, installed.stderr[-1000:])
+                (code / "src/funpayflow/main.py").write_text(
+                    "raise SystemExit(3)\n", encoding="utf-8")
                 synthetic_start = subprocess.run(["cmd.exe", "/d", "/c",
                     str(release_root / "Start.bat")], cwd=temporary,
                     env=environment, input="\n", text=True, encoding="utf-8",
@@ -394,8 +426,8 @@ print('extracted-import-and-config:PASS')
                         cwd=code, text=True, encoding="utf-8",
                         capture_output=True, check=False)
                     self.assertEqual(syntax.returncode, 0, syntax.stderr)
-                unit = subprocess.run([str(python), "-B",
-                    str(code / "render_service.py"), "--code-dir", str(code),
+                unit = subprocess.run([str(python), "-B", "-m", "funpayflow.render_service",
+                    "--code-dir", str(code),
                     "--data-dir", str(private), "--output", str(temporary / "test.service")],
                     cwd=code, text=True, encoding="utf-8",
                     capture_output=True, check=False)

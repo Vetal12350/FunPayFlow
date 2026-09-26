@@ -30,7 +30,7 @@ import re
 import sys
 import threading
 from datetime import datetime
-from runtime_paths import logs_dir
+from .runtime_paths import logs_dir
 
 
 class _SafeFunPayApiFilter(logging.Filter):

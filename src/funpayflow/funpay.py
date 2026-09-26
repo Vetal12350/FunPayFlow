@@ -13,9 +13,9 @@ import requests
 from bs4 import BeautifulSoup
 import FunPayAPI
 from FunPayAPI.common.enums import SubCategoryTypes
-import logger
-from runtime_control import automatic_action_gate
-from runtime_events import (ActionEvent, ActionKind, QueuedCriticalEvent,
+from . import logger
+from .runtime_control import automatic_action_gate
+from .runtime_events import (ActionEvent, ActionKind, QueuedCriticalEvent,
                             critical_snapshot, hydrate_critical, html_preview)
 
 
@@ -938,7 +938,7 @@ class FunPayClient:
                         msg_text = getattr(chat, "last_message_text", None) or (str(chat) if chat is not None else "")
                         new_fb = getattr(message_types, "NEW_FEEDBACK", None)
                         changed_fb = getattr(message_types, "FEEDBACK_CHANGED", None)
-                        
+
                         if msg_type in (new_fb, changed_fb) and msg_type is not None:
                             # Точный regex Кардинала (utils.py): r"#[A-Z0-9]{8}"
                             # Номер заказа — ровно 8 символов в верхнем регистре.
@@ -946,7 +946,7 @@ class FunPayClient:
                             if match:
                                 order_id = match.group(1)
                                 results.append(ActionEvent(ActionKind.REVIEW_CHECK_NOW, order_id=order_id))
-                        
+
                         # Остальные системные сообщения игнорируем
                         return results
 
@@ -958,7 +958,7 @@ class FunPayClient:
                 if (type(author_id) is int and type(account_id) is int
                         and author_id == account_id):
                     return results
-                from telegram import is_night_mode_reply_text
+                from .telegram import is_night_mode_reply_text
                 if is_night_mode_reply_text(getattr(chat, "last_message_text", None)):
                     return results
                 if (type(chat_id) is int and self._is_recent_outgoing_echo(

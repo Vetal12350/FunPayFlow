@@ -14,7 +14,7 @@ dependencies = [
 ]
 
 [project.scripts]
-funpayflow = "main:run"
+funpayflow = "funpayflow.main:run"
 
 [build-system]
 requires = ["hatchling"]
@@ -24,20 +24,7 @@ build-backend = "hatchling.build"
 package = true
 
 [tool.hatch.build.targets.wheel]
-only-include = [
-    "main.py",
-    "telegram.py",
-    "funpay.py",
-    "state.py",
-    "feature_registry.py",
-    "runtime_control.py",
-    "runtime_events.py",
-    "logger.py",
-    "import_funpay_sales.py",
-    "runtime_paths.py",
-    "console_ui.py",
-    "setup_config.py",
-]
+packages = ["src/funpayflow"]
 
 [dependency-groups]
 dev = [

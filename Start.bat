@@ -4,7 +4,7 @@ chcp 65001 >nul
 pushd "%~dp0" || exit /b 1
 set "APP_DIR=%CD%"
 if exist "app\pyproject.toml" set "APP_DIR=%CD%\app"
-set "RESOLVER=%~dp0ResolveDataDir.bat"
+set "RESOLVER=%~dp0scripts\windows\ResolveDataDir.bat"
 if exist "%~dp0app\ResolveDataDir.bat" set "RESOLVER=%~dp0app\ResolveDataDir.bat"
 set "BOT_VERSION=unknown"
 for /f "tokens=3" %%V in ('findstr /b /c:"version = " "%APP_DIR%\pyproject.toml"') do set "BOT_VERSION=%%~V"
@@ -38,7 +38,7 @@ set "MSG_STOP=Bot stopped. Press a key to close this window."
 :language_ready
 if not exist "%FUNPAY_BOT_DATA_DIR%\.env" (
   if exist ".venv\Scripts\python.exe" (
-    ".venv\Scripts\python.exe" console_ui.py start-error --language "%INSTALLER_LANGUAGE%" --kind missing_config
+    ".venv\Scripts\python.exe" -m funpayflow.console_ui start-error --language "%INSTALLER_LANGUAGE%" --kind missing_config
   ) else (
     echo FunPayFlow v%BOT_VERSION%
     echo %MSG_CONFIG_MISSING%
@@ -54,20 +54,20 @@ if not exist ".venv\Scripts\python.exe" (
   pause
   exit /b 1
 )
-".venv\Scripts\python.exe" console_ui.py start-ready --language "%INSTALLER_LANGUAGE%" --data-dir "%FUNPAY_BOT_DATA_DIR%"
+".venv\Scripts\python.exe" -m funpayflow.console_ui start-ready --language "%INSTALLER_LANGUAGE%" --data-dir "%FUNPAY_BOT_DATA_DIR%"
 if errorlevel 1 (
   echo FunPayFlow v%BOT_VERSION%
   echo %MSG_CONFIG_OK%
   echo %MSG_DATA_OK%
   echo %MSG_BOT_START%
 )
-".venv\Scripts\python.exe" main.py
+".venv\Scripts\python.exe" -m funpayflow.main
 set "BOT_EXIT=%ERRORLEVEL%"
 if "%BOT_EXIT%"=="3" (
-  ".venv\Scripts\python.exe" console_ui.py start-error --language "%INSTALLER_LANGUAGE%" --kind lock --no-banner
+  ".venv\Scripts\python.exe" -m funpayflow.console_ui start-error --language "%INSTALLER_LANGUAGE%" --kind lock --no-banner
 )
 if not "%BOT_EXIT%"=="0" if not "%BOT_EXIT%"=="3" (
-  ".venv\Scripts\python.exe" console_ui.py start-error --language "%INSTALLER_LANGUAGE%" --kind runtime_error --no-banner
+  ".venv\Scripts\python.exe" -m funpayflow.console_ui start-error --language "%INSTALLER_LANGUAGE%" --kind runtime_error --no-banner
 )
 echo %MSG_STOP%
 pause >nul

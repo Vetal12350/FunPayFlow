@@ -8,7 +8,9 @@ import os
 from pathlib import Path
 
 
-CODE_DIR = Path(__file__).resolve().parent
+_PACKAGE_DIR = Path(__file__).resolve().parent
+CODE_DIR = (_PACKAGE_DIR.parents[1] if _PACKAGE_DIR.parent.name == "src"
+            else Path.cwd().resolve())
 DATA_DIR_ENV = "FUNPAY_BOT_DATA_DIR"
 
 

@@ -9,7 +9,7 @@ from unittest.mock import patch
 import requests
 from dotenv import dotenv_values
 
-import funpay
+from funpayflow import funpay
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -80,7 +80,7 @@ class ReleaseConfigurationTests(unittest.TestCase):
         parsed = dotenv_values(ROOT / ".env.example")
         self.assertEqual(set(parsed), keys)
         self.assertEqual(parsed["BOT_PASSWORD"], "")
-        source = (ROOT / "main.py").read_text(encoding="utf-8")
+        source = (ROOT / "src/funpayflow/main.py").read_text(encoding="utf-8")
         required = {node.args[0].value for node in ast.walk(ast.parse(source))
                     if isinstance(node, ast.Call)
                     and isinstance(node.func, ast.Name)

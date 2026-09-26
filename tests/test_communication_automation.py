@@ -15,17 +15,17 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import FunPayAPI
-import telegram as ui
-from funpay import FunPayClient
-from runtime_events import ActionKind
-from state import ReviewReceiptStore, StateError
+from funpayflow import telegram as ui
+from funpayflow.funpay import FunPayClient
+from funpayflow.runtime_events import ActionKind
+from funpayflow.state import ReviewReceiptStore, StateError
 
 
 MAIN_FUNCTIONS = {
     "_review_chat_context", "_send_scheduled_review_request",
     "_schedule_closed_review_request",
 }
-source = Path("main.py").read_text(encoding="utf-8")
+source = Path("src/funpayflow/main.py").read_text(encoding="utf-8")
 nodes = [node for node in ast.parse(source).body
          if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in MAIN_FUNCTIONS]
 runtime = {

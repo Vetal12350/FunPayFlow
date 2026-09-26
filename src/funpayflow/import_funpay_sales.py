@@ -20,7 +20,7 @@ from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
-from state import DEFAULT_DB_PATH, ReviewReceiptStore
+from .state import DEFAULT_DB_PATH, ReviewReceiptStore
 
 
 REQUIRED = {"order_uid", "game_id", "game_name", "section_type_id",

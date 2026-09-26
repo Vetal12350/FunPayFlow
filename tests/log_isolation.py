@@ -2,7 +2,7 @@
 
 import tempfile
 
-import logger
+from funpayflow import logger
 
 
 _test_logs = tempfile.TemporaryDirectory(prefix="funpay-offline-tests-")

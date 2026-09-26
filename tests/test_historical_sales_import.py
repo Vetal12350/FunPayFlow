@@ -13,10 +13,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
-import telegram as ui
-import import_funpay_sales as sales_import
-from import_funpay_sales import REQUIRED, SalesImportError, import_zip, parse_row
-from state import ReviewReceiptStore
+from funpayflow import telegram as ui
+from funpayflow import import_funpay_sales as sales_import
+from funpayflow.import_funpay_sales import REQUIRED, SalesImportError, import_zip, parse_row
+from funpayflow.state import ReviewReceiptStore
 
 REPORT_AT = int(datetime(2026, 9, 25, 1, tzinfo=timezone.utc).timestamp())
 

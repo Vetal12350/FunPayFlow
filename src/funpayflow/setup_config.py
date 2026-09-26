@@ -8,8 +8,8 @@ from pathlib import Path
 import sys
 import tempfile
 
-from console_ui import InstallerConsole, project_version, use_utf8_console
-from runtime_paths import CODE_DIR, DATA_DIR_ENV
+from .console_ui import InstallerConsole, project_version, use_utf8_console
+from .runtime_paths import CODE_DIR, DATA_DIR_ENV
 
 
 FIELDS = ("FUNPAY_GOLDEN_KEY", "BOT_TOKEN", "ADMIN_ID", "FUNPAY_USER_ID",

@@ -7,7 +7,6 @@ import json
 from pathlib import Path
 import queue
 import sqlite3
-import subprocess
 import tempfile
 import threading
 import unittest
@@ -18,10 +17,10 @@ from unittest.mock import patch
 
 import FunPayAPI
 
-from funpay import FunPayClient, _EventQueueOverflow
-from runtime_events import (ActionEvent, ActionKind, QueuedCriticalEvent,
+from funpayflow.funpay import FunPayClient, _EventQueueOverflow
+from funpayflow.runtime_events import (ActionEvent, ActionKind, QueuedCriticalEvent,
                             ReviewCheckEvent, critical_snapshot, hydrate_critical)
-from state import ReviewReceiptStore, StateError
+from funpayflow.state import ReviewReceiptStore, StateError
 
 
 def order_event(status="PAID", kind="NEW_ORDER"):
@@ -54,22 +53,28 @@ class RuntimeCoreTests(unittest.TestCase):
         return client
 
     def test_one_active_class_and_key_method_parity(self):
-        current = ast.parse(Path("funpay.py").read_text(encoding="utf-8"))
+        root = Path(__file__).resolve().parents[1]
+        source = root / "src" / "funpayflow" / "funpay.py"
+        self.assertTrue(source.is_file())
+        self.assertFalse((root / "funpay.py").exists())
+        current = ast.parse(source.read_text(encoding="utf-8"))
         classes = [n for n in current.body if isinstance(n, ast.ClassDef)
                    and n.name == "FunPayClient"]
         self.assertEqual(len(classes), 1)
-        original = subprocess.check_output(
-            ["git", "show", "HEAD:funpay.py"], text=True, encoding="utf-8")
-        old_classes = [n for n in ast.parse(original).body if isinstance(n, ast.ClassDef)
-                       and n.name == "FunPayClient"]
-        # Before cleanup HEAD had two definitions; after merge it has one.
-        self.assertGreaterEqual(len(old_classes), 1)
-        old = {n.name: n for n in old_classes[-1].body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
-        new = {n.name: n for n in classes[0].body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
-        for name in ("bump_lots", "get_completed_withdrawals",
-                     "get_runner_health", "start_runner", "stop_runner", "refresh_session"):
-            self.assertEqual(ast.dump(old[name], include_attributes=False),
-                             ast.dump(new[name], include_attributes=False), name)
+        methods = [node for node in classes[0].body
+                   if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))]
+        expected = {
+            "bump_lots": ast.AsyncFunctionDef,
+            "get_completed_withdrawals": ast.FunctionDef,
+            "get_runner_health": ast.FunctionDef,
+            "start_runner": ast.FunctionDef,
+            "stop_runner": ast.FunctionDef,
+            "refresh_session": ast.FunctionDef,
+        }
+        for name, kind in expected.items():
+            matches = [node for node in methods if node.name == name]
+            self.assertEqual(len(matches), 1, name)
+            self.assertIsInstance(matches[0], kind, name)
 
     def test_persist_before_queue_and_recover_interrupted(self):
         snapshot = critical_snapshot(order_event())
@@ -162,7 +167,7 @@ class RuntimeCoreTests(unittest.TestCase):
         client._runner_last_failure_category = None
         client._runner_last_failure_type = None
         client._runner_health = "starting"
-        with patch("funpay.logger.error", lambda *args: None):
+        with patch("funpayflow.funpay.logger.error", lambda *args: None):
             with self.assertRaises(_EventQueueOverflow):
                 client.listen_events(is_cancelled=lambda: False)
         self.assertEqual(client.event_queue.qsize(), 1)
@@ -211,7 +216,7 @@ class RuntimeCoreTests(unittest.TestCase):
         self.assertEqual(self.client().event_queue.qsize(), 0)
 
     def test_replayed_order_flows_through_consumer_once(self):
-        source = Path("main.py").read_text(encoding="utf-8")
+        source = Path("src/funpayflow/main.py").read_text(encoding="utf-8")
         wanted = {"_order_observation", "_order_history_fields",
                   "_schedule_closed_review_request", "notifications_loop"}
         nodes = [node for node in ast.parse(source).body
@@ -221,7 +226,7 @@ class RuntimeCoreTests(unittest.TestCase):
             return None
         async def no_review_check(*args, **kwargs):
             return None
-        from runtime_events import ActionKind
+        from funpayflow.runtime_events import ActionKind
         runtime = {
             "asyncio": asyncio, "queue": queue, "time": __import__("time"), "re": re,
             "datetime": datetime, "FunPayAPI": FunPayAPI, "FunPayClient": FunPayClient,

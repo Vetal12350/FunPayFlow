@@ -13,12 +13,12 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import FunPayAPI
-import telegram as ui
-from state import ReviewReceiptStore, StateError
+from funpayflow import telegram as ui
+from funpayflow.state import ReviewReceiptStore, StateError
 
 
 def load_event_adapters():
-    source = Path("main.py").read_text(encoding="utf-8")
+    source = Path("src/funpayflow/main.py").read_text(encoding="utf-8")
     names = {"_order_observation", "_order_history_fields"}
     nodes = [node for node in ast.parse(source).body
              if isinstance(node, ast.FunctionDef) and node.name in names]

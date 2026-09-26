@@ -7,6 +7,8 @@ script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 default_code_dir=$script_dir
 if [[ -f "$script_dir/../app/pyproject.toml" ]]; then
   default_code_dir=$(cd -- "$script_dir/../app" && pwd -P)
+elif [[ -f "$script_dir/../pyproject.toml" ]]; then
+  default_code_dir=$(cd -- "$script_dir/.." && pwd -P)
 fi
 code_dir=''
 data_dir=''
@@ -36,7 +38,7 @@ fi
   printf 'Both directories must be absolute paths.\n' >&2; exit 2;
 }
 code_dir=$(cd -- "$code_dir" && pwd -P)
-[[ -f "$code_dir/pyproject.toml" && -f "$code_dir/uv.lock" && -f "$code_dir/setup_config.py" ]] || {
+[[ -f "$code_dir/pyproject.toml" && -f "$code_dir/uv.lock" && -f "$code_dir/src/funpayflow/setup_config.py" ]] || {
   printf 'Code directory does not contain the release files.\n' >&2; exit 1;
 }
 mkdir -p -- "$data_dir"
@@ -67,7 +69,7 @@ fi
 
 "$uv_exe" python install 3.13
 (cd -- "$code_dir" && "$uv_exe" sync --locked --no-dev --python 3.13)
-"$code_dir/.venv/bin/python" "$code_dir/setup_config.py" --data-dir "$data_dir"
+"$code_dir/.venv/bin/python" -m funpayflow.setup_config --data-dir "$data_dir"
 chmod 600 -- "$data_dir/.env"
 
 if ((install_service)); then
@@ -79,7 +81,7 @@ if ((install_service)); then
     printf 'Existing service was preserved; inspect it manually before updating.\n' >&2
     exit 1
   fi
-  "$code_dir/.venv/bin/python" "$code_dir/render_service.py" \
+  "$code_dir/.venv/bin/python" -m funpayflow.render_service \
     --code-dir "$code_dir" --data-dir "$data_dir" \
     --output "$data_dir/$service_name"
   sudo install -m 644 -- "$data_dir/$service_name" "/etc/systemd/system/$service_name"
@@ -87,8 +89,8 @@ if ((install_service)); then
   sudo systemctl enable --now "$service_name"
   printf 'Service installed. Use: sudo systemctl status %s\n' "$service_name"
 else
-  printf 'Setup complete. Start with: FUNPAY_BOT_DATA_DIR="%s" "%s/.venv/bin/python" "%s/main.py"\n' \
-    "$data_dir" "$code_dir" "$code_dir"
+  printf 'Setup complete. Start with: FUNPAY_BOT_DATA_DIR="%s" "%s/.venv/bin/python" -m funpayflow.main\n' \
+    "$data_dir" "$code_dir"
   printf 'Optional service setup: bash "%s/install.sh" --code-dir "%s" --data-dir "%s" --systemd\n' \
     "$script_dir" "$code_dir" "$data_dir"
 fi

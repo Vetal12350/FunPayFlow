@@ -15,13 +15,18 @@ from unittest.mock import patch
 
 from dotenv import dotenv_values
 
-import render_service
-import runtime_paths
-import setup_config
-import console_ui
+from funpayflow import render_service
+from funpayflow import runtime_paths
+from funpayflow import setup_config
+from funpayflow import console_ui
 
 
 ROOT = Path(__file__).resolve().parents[1]
+PACKAGE = ROOT / "src" / "funpayflow"
+VENV_PYTHON = Path(os.environ.get("VIRTUAL_ENV", sys.prefix)) / (
+    "Scripts/python.exe" if os.name == "nt" else "bin/python")
+if not VENV_PYTHON.is_file():
+    VENV_PYTHON = Path(sys.executable)
 
 
 def _without_ansi(value: str) -> str:
@@ -296,7 +301,8 @@ class ConfigurationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / ".env"
             path.write_bytes(b"synthetic original config")
-            script = [sys.executable, "-B", str(ROOT / "setup_config.py"), "--data-dir", folder]
+            script = [str(VENV_PYTHON), "-B", "-m", "funpayflow.setup_config",
+                      "--data-dir", folder]
             first = subprocess.run([*script, "--language", "en"], input="\n",
                 capture_output=True, text=True, encoding="utf-8", check=False)
             self.assertEqual(first.returncode, 0, first.stderr)
@@ -398,7 +404,7 @@ class ConfigurationTests(unittest.TestCase):
                     secret_fn=lambda _: self.fail("Secrets must not be requested on cancel"),
                     output_fn=lambda _: None)
             self.assertEqual(path.read_bytes(), b"synthetic original config")
-            result = subprocess.run([sys.executable, "-B", str(ROOT / "setup_config.py"),
+            result = subprocess.run([str(VENV_PYTHON), "-B", "-m", "funpayflow.setup_config",
                 "--data-dir", folder, "--language", "en"], input="\n", capture_output=True, text=True,
                 encoding="utf-8", check=False)
             self.assertEqual(result.returncode, 0, result.stderr)
@@ -419,7 +425,7 @@ class IsolatedFirstRunTests(unittest.TestCase):
         environment["FUNPAY_BOT_DATA_DIR"] = str(folder)
         environment["PYTHONDONTWRITEBYTECODE"] = "1"
         environment.pop("PYTHONPATH", None)
-        result = subprocess.run([sys.executable, "-X", "utf8", "-I", "-B", "-c", source],
+        result = subprocess.run([str(VENV_PYTHON), "-X", "utf8", "-I", "-B", "-c", source],
             cwd=folder, env=environment, capture_output=True, text=True,
             encoding="utf-8", check=False)
         if result.returncode:
@@ -437,9 +443,9 @@ class IsolatedFirstRunTests(unittest.TestCase):
                 environment.pop(key, None)
             environment.pop("PYTHONPATH", None)
             source = ("import sys; sys.stdout.reconfigure(encoding='cp1252'); "
-                      f"sys.path.insert(0, {str(ROOT)!r}); import telegram; "
+                      "from funpayflow import telegram; "
                       "print('settings-import:PASS')")
-            result = subprocess.run([sys.executable, "-I", "-B", "-c", source],
+            result = subprocess.run([str(VENV_PYTHON), "-I", "-B", "-c", source],
                 cwd=folder, env=environment, text=True, encoding="utf-8",
                 capture_output=True, check=False)
             self.assertEqual(result.returncode, 0, result.stderr[-1000:])
@@ -453,13 +459,13 @@ class IsolatedFirstRunTests(unittest.TestCase):
             secret = iter(["fake-golden", "123456789:FAKE", ""])
             setup_config.configure(data, input_fn=lambda _: next(prompts),
                 secret_fn=lambda _: next(secret), output_fn=lambda _: None)
-            prefix = f"import sys; sys.path.insert(0, {str(ROOT)!r}); "
+            prefix = ""
             first = self._run_script(prefix + """
 import json
 from pathlib import Path
-import main, telegram as ui, logger, state
-from feature_registry import all_features, is_fresh_install
-from runtime_paths import imports_dir, logs_dir, runtime_file
+from funpayflow import main, telegram as ui, logger, state
+from funpayflow.feature_registry import all_features, is_fresh_install
+from funpayflow.runtime_paths import imports_dir, logs_dir, runtime_file
 fresh = is_fresh_install(Path(ui.SETTINGS_FILE), state.DEFAULT_DB_PATH,
                          runtime_file('stats_log.json'))
 ui.configure_module_runtime(fresh_install=fresh)
@@ -492,9 +498,9 @@ print(json.dumps({'fresh': fresh, 'all_on': all_on, 'inactive': inactive,
             second = self._run_script(prefix + """
 import json
 from pathlib import Path
-import telegram as ui, state
-from feature_registry import is_fresh_install
-from runtime_paths import runtime_file
+from funpayflow import telegram as ui, state
+from funpayflow.feature_registry import is_fresh_install
+from funpayflow.runtime_paths import runtime_file
 fresh = is_fresh_install(Path(ui.SETTINGS_FILE), state.DEFAULT_DB_PATH,
                          runtime_file('stats_log.json'))
 ui.configure_module_runtime(fresh_install=fresh)
@@ -507,9 +513,9 @@ print(json.dumps({'fresh': fresh, 'pending': pending}))
             third = self._run_script(prefix + """
 import json
 from pathlib import Path
-import telegram as ui, state
-from feature_registry import is_fresh_install
-from runtime_paths import runtime_file
+from funpayflow import telegram as ui, state
+from funpayflow.feature_registry import is_fresh_install
+from funpayflow.runtime_paths import runtime_file
 fresh = is_fresh_install(Path(ui.SETTINGS_FILE), state.DEFAULT_DB_PATH,
                          runtime_file('stats_log.json'))
 ui.configure_module_runtime(fresh_install=fresh)
@@ -525,7 +531,7 @@ class InstallerStaticTests(unittest.TestCase):
     def test_windows_scripts_and_service_rendering(self):
         setup = (ROOT / "Setup.bat").read_text(encoding="utf-8")
         start = (ROOT / "Start.bat").read_text(encoding="utf-8")
-        resolver = (ROOT / "ResolveDataDir.bat").read_text(encoding="utf-8")
+        resolver = (ROOT / "scripts/windows/ResolveDataDir.bat").read_text(encoding="utf-8")
         self.assertIn('pushd "%~dp0"', setup)
         self.assertIn('pushd "%~dp0"', start)
         self.assertIn('call "%RESOLVER%"', setup)
@@ -539,16 +545,16 @@ class InstallerStaticTests(unittest.TestCase):
         self.assertIn("--locked --no-dev --python 3.13", setup)
         self.assertIn('--data-dir "%FUNPAY_BOT_DATA_DIR%"', setup)
         self.assertIn('path.parent.mkdir(parents=True, exist_ok=True)',
-                      (ROOT / "setup_config.py").read_text(encoding="utf-8"))
+                      (PACKAGE / "setup_config.py").read_text(encoding="utf-8"))
         self.assertIn('if not exist "%FUNPAY_BOT_DATA_DIR%\\.env"', start)
-        self.assertIn('".venv\\Scripts\\python.exe" main.py', start)
+        self.assertIn('".venv\\Scripts\\python.exe" -m funpayflow.main', start)
         self.assertIn('installer_language.txt', start)
         self.assertIn('--language "%INSTALLER_LANGUAGE%"', setup)
         self.assertIn('Выберите язык / Choose language', setup)
         self.assertIn('[1] Русский', setup)
         self.assertIn('[2] English', setup)
-        self.assertIn("console_ui.py start-ready", start)
-        self.assertIn("console_ui.py start-error", start)
+        self.assertIn("-m funpayflow.console_ui start-ready", start)
+        self.assertIn("-m funpayflow.console_ui start-error", start)
         self.assertIn("[1/3] Preparing Python", setup)
         self.assertIn("[2/3] Installing dependencies", setup)
         self.assertIn("[3/3] Opening configuration", setup)
@@ -556,10 +562,10 @@ class InstallerStaticTests(unittest.TestCase):
         self.assertIn('echo %MSG_DETAILS% "%SETUP_LOG%"', setup)
         self.assertIn('Подробный вывод установщика:', setup)
         self.assertIn('Другой экземпляр FunPayFlow уже запущен.',
-                      (ROOT / "console_ui.py").read_text(encoding="utf-8"))
+                      (PACKAGE / "console_ui.py").read_text(encoding="utf-8"))
         self.assertNotIn(".install-data-dir", setup + start)
         self.assertNotIn("FUNPAY_GOLDEN_KEY", setup + start + resolver)
-        self.assertNotIn("installer_language", (ROOT / "telegram.py").read_text(encoding="utf-8"))
+        self.assertNotIn("installer_language", (PACKAGE / "telegram.py").read_text(encoding="utf-8"))
         with tempfile.TemporaryDirectory(prefix="FunPay service test ") as folder:
             code = Path(folder) / "code with spaces"
             data = Path(folder) / "data with spaces"
@@ -617,7 +623,7 @@ class InstallerStaticTests(unittest.TestCase):
             tools_dir.mkdir()
             data.mkdir()
             shutil.copyfile(ROOT / "Setup.bat", release / "Setup.bat")
-            shutil.copyfile(ROOT / "ResolveDataDir.bat", app / "ResolveDataDir.bat")
+            shutil.copyfile(ROOT / "scripts/windows/ResolveDataDir.bat", app / "ResolveDataDir.bat")
             shutil.copyfile(ROOT / "pyproject.toml", app / "pyproject.toml")
             (tools_dir / "uv.cmd").write_text(
                 '@echo off\r\nif "%~1"=="run" (\r\n'
@@ -697,17 +703,24 @@ class InstallerStaticTests(unittest.TestCase):
             data = root / "private data with spaces"
             code.mkdir()
             data.mkdir()
-            for name in ("Start.bat", "ResolveDataDir.bat"):
-                shutil.copyfile(ROOT / name, code / name)
-            shutil.copyfile(ROOT / "console_ui.py", code / "console_ui.py")
+            shutil.copyfile(ROOT / "Start.bat", code / "Start.bat")
+            resolver = code / "scripts" / "windows" / "ResolveDataDir.bat"
+            resolver.parent.mkdir(parents=True)
+            shutil.copyfile(ROOT / "scripts/windows/ResolveDataDir.bat", resolver)
+            package = code / "src" / "funpayflow"
+            package.mkdir(parents=True)
+            shutil.copyfile(PACKAGE / "__init__.py", package / "__init__.py")
+            shutil.copyfile(PACKAGE / "console_ui.py", package / "console_ui.py")
             shutil.copyfile(ROOT / "pyproject.toml", code / "pyproject.toml")
             (data / ".env").write_text("synthetic-only\n", encoding="utf-8")
-            (code / "main.py").write_text("raise SystemExit(3)\n", encoding="utf-8")
+            (package / "main.py").write_text("raise SystemExit(3)\n", encoding="utf-8")
             created = subprocess.run(["uv", "venv", "--offline", "--python", "3.13",
                 str(code / ".venv")], cwd=code, capture_output=True, text=True,
                 encoding="utf-8",
                 check=False)
             self.assertEqual(created.returncode, 0, created.stderr[-1000:])
+            (code / ".venv/Lib/site-packages/funpayflow-test.pth").write_text(
+                str(code / "src") + "\n", encoding="utf-8")
             environment = dict(os.environ, FUNPAY_BOT_DATA_DIR=str(data))
             for language, lock_message, config_message in (
                 ("ru", "Другой экземпляр FunPayFlow уже запущен.",
@@ -720,7 +733,7 @@ class InstallerStaticTests(unittest.TestCase):
                     result = subprocess.run(["cmd.exe", "/d", "/c", str(code / "Start.bat")],
                         cwd=code, env=environment, input="\n", capture_output=True, text=True,
                         encoding="utf-8", timeout=15, check=False)
-                    self.assertEqual(result.returncode, 3, result.stderr[-1000:])
+                    self.assertEqual(result.returncode, 3, (result.stdout + result.stderr)[-2000:])
                     self.assertIn("FunPayFlow v1.0.0", result.stdout)
                     self.assertIn(lock_message, result.stdout)
                     self.assertIn(config_message, result.stdout)
@@ -736,7 +749,8 @@ class InstallerStaticTests(unittest.TestCase):
             first_release.mkdir()
             next_release.mkdir()
             for release in (first_release, next_release):
-                shutil.copyfile(ROOT / "ResolveDataDir.bat", release / "ResolveDataDir.bat")
+                shutil.copyfile(ROOT / "scripts/windows/ResolveDataDir.bat",
+                                release / "ResolveDataDir.bat")
             environment = dict(os.environ)
             for key in (*setup_config.FIELDS, "FUNPAY_BOT_DATA_DIR"):
                 environment.pop(key, None)
@@ -784,13 +798,13 @@ class InstallerStaticTests(unittest.TestCase):
                 Path(environment["USERPROFILE"]) / "AppData" / "Local" / "FunPayFlow")
 
     def test_linux_syntax_and_permission_strategy(self):
-        script = ROOT / "install.sh"
+        script = ROOT / "linux/install.sh"
         source = script.read_text(encoding="utf-8")
         self.assertIn("set -euo pipefail", source)
         self.assertIn("umask 077", source)
         self.assertIn('chmod 700 -- "$data_dir"', source)
         self.assertIn('chmod 600 -- "$data_dir/.env"', source)
-        self.assertIn('"$code_dir/setup_config.py" --data-dir "$data_dir"', source)
+        self.assertIn('"$code_dir/.venv/bin/python" -m funpayflow.setup_config', source)
         self.assertNotIn("eval ", source)
         self.assertNotIn(b"\r", script.read_bytes())
         bash = shutil.which("bash")

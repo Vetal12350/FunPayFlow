@@ -9,7 +9,7 @@ from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation, localcontext
 from pathlib import Path
-from runtime_paths import runtime_file
+from .runtime_paths import runtime_file
 
 
 DEFAULT_DB_PATH = runtime_file("state.sqlite3")
@@ -1171,7 +1171,7 @@ class ReviewReceiptStore:
     def insert_critical_event(self, event_id: str, event_type: str,
                               entity_id: str, payload: dict) -> bool:
         """Idempotent durable observation, bounded by 4096 unfinished rows."""
-        from runtime_events import hydrate_critical
+        from .runtime_events import hydrate_critical
         if (type(event_id) is not str or not 1 <= len(event_id) <= 160
                 or not re.fullmatch(r"[A-Za-z0-9:_-]+", event_id)):
             raise StateError("Invalid critical event ID.")

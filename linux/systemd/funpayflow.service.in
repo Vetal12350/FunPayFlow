@@ -9,7 +9,7 @@ User=@USER@
 WorkingDirectory=@CODE_DIR@
 EnvironmentFile=@ENV_FILE@
 Environment="FUNPAY_BOT_DATA_DIR=@DATA_VALUE@"
-ExecStart=@PYTHON@ @MAIN@
+ExecStart=@PYTHON@ -m funpayflow.main
 KillSignal=SIGTERM
 TimeoutStopSec=40
 Restart=on-failure

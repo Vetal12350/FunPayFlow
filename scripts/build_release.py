@@ -11,13 +11,17 @@ import zipfile
 
 
 ROOT = Path(__file__).resolve().parents[1]
-REQUIRED_FILES = (
-    "main.py", "telegram.py", "funpay.py", "state.py", "feature_registry.py",
-    "runtime_control.py", "runtime_events.py", "runtime_paths.py", "logger.py",
-    "import_funpay_sales.py", "setup_config.py", "console_ui.py", "render_service.py",
+PACKAGE_FILES = tuple(f"src/funpayflow/{name}" for name in (
+    "__init__.py", "main.py", "telegram.py", "funpay.py", "state.py",
+    "feature_registry.py", "runtime_control.py", "runtime_events.py",
+    "runtime_paths.py", "logger.py", "import_funpay_sales.py", "setup_config.py",
+    "console_ui.py", "render_service.py",
+))
+REQUIRED_FILES = PACKAGE_FILES + (
     "pyproject.toml", "uv.lock", ".env.example", "README.md", "README.en.md", "CHANGELOG.md",
-    "SECURITY.md", "LICENSE", "Setup.bat", "Start.bat", "ResolveDataDir.bat",
-    "install.sh", "systemd/funpayflow.service.in",
+    "SECURITY.md", "LICENSE", "Setup.bat", "Start.bat", "docs/VPS_INSTALL.md",
+    "scripts/windows/ResolveDataDir.bat", "linux/install.sh",
+    "linux/systemd/funpayflow.service.in",
 )
 OPTIONAL_FILES: tuple[str, ...] = ()
 
@@ -27,15 +31,21 @@ def archive_name(source: str) -> str:
     if source in {"Setup.bat", "Start.bat", "README.md",
                   "README.en.md", "CHANGELOG.md", "SECURITY.md", "LICENSE"}:
         return source
-    if source == "install.sh" or source.startswith("systemd/"):
-        return "linux/" + source
+    if source.startswith("linux/"):
+        return source
+    if source == "docs/VPS_INSTALL.md":
+        return source
+    if source == "scripts/windows/ResolveDataDir.bat":
+        return "app/ResolveDataDir.bat"
     return "app/" + source
 
 
 def archive_files(files: tuple[str, ...]) -> dict[str, str]:
     result = {archive_name(name): name for name in files}
-    # Hatchling needs the project readme inside the app's build root.
-    result["app/README.md"] = "README.md"
+    # Hatchling needs the readme inside app/; keep its relative links valid.
+    for name in ("README.md", "README.en.md", "SECURITY.md", "LICENSE"):
+        result[f"app/{name}"] = name
+    result["app/docs/VPS_INSTALL.md"] = "docs/VPS_INSTALL.md"
     return result
 MAX_MEMBER_BYTES = 10_000_000
 MAX_ARCHIVE_BYTES = 50_000_000
@@ -203,7 +213,7 @@ def build_release(root: Path = ROOT, output_dir: Path | None = None, *,
                 info = zipfile.ZipInfo(f"{top}/{destination}", date_time=(2020, 1, 1, 0, 0, 0))
                 info.compress_type = zipfile.ZIP_DEFLATED
                 info.create_system = 3
-                info.external_attr = (0o100755 if source == "install.sh" else 0o100644) << 16
+                info.external_attr = (0o100755 if source == "linux/install.sh" else 0o100644) << 16
                 bundle.writestr(info, _release_bytes(source, root / source), compress_type=zipfile.ZIP_DEFLATED,
                                 compresslevel=9)
         audit_archive(temporary, version=version, private_markers=private_markers)

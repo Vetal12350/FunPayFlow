@@ -17,11 +17,11 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import FunPayAPI
-import logger
-import telegram as ui
-from funpay import FunPayClient
-from runtime_events import html_preview
-from state import ReviewReceiptStore, StateError
+from funpayflow import logger
+from funpayflow import telegram as ui
+from funpayflow.funpay import FunPayClient
+from funpayflow.runtime_events import html_preview
+from funpayflow.state import ReviewReceiptStore, StateError
 
 
 class SettingsCompatibilityTests(unittest.TestCase):
@@ -198,7 +198,7 @@ class MessageLimitsTests(unittest.IsolatedAsyncioTestCase):
         self.tmp.cleanup()
 
     def review_runtime(self):
-        source = Path("main.py").read_text(encoding="utf-8")
+        source = Path("src/funpayflow/main.py").read_text(encoding="utf-8")
         wanted = {"_review_state_operation", "_review_fingerprint",
                   "_safe_review_event_part", "_fetch_and_send_review"}
         nodes = [n for n in ast.parse(source).body

@@ -5,10 +5,10 @@ import os
 from pathlib import Path
 import re
 
-from runtime_paths import CODE_DIR
+from .runtime_paths import CODE_DIR
 
 
-TEMPLATE = CODE_DIR / "systemd" / "funpayflow.service.in"
+TEMPLATE = CODE_DIR / "linux" / "systemd" / "funpayflow.service.in"
 if not TEMPLATE.is_file():  # Release ZIP keeps Linux helpers outside app/.
     TEMPLATE = CODE_DIR.parent / "linux" / "systemd" / "funpayflow.service.in"
 
@@ -43,7 +43,6 @@ def render(code_dir: Path, data_dir: Path, user: str) -> str:
         "@ENV_FILE@": _unit_word(str(data / ".env")),
         "@DATA_VALUE@": str(data).replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%"),
         "@PYTHON@": _exec_word(str(code / ".venv" / "bin" / "python")),
-        "@MAIN@": _exec_word(str(code / "main.py")),
     }
     result = TEMPLATE.read_text(encoding="utf-8")
     for key, value in values.items():
