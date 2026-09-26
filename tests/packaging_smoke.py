@@ -2,6 +2,7 @@
 
 import os
 from pathlib import Path, PurePosixPath
+import shutil
 import subprocess
 import sys
 import tarfile
@@ -10,13 +11,12 @@ import zipfile
 
 
 ROOT = Path(__file__).resolve().parents[1]
-MODULES = {
-    "main.py", "telegram.py", "funpay.py", "state.py", "feature_registry.py",
-    "runtime_control.py", "runtime_events.py", "logger.py",
-    "import_funpay_sales.py",
-    "runtime_paths.py",
-    "console_ui.py", "setup_config.py",
-}
+MODULES = {f"funpayflow/{name}" for name in (
+    "__init__.py", "main.py", "telegram.py", "funpay.py", "state.py",
+    "feature_registry.py", "runtime_control.py", "runtime_events.py",
+    "logger.py", "import_funpay_sales.py", "runtime_paths.py",
+    "console_ui.py", "setup_config.py", "render_service.py",
+)}
 
 
 def _run(*args: str, cwd: Path, env: dict[str, str]) -> None:
@@ -50,9 +50,16 @@ def main() -> None:
         temporary = Path(folder).resolve()
         if temporary.parent != Path(tempfile.gettempdir()).resolve():
             raise RuntimeError("Unsafe temporary build directory.")
+        source = temporary / "isolated source"
+        package = source / "src" / "funpayflow"
+        package.parent.mkdir(parents=True)
+        shutil.copytree(ROOT / "src" / "funpayflow", package,
+                        ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+        for name in ("pyproject.toml", "uv.lock", "README.md", "LICENSE"):
+            shutil.copyfile(ROOT / name, source / name)
         dist = temporary / "dist"
         _run("uv", "build", "--offline", "--out-dir", str(dist),
-             cwd=ROOT, env=environment)
+             cwd=source, env=environment)
         wheels = list(dist.glob("*.whl"))
         archives = list(dist.glob("*.tar.gz"))
         if len(wheels) != 1 or len(archives) != 1:
@@ -69,7 +76,7 @@ def main() -> None:
              cwd=ROOT, env=environment)
         environment["UV_PROJECT_ENVIRONMENT"] = str(virtualenv)
         _run("uv", "sync", "--offline", "--frozen", "--no-install-project",
-             "--no-dev", cwd=ROOT, env=environment)
+             "--no-dev", cwd=source, env=environment)
         python = (virtualenv / "Scripts" / "python.exe" if os.name == "nt"
                   else virtualenv / "bin" / "python")
         _run("uv", "pip", "install", "--offline", "--no-deps", "--python",
@@ -82,10 +89,11 @@ def main() -> None:
             "assert root not in [Path(p).resolve() for p in sys.path if p]\n"
             "entry = next(e for e in distribution('funpayflow').entry_points "
             "if e.name == 'funpayflow')\n"
-            "assert entry.value == 'main:run' and callable(entry.load())\n"
-            "import telegram, state, feature_registry, runtime_control, "
+            "assert entry.value == 'funpayflow.main:run' and callable(entry.load())\n"
+            "from funpayflow import telegram, state, feature_registry, runtime_control, "
             "runtime_events, import_funpay_sales, runtime_paths, "
             "console_ui, setup_config\n"
+            "assert runtime_paths.CODE_DIR == Path.cwd().resolve()\n"
             "print('isolated wheel import: PASS')\n"
         )
         _run(str(python), "-I", "-c", smoke, str(ROOT),

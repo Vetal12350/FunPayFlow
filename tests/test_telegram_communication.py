@@ -10,9 +10,9 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-import telegram as ui
-from runtime_events import ActionEvent, ActionKind
-from runtime_control import automatic_action_gate, restart_requested
+from funpayflow import telegram as ui
+from funpayflow.runtime_events import ActionEvent, ActionKind
+from funpayflow.runtime_control import automatic_action_gate, restart_requested
 
 
 class FakeMessage:
@@ -110,7 +110,7 @@ class CommunicationTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(ui.is_night_mode_enabled())
 
     async def test_night_mode_worker_uses_custom_text(self):
-        source = Path("main.py").read_text(encoding="utf-8")
+        source = Path("src/funpayflow/main.py").read_text(encoding="utf-8")
         node = next(n for n in ast.parse(source).body if isinstance(n, ast.AsyncFunctionDef)
                     and n.name == "_send_night_mode_reply")
         namespace = {"FunPayClient": object, "asyncio": asyncio,
@@ -136,7 +136,7 @@ class CommunicationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.account.sent), 1)
 
     async def test_safe_mode_blocks_night_mode_auto_send(self):
-        source = Path("main.py").read_text(encoding="utf-8")
+        source = Path("src/funpayflow/main.py").read_text(encoding="utf-8")
         node = next(n for n in ast.parse(source).body if isinstance(n, ast.AsyncFunctionDef)
                     and n.name == "_send_night_mode_reply")
         namespace = {"FunPayClient": object, "asyncio": asyncio,

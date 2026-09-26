@@ -20,15 +20,15 @@ from decimal import Decimal, ROUND_HALF_UP, localcontext
 from aiogram import Dispatcher, F
 from aiogram.filters import Command
 from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, ReplyKeyboardMarkup, KeyboardButton, FSInputFile
-from funpay import FunPayClient, NIGHT_MODE_MESSAGE_TEXT, NIGHT_MODE_ORDER_TEXT
-from feature_registry import (MODULES_VERSION, all_features, get_feature,
+from .funpay import FunPayClient, NIGHT_MODE_MESSAGE_TEXT, NIGHT_MODE_ORDER_TEXT
+from .feature_registry import (MODULES_VERSION, all_features, get_feature,
                               is_feature_enabled, profile_modules, resolve_modules,
                               validate_modules_config)
-from import_funpay_sales import import_zip
-from state import StateError, normalize_reporting_currency
-from runtime_control import claim_restart, restart_requested, signal_restart
-from runtime_paths import imports_dir, logs_dir, runtime_file
-import logger
+from .import_funpay_sales import import_zip
+from .state import StateError, normalize_reporting_currency
+from .runtime_control import claim_restart, restart_requested, signal_restart
+from .runtime_paths import imports_dir, logs_dir, runtime_file
+from . import logger
 
 dp = Dispatcher()
 LOGS_DIR = str(logs_dir())

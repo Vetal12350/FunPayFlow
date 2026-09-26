@@ -10,8 +10,8 @@ from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 
-import telegram as ui
-from state import ReviewReceiptStore, StateError, normalize_reporting_currency
+from funpayflow import telegram as ui
+from funpayflow.state import ReviewReceiptStore, StateError, normalize_reporting_currency
 
 
 class Callback:

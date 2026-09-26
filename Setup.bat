@@ -4,7 +4,7 @@ chcp 65001 >nul
 pushd "%~dp0" || exit /b 1
 set "APP_DIR=%CD%"
 if exist "app\pyproject.toml" set "APP_DIR=%CD%\app"
-set "RESOLVER=%~dp0ResolveDataDir.bat"
+set "RESOLVER=%~dp0scripts\windows\ResolveDataDir.bat"
 if exist "%~dp0app\ResolveDataDir.bat" set "RESOLVER=%~dp0app\ResolveDataDir.bat"
 set "BOT_VERSION=unknown"
 for /f "tokens=3" %%V in ('findstr /b /c:"version = " "%APP_DIR%\pyproject.toml"') do set "BOT_VERSION=%%~V"
@@ -121,7 +121,7 @@ call "%UV_EXE%" sync --locked --no-dev --python 3.13 >>"%SETUP_LOG%" 2>&1
 if errorlevel 1 goto :install_failed
 echo %MSG_READY%
 echo %MSG_STAGE3%
-call "%UV_EXE%" run --no-sync python setup_config.py --data-dir "%FUNPAY_BOT_DATA_DIR%" --language "%INSTALLER_LANGUAGE%" --dependencies-ready
+call "%UV_EXE%" run --no-sync python -m funpayflow.setup_config --data-dir "%FUNPAY_BOT_DATA_DIR%" --language "%INSTALLER_LANGUAGE%" --dependencies-ready
 if errorlevel 2 goto :canceled
 if errorlevel 1 goto :config_failed
 call :wait_for_enter

@@ -18,10 +18,10 @@ from unittest.mock import patch
 
 import FunPayAPI
 
-from funpay import FunPayClient, _EventQueueOverflow
-from runtime_events import (ActionEvent, ActionKind, QueuedCriticalEvent,
+from funpayflow.funpay import FunPayClient, _EventQueueOverflow
+from funpayflow.runtime_events import (ActionEvent, ActionKind, QueuedCriticalEvent,
                             ReviewCheckEvent, critical_snapshot, hydrate_critical)
-from state import ReviewReceiptStore, StateError
+from funpayflow.state import ReviewReceiptStore, StateError
 
 
 def order_event(status="PAID", kind="NEW_ORDER"):
@@ -54,7 +54,7 @@ class RuntimeCoreTests(unittest.TestCase):
         return client
 
     def test_one_active_class_and_key_method_parity(self):
-        current = ast.parse(Path("funpay.py").read_text(encoding="utf-8"))
+        current = ast.parse(Path("src/funpayflow/funpay.py").read_text(encoding="utf-8"))
         classes = [n for n in current.body if isinstance(n, ast.ClassDef)
                    and n.name == "FunPayClient"]
         self.assertEqual(len(classes), 1)
@@ -162,7 +162,7 @@ class RuntimeCoreTests(unittest.TestCase):
         client._runner_last_failure_category = None
         client._runner_last_failure_type = None
         client._runner_health = "starting"
-        with patch("funpay.logger.error", lambda *args: None):
+        with patch("funpayflow.funpay.logger.error", lambda *args: None):
             with self.assertRaises(_EventQueueOverflow):
                 client.listen_events(is_cancelled=lambda: False)
         self.assertEqual(client.event_queue.qsize(), 1)
@@ -211,7 +211,7 @@ class RuntimeCoreTests(unittest.TestCase):
         self.assertEqual(self.client().event_queue.qsize(), 0)
 
     def test_replayed_order_flows_through_consumer_once(self):
-        source = Path("main.py").read_text(encoding="utf-8")
+        source = Path("src/funpayflow/main.py").read_text(encoding="utf-8")
         wanted = {"_order_observation", "_order_history_fields",
                   "_schedule_closed_review_request", "notifications_loop"}
         nodes = [node for node in ast.parse(source).body
@@ -221,7 +221,7 @@ class RuntimeCoreTests(unittest.TestCase):
             return None
         async def no_review_check(*args, **kwargs):
             return None
-        from runtime_events import ActionKind
+        from funpayflow.runtime_events import ActionKind
         runtime = {
             "asyncio": asyncio, "queue": queue, "time": __import__("time"), "re": re,
             "datetime": datetime, "FunPayAPI": FunPayAPI, "FunPayClient": FunPayClient,

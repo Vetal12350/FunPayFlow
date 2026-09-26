@@ -12,8 +12,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-import telegram as ui
-from state import ReviewReceiptStore, StateError
+from funpayflow import telegram as ui
+from funpayflow.state import ReviewReceiptStore, StateError
 
 
 class Callback:
@@ -156,7 +156,7 @@ class OperationsTests(unittest.IsolatedAsyncioTestCase):
 
 
     async def test_autobump_safe_gate_and_late_check(self):
-        source = Path("main.py").read_text(encoding="utf-8")
+        source = Path("src/funpayflow/main.py").read_text(encoding="utf-8")
         node = next(n for n in ast.parse(source).body
                     if isinstance(n, ast.AsyncFunctionDef) and n.name == "auto_bump_loop")
         namespace = {"Bot": object, "FunPayClient": object, "asyncio": asyncio,

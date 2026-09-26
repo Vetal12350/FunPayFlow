@@ -15,12 +15,12 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-import telegram as ui
-from feature_registry import (_index, all_features, get_feature, is_feature_enabled,
+from funpayflow import telegram as ui
+from funpayflow.feature_registry import (_index, all_features, get_feature, is_feature_enabled,
                               is_fresh_install, profile_modules, resolve_modules,
                               validate_modules_config)
-from runtime_events import ActionEvent, ActionKind
-from state import ReviewReceiptStore, StateError
+from funpayflow.runtime_events import ActionEvent, ActionKind
+from funpayflow.state import ReviewReceiptStore, StateError
 
 
 class Message:
@@ -53,7 +53,7 @@ def callback_data(markup):
 
 
 def main_function(name, namespace):
-    source = Path("main.py").read_text(encoding="utf-8")
+    source = Path("src/funpayflow/main.py").read_text(encoding="utf-8")
     node = next(node for node in ast.parse(source).body
                 if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name)
     exec(compile(ast.Module(body=[node], type_ignores=[]), "main.py", "exec"), namespace)
@@ -99,7 +99,7 @@ class RegistryTests(unittest.TestCase):
             self.assertFalse(is_fresh_install(settings, db, legacy))
 
     def test_fresh_marker_precedes_account_and_sqlite_startup(self):
-        source = ast.parse(Path("main.py").read_text(encoding="utf-8"))
+        source = ast.parse(Path("src/funpayflow/main.py").read_text(encoding="utf-8"))
         main_node = next(node for node in source.body
                          if isinstance(node, ast.AsyncFunctionDef) and node.name == "main")
         calls = {}
@@ -504,7 +504,7 @@ class TelegramModuleTests(ModuleStateMixin, unittest.IsolatedAsyncioTestCase):
                                  _review_notification_lock=asyncio.Lock(),
                                  _review_state_failed=False, review_state=store,
                                  _notified_reviews={})
-        source = Path("main.py").read_text(encoding="utf-8")
+        source = Path("src/funpayflow/main.py").read_text(encoding="utf-8")
         names = {"_review_state_operation", "_review_fingerprint",
                  "_safe_review_event_part", "_fetch_and_send_review"}
         nodes = [node for node in ast.parse(source).body

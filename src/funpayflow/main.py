@@ -13,12 +13,12 @@ from html import escape
 from pathlib import Path
 from dotenv import load_dotenv
 from aiogram import Bot
-from runtime_paths import runtime_file
+from .runtime_paths import runtime_file
 
 load_dotenv(runtime_file(".env"))
 
 import FunPayAPI
-from telegram import (dp, bot_settings, get_user_settings, get_all_recipients,
+from .telegram import (dp, bot_settings, get_user_settings, get_all_recipients,
                       set_runtime_status_context, clear_runtime_status_context,
                       disable_autobump, enable_autobump_on_startup,
                       get_reply_keyboard, is_night_mode_enabled,
@@ -28,14 +28,14 @@ from telegram import (dp, bot_settings, get_user_settings, get_all_recipients,
                       get_night_mode_reply_text,
                       expand_review_request_text, is_review_request_enabled,
                       configure_module_runtime, module_enabled, save_settings, SETTINGS_FILE)
-from feature_registry import is_fresh_install
-from funpay import FunPayClient, _AmbiguousRaiseOutcome
-from runtime_events import (ActionEvent, ActionKind, QueuedCriticalEvent,
+from .feature_registry import is_fresh_install
+from .funpay import FunPayClient, _AmbiguousRaiseOutcome
+from .runtime_events import (ActionEvent, ActionKind, QueuedCriticalEvent,
                             ReviewCheckEvent, html_preview)
-from runtime_control import (RuntimeAction, automatic_action_gate,
+from .runtime_control import (RuntimeAction, automatic_action_gate,
                              begin_runtime_cycle, restart_requested, wait_for_restart)
-from state import ReviewReceiptStore, StateError, DEFAULT_DB_PATH
-import logger
+from .state import ReviewReceiptStore, StateError, DEFAULT_DB_PATH
+from . import logger
 
 
 def _is_ignorable_send_error(e: Exception) -> bool:
@@ -1120,7 +1120,7 @@ async def _application_loop() -> None:
 
 
 def run():
-    """Точка входа для `uv run funpay-bot` (project.scripts)."""
+    """Точка входа для `uv run funpayflow` (project.scripts)."""
     try:
         acquire_lock()
         asyncio.run(_application_loop())

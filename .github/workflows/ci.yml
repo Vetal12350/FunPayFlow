@@ -29,8 +29,8 @@ jobs:
         run: uv run --no-sync pytest -q
       - name: Linux installer syntax
         if: runner.os == 'Linux'
-        run: bash -n install.sh
+        run: bash -n linux/install.sh
       - name: Compile tracked Python source
-        run: uv run --no-sync python -m compileall -q main.py telegram.py funpay.py state.py feature_registry.py runtime_control.py runtime_events.py runtime_paths.py logger.py import_funpay_sales.py setup_config.py render_service.py tests
+        run: uv run --no-sync python -m compileall -q src/funpayflow tests scripts
       - name: Build and install wheel outside checkout
         run: uv run --no-sync python tests/packaging_smoke.py

@@ -75,7 +75,7 @@ _COPY = {
 
 def project_version(code_dir: Path | None = None) -> str:
     """Read the authoritative project version; never maintain a UI copy."""
-    root = code_dir or Path(__file__).resolve().parent
+    root = code_dir or Path(__file__).resolve().parents[2]
     try:
         with (root / "pyproject.toml").open("rb") as stream:
             return str(tomllib.load(stream)["project"]["version"])

@@ -17,17 +17,17 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-import telegram as ui
-from funpay import FunPayClient, _AutobumpActionCancelled
-from runtime_events import ActionEvent, ActionKind
-from runtime_control import (RuntimeAction, automatic_action_gate,
+from funpayflow import telegram as ui
+from funpayflow.funpay import FunPayClient, _AutobumpActionCancelled
+from funpayflow.runtime_events import ActionEvent, ActionKind
+from funpayflow.runtime_control import (RuntimeAction, automatic_action_gate,
                              begin_runtime_cycle, claim_restart, restart_requested,
                              signal_restart, wait_for_restart)
-from state import ReviewReceiptStore
+from funpayflow.state import ReviewReceiptStore
 
 
 def main_function(name: str, namespace: dict):
-    source = ast.parse(Path("main.py").read_text(encoding="utf-8"))
+    source = ast.parse(Path("src/funpayflow/main.py").read_text(encoding="utf-8"))
     node = next(node for node in source.body
                 if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name)
     exec(compile(ast.Module(body=[node], type_ignores=[]), "main.py", "exec"), namespace)
@@ -203,8 +203,8 @@ class RestartLifecycleTests(unittest.IsolatedAsyncioTestCase):
             def send_message(self, *args, **kwargs):
                 network_calls.append(("night",))
 
-        with patch("funpay._apply_funpay_cookie_patch", lambda: None), \
-             patch("funpay.FunPayAPI.Account", Account):
+        with patch("funpayflow.funpay._apply_funpay_cookie_patch", lambda: None), \
+             patch("funpayflow.funpay.FunPayAPI.Account", Account):
             client = FunPayClient("synthetic")
         self.assertTrue(claim_restart())
         with self.assertRaises(_AutobumpActionCancelled):

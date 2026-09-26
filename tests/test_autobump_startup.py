@@ -9,7 +9,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-import telegram as ui
+from funpayflow import telegram as ui
 
 
 class AutobumpStartupTests(unittest.TestCase):
@@ -48,7 +48,7 @@ class AutobumpStartupTests(unittest.TestCase):
         self.assertFalse(Path(ui.SETTINGS_FILE).exists())
 
     def test_readiness_order_and_single_worker(self):
-        source = Path("main.py").read_text(encoding="utf-8")
+        source = Path("src/funpayflow/main.py").read_text(encoding="utf-8")
         functions = {node.name: node for node in ast.parse(source).body
                      if isinstance(node, ast.AsyncFunctionDef)}
         startup = ast.unparse(functions["main"])

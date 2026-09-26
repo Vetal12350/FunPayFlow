@@ -15,9 +15,9 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-import import_funpay_sales as engine
-import telegram as ui
-from state import ReviewReceiptStore
+from funpayflow import import_funpay_sales as engine
+from funpayflow import telegram as ui
+from funpayflow.state import ReviewReceiptStore
 
 
 def sales_zip(order_id="AA000001"):
