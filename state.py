@@ -9,9 +9,10 @@ from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation, localcontext
 from pathlib import Path
+from runtime_paths import runtime_file
 
 
-DEFAULT_DB_PATH = Path(__file__).resolve().with_name("state.sqlite3")
+DEFAULT_DB_PATH = runtime_file("state.sqlite3")
 
 
 class _DecimalSum:

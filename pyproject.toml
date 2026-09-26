@@ -1,7 +1,7 @@
 [project]
-name = "funpay"
-version = "0.1.0"
-description = "FunPay automation bot — Telegram notifications and lot auto-bump"
+name = "funpayflow"
+version = "1.0.0"
+description = "FunPayFlow — automation and analytics for FunPay sellers"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
@@ -10,10 +10,11 @@ dependencies = [
     "requests>=2.28",
     "beautifulsoup4>=4.12",
     "python-dotenv>=1.0",
+    "rich>=14,<15",
 ]
 
 [project.scripts]
-funpay-bot = "main:run"
+funpayflow = "main:run"
 
 [build-system]
 requires = ["hatchling"]
@@ -33,6 +34,9 @@ only-include = [
     "runtime_events.py",
     "logger.py",
     "import_funpay_sales.py",
+    "runtime_paths.py",
+    "console_ui.py",
+    "setup_config.py",
 ]
 
 [dependency-groups]

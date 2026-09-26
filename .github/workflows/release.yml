@@ -1,0 +1,56 @@
+name: Draft release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          python-version: '3.13'
+      - name: Verify version, license and locked environment
+        run: |
+          python scripts/build_release.py verify-tag "$GITHUB_REF_NAME"
+          test -f LICENSE
+          uv sync --locked --dev
+      - name: Full offline tests
+        run: uv run --no-sync pytest -q
+      - name: Packaging smoke
+        run: uv run --no-sync python tests/packaging_smoke.py
+      - name: Build and audit public ZIP
+        run: |
+          uv run --no-sync python scripts/build_release.py build --require-license
+          uv run --no-sync python scripts/build_release.py audit "dist/FunPayFlow-${GITHUB_REF_NAME}.zip"
+
+  draft:
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          python-version: '3.13'
+      - name: Rebuild and audit artifacts from the verified tag
+        run: |
+          python scripts/build_release.py verify-tag "$GITHUB_REF_NAME"
+          uv sync --locked --dev
+          uv run --no-sync python scripts/build_release.py build --require-license
+          uv run --no-sync python scripts/build_release.py audit "dist/FunPayFlow-${GITHUB_REF_NAME}.zip"
+      - name: Create draft GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            "dist/FunPayFlow-${GITHUB_REF_NAME}.zip" \
+            "dist/FunPayFlow-${GITHUB_REF_NAME}.zip.sha256" \
+            --verify-tag --draft --title "FunPayFlow ${GITHUB_REF_NAME}" \
+            --notes-file CHANGELOG.md

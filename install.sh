@@ -4,6 +4,10 @@ set -euo pipefail
 umask 077
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+default_code_dir=$script_dir
+if [[ -f "$script_dir/../app/pyproject.toml" ]]; then
+  default_code_dir=$(cd -- "$script_dir/../app" && pwd -P)
+fi
 code_dir=''
 data_dir=''
 install_service=0
@@ -21,12 +25,12 @@ if [[ $(id -u) -eq 0 ]]; then
   exit 1
 fi
 if [[ -z "$code_dir" ]]; then
-  read -r -p "Code directory [$script_dir]: " code_dir || exit 2
-  code_dir=${code_dir:-$script_dir}
+  read -r -p "Code directory [$default_code_dir]: " code_dir || exit 2
+  code_dir=${code_dir:-$default_code_dir}
 fi
 if [[ -z "$data_dir" ]]; then
-  read -r -p "Private data directory [$HOME/.local/share/funpay-seller-bot]: " data_dir || exit 2
-  data_dir=${data_dir:-$HOME/.local/share/funpay-seller-bot}
+  read -r -p "Private data directory [$HOME/.local/share/funpayflow]: " data_dir || exit 2
+  data_dir=${data_dir:-$HOME/.local/share/funpayflow}
 fi
 [[ "$code_dir" = /* && "$data_dir" = /* ]] || {
   printf 'Both directories must be absolute paths.\n' >&2; exit 2;
@@ -70,7 +74,7 @@ if ((install_service)); then
   command -v sudo >/dev/null 2>&1 && command -v systemctl >/dev/null 2>&1 || {
     printf 'systemd and sudo are required for --systemd. Setup is otherwise complete.\n' >&2; exit 1;
   }
-  service_name=funpay-seller-bot.service
+  service_name=funpayflow.service
   if [[ -e "/etc/systemd/system/$service_name" ]]; then
     printf 'Existing service was preserved; inspect it manually before updating.\n' >&2
     exit 1
@@ -86,5 +90,5 @@ else
   printf 'Setup complete. Start with: FUNPAY_BOT_DATA_DIR="%s" "%s/.venv/bin/python" "%s/main.py"\n' \
     "$data_dir" "$code_dir" "$code_dir"
   printf 'Optional service setup: bash "%s/install.sh" --code-dir "%s" --data-dir "%s" --systemd\n' \
-    "$code_dir" "$code_dir" "$data_dir"
+    "$script_dir" "$code_dir" "$data_dir"
 fi

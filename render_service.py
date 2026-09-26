@@ -8,7 +8,9 @@ import re
 from runtime_paths import CODE_DIR
 
 
-TEMPLATE = CODE_DIR / "systemd" / "funpay-seller-bot.service.in"
+TEMPLATE = CODE_DIR / "systemd" / "funpayflow.service.in"
+if not TEMPLATE.is_file():  # Release ZIP keeps Linux helpers outside app/.
+    TEMPLATE = CODE_DIR.parent / "linux" / "systemd" / "funpayflow.service.in"
 
 
 def _unit_word(value: str) -> str:

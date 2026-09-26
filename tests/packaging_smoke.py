@@ -14,6 +14,8 @@ MODULES = {
     "main.py", "telegram.py", "funpay.py", "state.py", "feature_registry.py",
     "runtime_control.py", "runtime_events.py", "logger.py",
     "import_funpay_sales.py",
+    "runtime_paths.py",
+    "console_ui.py", "setup_config.py",
 }
 
 
@@ -31,7 +33,7 @@ def _private_artifact(name: str) -> bool:
     filename = parts[-1]
     return (any(part in {"logs", "imports", "exports", "private", "secrets"}
                 for part in parts[:-1])
-            or filename == ".env"
+            or filename in {".env", ".install-data-dir"}
             or (filename.startswith(".env.") and filename != ".env.example")
             or filename.startswith("bot_settings")
             or (filename.startswith("state") and ".sqlite3" in filename)
@@ -76,11 +78,12 @@ def main() -> None:
             "import sys\n"
             "root = Path(sys.argv[1]).resolve()\n"
             "assert root not in [Path(p).resolve() for p in sys.path if p]\n"
-            "entry = next(e for e in distribution('funpay').entry_points "
-            "if e.name == 'funpay-bot')\n"
+            "entry = next(e for e in distribution('funpayflow').entry_points "
+            "if e.name == 'funpayflow')\n"
             "assert entry.value == 'main:run' and callable(entry.load())\n"
             "import telegram, state, feature_registry, runtime_control, "
-            "runtime_events, import_funpay_sales\n"
+            "runtime_events, import_funpay_sales, runtime_paths, "
+            "console_ui, setup_config\n"
             "print('isolated wheel import: PASS')\n"
         )
         _run(str(python), "-I", "-c", smoke, str(ROOT),

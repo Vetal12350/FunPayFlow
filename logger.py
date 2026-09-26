@@ -29,6 +29,7 @@ import os
 import re
 import threading
 from datetime import datetime
+from runtime_paths import logs_dir
 
 
 class _SafeFunPayApiFilter(logging.Filter):
@@ -77,7 +78,7 @@ _GR = "\033[90m"  # dark gray
 _W  = "\033[97m"  # bright white
 # ─────────────────────────────────────────────────────────────────────────────
 
-LOGS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+LOGS_DIR = str(logs_dir())
 _file_lock = threading.Lock()
 _ansi_escape = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 _credential_label = re.compile(
