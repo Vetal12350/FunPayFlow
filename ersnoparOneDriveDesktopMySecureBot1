@@ -1,0 +1,44 @@
+ .github/workflows/ci.yml                           |   4 [32m+[m[31m-[m
+ README.en.md                                       | 267 [32m++++++[m[31m--------------[m
+ README.md                                          | 273 [32m++++++[m[31m---------------[m
+ Setup.bat                                          |   4 [32m+[m[31m-[m
+ Start.bat                                          |  12 [32m+[m[31m-[m
+ docs/RELEASE_CHECKLIST.md                          |  22 [32m+[m[31m-[m
+ docs/VPS_INSTALL.md                                | 204 [32m+++++++++++++++[m
+ install.sh => linux/install.sh                     |  12 [32m+[m[31m-[m
+ {systemd => linux/systemd}/funpayflow.service.in   |   2 [32m+[m[31m-[m
+ pyproject.toml                                     |  17 [32m+[m[31m-[m
+ scripts/build_release.py                           |  32 [32m++[m[31m-[m
+ .../windows/ResolveDataDir.bat                     |   0
+ src/funpayflow/__init__.py                         |   1 [32m+[m
+ console_ui.py => src/funpayflow/console_ui.py      |   2 [32m+[m[31m-[m
+ .../funpayflow/feature_registry.py                 |   0
+ funpay.py => src/funpayflow/funpay.py              |  12 [32m+[m[31m-[m
+ .../funpayflow/import_funpay_sales.py              |   2 [32m+[m[31m-[m
+ logger.py => src/funpayflow/logger.py              |   2 [32m+[m[31m-[m
+ main.py => src/funpayflow/main.py                  |  18 [32m+[m[31m-[m
+ .../funpayflow/render_service.py                   |   5 [32m+[m[31m-[m
+ .../funpayflow/runtime_control.py                  |   0
+ .../funpayflow/runtime_events.py                   |   0
+ .../funpayflow/runtime_paths.py                    |   4 [32m+[m[31m-[m
+ setup_config.py => src/funpayflow/setup_config.py  |   4 [32m+[m[31m-[m
+ state.py => src/funpayflow/state.py                |   4 [32m+[m[31m-[m
+ telegram.py => src/funpayflow/telegram.py          |  14 [32m+[m[31m-[m
+ tests/log_isolation.py                             |   2 [32m+[m[31m-[m
+ tests/packaging_smoke.py                           |  30 [32m++[m[31m-[m
+ tests/test_autobump_startup.py                     |   4 [32m+[m[31m-[m
+ tests/test_communication_automation.py             |  10 [32m+[m[31m-[m
+ tests/test_historical_sales_import.py              |   8 [32m+[m[31m-[m
+ tests/test_modular_features.py                     |  14 [32m+[m[31m-[m
+ tests/test_operations_center.py                    |   6 [32m+[m[31m-[m
+ tests/test_order_history.py                        |   6 [32m+[m[31m-[m
+ tests/test_pre_live_integration.py                 |  12 [32m+[m[31m-[m
+ tests/test_public_installation.py                  |  84 [32m++++[m[31m---[m
+ tests/test_public_release_foundation.py            |   4 [32m+[m[31m-[m
+ tests/test_release_package.py                      |  68 [32m+++[m[31m--[m
+ tests/test_runtime_core.py                         |  14 [32m+[m[31m-[m
+ tests/test_runtime_restart.py                      |  16 [32m+[m[31m-[m
+ tests/test_sales_analytics.py                      |   4 [32m+[m[31m-[m
+ tests/test_telegram_communication.py               |  10 [32m+[m[31m-[m
+ tests/test_telegram_sales_import.py                |   6 [32m+[m[31m-[m
+ 43 files changed, 610 insertions(+), 605 deletions(-)
