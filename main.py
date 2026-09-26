@@ -13,8 +13,9 @@ from html import escape
 from pathlib import Path
 from dotenv import load_dotenv
 from aiogram import Bot
+from runtime_paths import runtime_file
 
-load_dotenv()
+load_dotenv(runtime_file(".env"))
 
 import FunPayAPI
 from telegram import (dp, bot_settings, get_user_settings, get_all_recipients,
@@ -86,7 +87,7 @@ def _require_env(name: str) -> str:
 # в funpay.py про golden_seal/сессии). Поэтому перед стартом проверяем,
 # не запущен ли уже другой процесс этого же бота, и если да - сразу выходим
 # с понятным сообщением, вместо непонятных 409/ошибок сессии.
-LOCK_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot.lock")
+LOCK_FILE = str(runtime_file("bot.lock"))
 _lock_handle = None
 
 
@@ -95,6 +96,7 @@ def acquire_lock():
     global _lock_handle
     if _lock_handle is not None:
         raise RuntimeError("Process lock already acquired.")
+    os.makedirs(os.path.dirname(LOCK_FILE), exist_ok=True)
     handle = open(LOCK_FILE, "a+b")
     try:
         handle.seek(0)
@@ -111,7 +113,7 @@ def acquire_lock():
     except OSError:
         handle.close()
         logger.error("Не удалось получить bot.lock: другой экземпляр или ошибка файловой системы.")
-        raise SystemExit(1) from None
+        raise SystemExit(3) from None
     _lock_handle = handle
     atexit.register(release_lock)
 

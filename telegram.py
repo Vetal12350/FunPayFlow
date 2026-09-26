@@ -27,10 +27,11 @@ from feature_registry import (MODULES_VERSION, all_features, get_feature,
 from import_funpay_sales import import_zip
 from state import StateError, normalize_reporting_currency
 from runtime_control import claim_restart, restart_requested, signal_restart
+from runtime_paths import imports_dir, logs_dir, runtime_file
 import logger
 
 dp = Dispatcher()
-LOGS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+LOGS_DIR = str(logs_dir())
 
 
 async def _send_log_file(target: Message | CallbackQuery, date_str: str) -> None:
@@ -313,7 +314,7 @@ def get_runtime_status_text() -> str:
 #      Влияют на работу бота в целом.
 #   2. Персональные (_user_settings) — notify_*, notifications_enabled.
 #      У каждого авторизованного пользователя свои, независимые друг от друга.
-SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot_settings.json")
+SETTINGS_FILE = str(runtime_file("bot_settings.json"))
 OLD_DEFAULT_REVIEW_REQUEST_TEXT = "Спасибо за покупку! Если всё понравилось, пожалуйста, оставьте отзыв о заказе."
 DEFAULT_REVIEW_REQUEST_TEXT = OLD_DEFAULT_REVIEW_REQUEST_TEXT + "\n\n{order_url}"
 DEFAULT_REVIEW_REQUEST_DELAY_SECONDS = 300
@@ -542,6 +543,7 @@ def save_settings(*, required: bool = False) -> None:
                 str(uid): sett for uid, sett in _user_settings.items()
             },
         }
+        os.makedirs(os.path.dirname(SETTINGS_FILE), exist_ok=True)
         descriptor, temporary_path = tempfile.mkstemp(
             prefix=".bot_settings-", suffix=".tmp", dir=os.path.dirname(SETTINGS_FILE)
         )
@@ -1795,8 +1797,9 @@ async def _sales_import_document(message: Message, user_id: int) -> bool:
         session["phase"] = "checking"
         path = None
         try:
+            imports_dir().mkdir(parents=True, exist_ok=True)
             with tempfile.NamedTemporaryFile(prefix="funpay-sales-", suffix=".zip",
-                                             delete=False) as temporary:
+                                             dir=imports_dir(), delete=False) as temporary:
                 path = Path(temporary.name)
             session["path"] = path
             with path.open("wb") as destination:

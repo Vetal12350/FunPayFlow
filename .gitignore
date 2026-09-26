@@ -26,6 +26,8 @@ bot_settings.json
 /imports/
 /exports/
 /data/
+/.install-data-dir
+/installer_language.txt
 /private/
 /secrets/
 /credentials.local.json
@@ -43,6 +45,7 @@ logs/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+/dist/
 
 # IDE / OS
 .vscode/

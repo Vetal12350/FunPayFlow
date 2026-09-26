@@ -27,8 +27,10 @@ debug-сообщения туда не копируются.
 import logging
 import os
 import re
+import sys
 import threading
 from datetime import datetime
+from runtime_paths import logs_dir
 
 
 class _SafeFunPayApiFilter(logging.Filter):
@@ -64,6 +66,11 @@ configure_funpayapi_logging()
 # Включаем ANSI-escape-коды на Windows (cmd / PowerShell / Windows Terminal)
 if os.name == "nt":
     os.system("")
+    # Runtime modules log Cyrillic during import (including settings load).
+    # A redirected Windows stdout may otherwise use a legacy code page.
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8")
 
 # ── ANSI-палитра ──────────────────────────────────────────────────────────────
 _R  = "\033[0m"   # reset
@@ -77,7 +84,7 @@ _GR = "\033[90m"  # dark gray
 _W  = "\033[97m"  # bright white
 # ─────────────────────────────────────────────────────────────────────────────
 
-LOGS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+LOGS_DIR = str(logs_dir())
 _file_lock = threading.Lock()
 _ansi_escape = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 _credential_label = re.compile(
