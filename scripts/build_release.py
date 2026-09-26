@@ -15,7 +15,7 @@ REQUIRED_FILES = (
     "main.py", "telegram.py", "funpay.py", "state.py", "feature_registry.py",
     "runtime_control.py", "runtime_events.py", "runtime_paths.py", "logger.py",
     "import_funpay_sales.py", "setup_config.py", "console_ui.py", "render_service.py",
-    "pyproject.toml", "uv.lock", ".env.example", "README.md", "README.ru.md", "CHANGELOG.md",
+    "pyproject.toml", "uv.lock", ".env.example", "README.md", "README.en.md", "CHANGELOG.md",
     "SECURITY.md", "LICENSE", "Setup.bat", "Start.bat", "ResolveDataDir.bat",
     "install.sh", "systemd/funpayflow.service.in",
 )
@@ -25,7 +25,7 @@ OPTIONAL_FILES: tuple[str, ...] = ()
 def archive_name(source: str) -> str:
     """Map the flat source checkout to the public release layout."""
     if source in {"Setup.bat", "Start.bat", "README.md",
-                  "README.ru.md", "CHANGELOG.md", "SECURITY.md", "LICENSE"}:
+                  "README.en.md", "CHANGELOG.md", "SECURITY.md", "LICENSE"}:
         return source
     if source == "install.sh" or source.startswith("systemd/"):
         return "linux/" + source
