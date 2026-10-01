@@ -60,7 +60,7 @@ _problems_lock = threading.Lock()
 _active_problems: dict[str, dict] = {}
 _PROBLEM_TYPES = {
     "RUNNER_STOPPED": ("ERROR", "FunPay Runner остановлен."),
-    "RUNNER_RETRYING": ("WARNING", "Повторяются ошибки FunPay Runner."),
+    "RUNNER_RETRYING": ("WARNING", "FunPay Runner переподключается."),
     "QUEUE_PRESSURE": ("WARNING", "Очередь событий близка к заполнению."),
     "DB_UNAVAILABLE": ("ERROR", "Persistent SQLite недоступна."),
     "WITHDRAWAL_REPEATED": ("WARNING", "Повторяются ошибки проверки выводов."),
@@ -122,7 +122,7 @@ def _sync_runtime_problems() -> None:
             _clear_problem("RUNNER_STOPPED")
         if (health.get("state") == "backoff"
                 and type(health.get("consecutive_errors")) is int
-                and health["consecutive_errors"] >= 3):
+                and health["consecutive_errors"] >= 1):
             _set_problem("RUNNER_RETRYING")
         else:
             _clear_problem("RUNNER_RETRYING")
@@ -217,7 +217,7 @@ def get_runtime_status_text() -> str:
     runner_states = {
         "starting": "starting",
         "healthy": "running",
-        "backoff": "backoff",
+        "backoff": "🟡 переподключение",
         "failed": "failed",
         "stopped": "stopped",
     }
@@ -292,6 +292,9 @@ def get_runtime_status_text() -> str:
         f"Withdrawal polling: {withdrawal_text}",
         f"🧩 Модули: {sum(_effective_modules.values())}/{len(_effective_modules)} включено",
     ]
+    retry_delay = health.get("retry_delay")
+    if state == "backoff" and type(retry_delay) in (int, float) and retry_delay > 0:
+        lines.insert(7, f"Следующая попытка: до {retry_delay:g} с")
     if module_enabled("withdrawals") and _last_withdrawal_success_monotonic is not None:
         lines.append("Последняя успешная проверка выводов: " +
                      _elapsed_since(_last_withdrawal_success_monotonic, now))

@@ -88,7 +88,7 @@ class OperationsTests(unittest.IsolatedAsyncioTestCase):
         ui.record_withdrawal_poll(True)
         self.assertNotIn("WITHDRAWAL_REPEATED", {p["code"] for p in ui.get_active_problems()})
         self.client.get_runner_health = lambda: {"state": "backoff", "consecutive_errors": 1}
-        self.assertNotIn("RUNNER_RETRYING", {p["code"] for p in ui.get_active_problems()})
+        self.assertIn("RUNNER_RETRYING", {p["code"] for p in ui.get_active_problems()})
         self.client.get_runner_health = lambda: {"state": "backoff", "consecutive_errors": 3}
         self.assertIn("RUNNER_RETRYING", {p["code"] for p in ui.get_active_problems()})
         self.client.get_runner_health = lambda: {"state": "healthy", "consecutive_errors": 0}

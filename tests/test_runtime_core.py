@@ -218,7 +218,8 @@ class RuntimeCoreTests(unittest.TestCase):
     def test_replayed_order_flows_through_consumer_once(self):
         source = Path("src/funpayflow/main.py").read_text(encoding="utf-8")
         wanted = {"_order_observation", "_order_history_fields",
-                  "_schedule_closed_review_request", "notifications_loop"}
+                  "_schedule_closed_review_request", "notifications_loop",
+                  "_notify_funpay_connection"}
         nodes = [node for node in ast.parse(source).body
                  if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
                  and node.name in wanted]
@@ -238,6 +239,7 @@ class RuntimeCoreTests(unittest.TestCase):
             "_send_night_mode_reply": no_night_reply,
             "_fetch_and_send_review": no_review_check,
             "_send_scheduled_review_request": no_review_check,
+            "_send_runtime_notice": no_review_check,
             "get_all_recipients": lambda: [],
             "_set_problem": lambda *args: None,
             "_clear_problem": lambda *args: None,
@@ -252,6 +254,7 @@ class RuntimeCoreTests(unittest.TestCase):
         client.account = SimpleNamespace(username="Example")
         client.start_runner = lambda: None
         client.runner_failed = lambda: False
+        client.get_runner_health = lambda: {"state": "healthy", "incident_id": 0}
         client.runner_stop_requested = lambda: not self.store.pending_critical_events(1) and (
             self._critical_state(snapshot.event_id) == "done")
         client.enqueue_pending_critical_events()

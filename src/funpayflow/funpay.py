@@ -6,6 +6,8 @@ import random
 import re
 import queue
 import threading
+import ssl
+import urllib3.exceptions
 from urllib.parse import urlsplit
 from decimal import Decimal, InvalidOperation
 from html import escape
@@ -43,6 +45,8 @@ class _WithdrawalParseError(ValueError):
 EVENT_QUEUE_CAPACITY = 256
 NIGHT_MODE_MESSAGE_TEXT = "😴 Продавец спит, как только проснется сразу ответит Вам"
 NIGHT_MODE_ORDER_TEXT = "😴 Продавец спит, как проснётся — сразу приступит"
+RUNNER_RETRY_INITIAL_SECONDS = 5.0
+RUNNER_RETRY_MAX_SECONDS = 60.0
 
 # ---------------------------------------------------------------------------
 # ФИКС ДЛЯ 400 "Необходимая cookie отсутствует или устарела" на runner/
@@ -202,6 +206,8 @@ class FunPayClient:
         self._runner_consecutive_errors = 0
         self._runner_last_failure_category: str | None = None
         self._runner_last_failure_type: str | None = None
+        self._runner_incident_id = 0
+        self._runner_retry_delay: float | None = None
         self._raise_action_gate = threading.local()
         original_account_method = self.account.method
 
@@ -739,7 +745,74 @@ class FunPayClient:
                 "consecutive_errors": self._runner_consecutive_errors,
                 "last_failure_category": self._runner_last_failure_category,
                 "last_failure_type": self._runner_last_failure_type,
+                "incident_id": self._runner_incident_id,
+                "retry_delay": self._runner_retry_delay,
             }
+
+    @staticmethod
+    def _certificate_verification_failed(error: BaseException) -> bool:
+        """Only known certificate failures bypass transport retry; never log their text."""
+        pending = [error]
+        seen = set()
+        while pending and len(seen) < 12:
+            current = pending.pop()
+            if id(current) in seen:
+                continue
+            seen.add(id(current))
+            if isinstance(current, (ssl.SSLCertVerificationError, ssl.CertificateError)):
+                return True
+            # requests/urllib3 can wrap the SSL exception in reason or args.
+            for item in (getattr(current, "__cause__", None),
+                         getattr(current, "__context__", None),
+                         getattr(current, "reason", None), *current.args):
+                if isinstance(item, BaseException):
+                    pending.append(item)
+                elif type(item) is str and (
+                        "CERTIFICATE_VERIFY_FAILED" in item.upper()
+                        or "CERTIFICATE VERIFY FAILED" in item.upper()
+                        or "HOSTNAME MISMATCH" in item.upper()):
+                    return True
+        return False
+
+    @staticmethod
+    def _safe_runner_error_detail(error: Exception) -> str:
+        """Fixed diagnostic labels only; exception payloads never reach logs."""
+        if isinstance(error, FunPayAPI.exceptions.RequestFailedError):
+            status = error.status_code
+            return f"HTTP_{status}" if type(status) is int and 100 <= status <= 599 else "HTTP_UNKNOWN"
+        if isinstance(error, requests.exceptions.ReadTimeout):
+            return "READ_TIMEOUT"
+        if isinstance(error, requests.exceptions.ConnectTimeout):
+            return "CONNECT_TIMEOUT"
+        if FunPayClient._certificate_verification_failed(error):
+            return "CERTIFICATE_VERIFY_FAILED"
+        pending = [error]
+        seen = set()
+        while pending and len(seen) < 12:
+            current = pending.pop()
+            if id(current) in seen:
+                continue
+            seen.add(id(current))
+            if isinstance(current, ssl.SSLEOFError):
+                return "TLS_UNEXPECTED_EOF"
+            for item in (getattr(current, "__cause__", None),
+                         getattr(current, "__context__", None),
+                         getattr(current, "reason", None), *current.args):
+                if isinstance(item, BaseException):
+                    pending.append(item)
+                elif type(item) is str:
+                    upper = item.upper()
+                    if "UNEXPECTED_EOF_WHILE_READING" in upper or "EOF OCCURRED IN VIOLATION" in upper:
+                        return "TLS_UNEXPECTED_EOF"
+                    if "TLSV1_ALERT_INTERNAL_ERROR" in upper:
+                        return "TLS_ALERT_INTERNAL_ERROR"
+                    if "SSLV3_ALERT_HANDSHAKE_FAILURE" in upper:
+                        return "TLS_HANDSHAKE_FAILURE"
+                    if "WRONG_VERSION_NUMBER" in upper:
+                        return "TLS_VERSION_MISMATCH"
+        if isinstance(error, (requests.exceptions.SSLError, urllib3.exceptions.SSLError)):
+            return "TLS_OTHER"
+        return "TRANSPORT_OTHER"
 
     @staticmethod
     def _classify_runner_error(error: Exception) -> str:
@@ -754,10 +827,20 @@ class FunPayClient:
             if status in (408, 429, 500, 502, 503, 504):
                 return "RECOVERABLE"
             return "UNKNOWN"
-        if isinstance(error, requests.exceptions.SSLError):
-            return "FATAL"
-        if isinstance(error, (requests.exceptions.Timeout, requests.exceptions.ConnectionError)):
-            return "RECOVERABLE"
+        if isinstance(error, urllib3.exceptions.MaxRetryError):
+            reason = getattr(error, "reason", None)
+            if reason is not error and isinstance(reason, (
+                    urllib3.exceptions.TimeoutError, urllib3.exceptions.ProtocolError,
+                    urllib3.exceptions.SSLError, TimeoutError, ConnectionResetError)):
+                return FunPayClient._classify_runner_error(reason)
+            return "UNKNOWN"
+        if isinstance(error, (requests.exceptions.SSLError, urllib3.exceptions.SSLError)):
+            return "FATAL" if FunPayClient._certificate_verification_failed(error) else "RECOVERABLE"
+        if isinstance(error, (requests.exceptions.Timeout, requests.exceptions.ConnectionError,
+                              urllib3.exceptions.TimeoutError, urllib3.exceptions.ProtocolError,
+                              TimeoutError, ConnectionResetError, ConnectionAbortedError,
+                              BrokenPipeError)):
+            return "FATAL" if FunPayClient._certificate_verification_failed(error) else "RECOVERABLE"
         if isinstance(error, (ValueError, TypeError, KeyError, AttributeError, AssertionError)):
             return "FATAL"
         return "UNKNOWN"
@@ -818,12 +901,23 @@ class FunPayClient:
                     self._runner_consecutive_errors = consecutive_errors
                     self._runner_last_failure_category = category
                     self._runner_last_failure_type = error_type
-                    self._runner_health = "backoff" if category == "RECOVERABLE" and consecutive_errors < 8 else "failed"
-                if category != "RECOVERABLE" or consecutive_errors >= 8:
+                    if category == "RECOVERABLE":
+                        if self._runner_health != "backoff":
+                            self._runner_incident_id += 1
+                        self._runner_health = "backoff"
+                    else:
+                        self._runner_health = "failed"
+                        self._runner_retry_delay = None
+                if category != "RECOVERABLE":
                     logger.error(f"Runner polling остановлен: {category}, {error_type}.")
                     raise
-                backoff = min(delay * 2 ** (consecutive_errors - 1), max(delay, 300.0))
-                logger.warning(f"Runner polling retry: {category}, {error_type}, попытка {consecutive_errors}/8.")
+                backoff = min(RUNNER_RETRY_MAX_SECONDS,
+                              RUNNER_RETRY_INITIAL_SECONDS * 2 ** min(consecutive_errors - 1, 4))
+                with self._runner_health_lock:
+                    self._runner_retry_delay = backoff
+                detail = self._safe_runner_error_detail(e)
+                logger.warning(f"Runner polling reconnect: {error_type}/{detail}, attempt {consecutive_errors}, "
+                               f"retry in {backoff:g}s (capped).")
                 if self._runner_stop.wait(backoff):
                     return
                 continue
@@ -835,6 +929,7 @@ class FunPayClient:
                 self._runner_last_success_monotonic = time.monotonic()
                 self._runner_consecutive_errors = 0
                 self._runner_health = "healthy"
+                self._runner_retry_delay = None
             if self._runner_stop.wait(delay):
                 return
 
