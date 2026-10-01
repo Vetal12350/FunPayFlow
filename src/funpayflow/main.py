@@ -624,6 +624,8 @@ async def notifications_loop(bot: Bot, client: FunPayClient):
     review_tasks: set[asyncio.Task] = set()
     request_tasks: dict[str, asyncio.Task] = {}
     review_failed = False
+    warned_incident = 0
+    recovered_incident = 0
 
     def review_done(task: asyncio.Task) -> None:
         nonlocal review_failed
@@ -706,6 +708,8 @@ async def notifications_loop(bot: Bot, client: FunPayClient):
                 return
             if client.runner_failed():
                 raise RuntimeError("Runner producer неожиданно завершился.") from None
+            warned_incident, recovered_incident = await _notify_funpay_connection(
+                bot, client.get_runner_health(), warned_incident, recovered_incident)
             if review_failed:
                 raise RuntimeError("Review task unexpectedly failed.") from None
             # Забираем следующее событие из очереди, не блокируя asyncio-цикл
@@ -914,6 +918,22 @@ async def _send_runtime_notice(bot: Bot, message: str, *, restore_keyboard: bool
             raise
         except Exception as e:
             logger.warning(f"Не удалось отправить системное уведомление: {type(e).__name__}.")
+
+
+async def _notify_funpay_connection(bot: Bot, health: dict,
+                                    warned: int, recovered: int) -> tuple[int, int]:
+    """One best-effort notice per observed polling incident, from the existing consumer."""
+    incident = health.get("incident_id")
+    if type(incident) is not int or incident <= 0:
+        return warned, recovered
+    if health.get("state") == "backoff" and incident > warned:
+        warned = incident
+        await _send_runtime_notice(
+            bot, "🟡 Временная ошибка соединения с FunPay. Выполняется автоматическое переподключение.")
+    elif health.get("state") == "healthy" and incident == warned and incident > recovered:
+        recovered = incident
+        await _send_runtime_notice(bot, "🟢 Соединение с FunPay восстановлено. Работа продолжена.")
+    return warned, recovered
 
 
 async def _supervise_tasks(bot: Bot, client: FunPayClient):
