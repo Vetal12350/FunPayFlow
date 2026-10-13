@@ -7,6 +7,7 @@ import re
 import queue
 import threading
 import ssl
+import uuid
 import urllib3.exceptions
 from urllib.parse import urlsplit
 from decimal import Decimal, InvalidOperation
@@ -17,6 +18,7 @@ import FunPayAPI
 from FunPayAPI.common.enums import SubCategoryTypes
 from . import logger
 from .runtime_control import automatic_action_gate
+from .state import StateError, AUTOBUMP_SAFE_INTERVAL
 from .runtime_events import (ActionEvent, ActionKind, QueuedCriticalEvent,
                             critical_snapshot, hydrate_critical, html_preview)
 
@@ -26,7 +28,7 @@ class _AutobumpActionCancelled(Exception):
 
 
 class _AmbiguousRaiseOutcome(Exception):
-    """Результат modifying lots/raise неизвестен; автоподнятие приостановлено."""
+    """Результат lots/raise неизвестен; target сохранён до безопасного окна."""
 
 
 class _RunnerStopRequested(BaseException):
@@ -349,6 +351,7 @@ class FunPayClient:
     # Прочие ошибки после начала lots/raise остаются неопределёнными.
 
     async def bump_lots(self, user_id: int, is_cancelled=None):
+        store = self.review_state
         abandoned = threading.Event()
         transport_started = threading.Event()
         boundary_lock = threading.Lock()
@@ -357,6 +360,11 @@ class FunPayClient:
             # Синхронизируем late gate с отменой ожидающей coroutine.
             with boundary_lock:
                 if abandoned.is_set() or (is_cancelled and is_cancelled()):
+                    return False
+                if not store.claim_autobump_target(cycle_id, game_id, attempt_id):
+                    return False
+                if abandoned.is_set() or (is_cancelled and is_cancelled()):
+                    store.release_autobump_claim(game_id, attempt_id)
                     return False
                 transport_started.set()
                 return True
@@ -389,6 +397,8 @@ class FunPayClient:
             logger.warning(f"Ошибка чтения профиля (парсинг лотов): {type(e).__name__}.")
             return False, "Ошибка получения данных профиля.", 600
 
+        if is_cancelled and is_cancelled():
+            return False, "Автоподнятие остановлено.", 0
         raised_cats = []
         cooldown_count = 0
         min_wait = 7200
@@ -417,20 +427,26 @@ class FunPayClient:
             if getattr(subcat, 'id', None):
                 games_to_raise[game_id]['node_count'] += 1
 
-        for game_id, data in games_to_raise.items():
+        cycle = await asyncio.to_thread(store.autobump_cycle, list(games_to_raise))
+        cycle_id = cycle[0]['cycle_id'] if cycle else None
+        for target in cycle:
+            game_id = target['game_id']
             if is_cancelled and is_cancelled():
                 logger.info("Автоподнятие прервано из-за кнопки выключателя.")
                 return False, "Автоподнятие остановлено.", 0
 
+            if target['state'] != 'pending':
+                cooldown_count += 1
+                min_wait = min(min_wait, max(1, int(target['eligible_at'] - current_time)))
+                continue
+            data = games_to_raise.get(game_id)
+            if data is None:
+                await asyncio.to_thread(store.skip_autobump_target, cycle_id, game_id)
+                continue
             game_name = data['name']
             node_count = data['node_count']
 
             display_name = f"{game_name} ({node_count} раздела/ов)" if node_count else game_name
-
-            if (saved_time := self.raise_time.get(game_id)) and saved_time > current_time:
-                cooldown_count += 1
-                min_wait = min(min_wait, int(saved_time - current_time))
-                continue
 
             await asyncio.sleep(random.uniform(5.0, 9.0))
 
@@ -441,13 +457,16 @@ class FunPayClient:
             try:
                 # account.raise_lots сам поднимает ВСЕ разделы (node_id) данной
                 # категории через уже авторизованную сессию self.account.
+                attempt_id = uuid.uuid4().hex
                 performed = await asyncio.to_thread(_raise_if_active, game_id)
 
             except asyncio.CancelledError:
+                abandoned.set()
                 with boundary_lock:
-                    abandoned.set()
                     uncertain = transport_started.is_set()
                 if uncertain:
+                    await asyncio.to_thread(store.finish_autobump_target, game_id, attempt_id,
+                                            'ambiguous', AUTOBUMP_SAFE_INTERVAL)
                     raise _AmbiguousRaiseOutcome() from None
                 raise
 
@@ -474,6 +493,8 @@ class FunPayClient:
                                 wait_time = amount + 2  # Как в старой рабочей версии.
 
                 if transport_started.is_set() and type(wait_time) is int and wait_time > 0:
+                    await asyncio.to_thread(store.finish_autobump_target, game_id, attempt_id,
+                                            'cooldown', wait_time)
                     self.raise_time[game_id] = time.time() + wait_time
                     min_wait = min(min_wait, wait_time)
                     cooldown_count += 1
@@ -485,8 +506,12 @@ class FunPayClient:
                     logger.error("Не удалось подготовить lots/raise: RaiseError.")
                     return False, "Не удалось подготовить поднятие лотов.", 600
                 logger.error("Результат lots/raise неизвестен: RaiseError.")
+                await asyncio.to_thread(store.finish_autobump_target, game_id, attempt_id,
+                                        'ambiguous', AUTOBUMP_SAFE_INTERVAL)
                 raise _AmbiguousRaiseOutcome() from None
 
+            except StateError:
+                raise
             except Exception as e:
                 if not transport_started.is_set():
                     # Ошибка возникла до Account.method("lots/raise");
@@ -494,6 +519,8 @@ class FunPayClient:
                     logger.error(f"Не удалось подготовить lots/raise: {type(e).__name__}.")
                     return False, "Не удалось подготовить поднятие лотов.", 600
                 logger.error(f"Результат lots/raise неизвестен: {type(e).__name__}.")
+                await asyncio.to_thread(store.finish_autobump_target, game_id, attempt_id,
+                                        'ambiguous', AUTOBUMP_SAFE_INTERVAL)
                 raise _AmbiguousRaiseOutcome() from None
 
             if not performed:
@@ -501,12 +528,16 @@ class FunPayClient:
 
             transport_started.clear()
             wait_time = 7200
+            await asyncio.to_thread(store.finish_autobump_target, game_id, attempt_id,
+                                    'success', wait_time)
             next_time = time.time() + wait_time
             self.raise_time[game_id] = next_time
             # Храним кортеж: (имя игры, кол-во разделов, время кулдауна) — для красивого Telegram-сообщения
             raised_cats.append((game_name, node_count, wait_time))
             logger.success(f"[BUMP] ✅ {display_name}: поднята")
 
+        if cycle_id is not None:
+            await asyncio.to_thread(store.complete_autobump_cycle, cycle_id)
         min_wait_final = max(min_wait, 60)
 
         # Формируем Telegram-уведомление только по успешно поднятым лотам.
@@ -924,6 +955,8 @@ class FunPayClient:
 
             if is_cancelled():
                 return
+            if consecutive_errors:
+                logger.info(f"FunPay polling restored after {consecutive_errors} transport failures.")
             consecutive_errors = 0
             with self._runner_health_lock:
                 self._runner_last_success_monotonic = time.monotonic()

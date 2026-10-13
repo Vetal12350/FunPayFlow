@@ -361,7 +361,7 @@ class RestartLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_main_recreates_one_account_and_session_per_cycle(self):
         with tempfile.TemporaryDirectory() as temp:
-            clients, bots, notices, autobump = [], [], [], []
+            clients, bots, notices = [], [], []
             db_path = Path(temp) / "state.sqlite3"
             class Client:
                 def __init__(self, key):
@@ -404,7 +404,6 @@ class RestartLifecycleTests(unittest.IsolatedAsyncioTestCase):
                     db_path, Path(temp) / "missing.json"),
                 "_validate_funpay_user_id": lambda *args: None,
                 "Bot": Bot, "module_enabled": lambda key: key == "autobump",
-                "enable_autobump_on_startup": lambda: autobump.append(True),
                 "_send_runtime_notice": notice,
                 "_supervise_tasks": supervise,
                 "set_runtime_status_context": lambda *args: None,
@@ -423,9 +422,7 @@ class RestartLifecycleTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual([client.initialized for client in clients], [1, 1])
             self.assertEqual(len(bots), 2)
             self.assertTrue(all(bot.session.closed for bot in bots))
-            self.assertEqual(notices.count("🟢 Бот запущен."), 2)
-            self.assertEqual(notices.count("⚠️ Бот остановлен из-за критической ошибки."), 0)
-            self.assertEqual(len(autobump), 2)
+            self.assertEqual(notices, [])
             with closing(sqlite3.connect(db_path)) as db:
                 self.assertEqual(db.execute("SELECT 1").fetchone(), (1,))
 

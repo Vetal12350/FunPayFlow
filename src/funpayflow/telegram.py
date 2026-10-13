@@ -324,7 +324,8 @@ DEFAULT_REVIEW_REQUEST_DELAY_SECONDS = 300
 
 # Глобальные настройки — общие для всего бота
 _DEFAULT_GLOBAL_SETTINGS: dict = {
-    "auto_bump": False,
+    "auto_bump": True,
+    "critical_notice": None,
     "night_mode": False,
     "safe_mode": False,
     "authorized_user_ids": [],
@@ -465,6 +466,12 @@ def load_settings() -> None:
             saved["review_request_enabled"] = False
             print("[SETTINGS] Некорректная задержка запроса отзыва пропущена; автоотправка выключена.")
         saved["review_request_delay_seconds"] = review_delay
+        notice = saved.get("critical_notice")
+        if (notice is not None and (not isinstance(notice, dict)
+                or set(notice) != {"code", "at"}
+                or notice.get("code") not in {"AUTH", "CERTIFICATE", "STATE", "RUNTIME"}
+                or type(notice.get("at")) is not int or notice["at"] < 0)):
+            saved["critical_notice"] = None
 
         # --- Миграция старого формата (без user_settings) ---
         # Раньше notify_* хранились в корне — теперь они персональные.
@@ -530,6 +537,7 @@ def save_settings(*, required: bool = False) -> None:
         )
         data = {
             "auto_bump": bot_settings["auto_bump"],
+            "critical_notice": bot_settings["critical_notice"],
             "night_mode": bot_settings["night_mode"],
             "safe_mode": bot_settings["safe_mode"],
             "authorized_user_ids": bot_settings["authorized_user_ids"],
@@ -659,21 +667,52 @@ def toggle_night_mode_saved(*, actor: str = "system") -> bool:
     return enabled
 
 
-def disable_autobump() -> None:
-    """Выключает автоподнятие и надёжно сохраняет OFF."""
-    bot_settings["auto_bump"] = False
-    save_settings(required=True)
+_autobump_state_lock = threading.Lock()
+_autobump_state_version = 0
 
 
-def enable_autobump_on_startup() -> None:
-    """Publish ON only after the required atomic settings save succeeds."""
-    previous = bot_settings["auto_bump"]
-    bot_settings["auto_bump"] = True
-    try:
-        save_settings(required=True)
-    except Exception:
-        bot_settings["auto_bump"] = previous
-        raise RuntimeError("Не удалось сохранить автоподнятие при запуске.") from None
+def get_autobump_state() -> tuple[bool, int]:
+    with _autobump_state_lock:
+        return bot_settings["auto_bump"], _autobump_state_version
+
+
+def claim_critical_notice(code: str) -> bool:
+    """Coalesce the same fatal category across process restarts for 30 minutes."""
+    if code not in {"AUTH", "CERTIFICATE", "STATE", "RUNTIME"}:
+        code = "RUNTIME"
+    with _autobump_state_lock:
+        now = int(time.time())
+        previous = bot_settings["critical_notice"]
+        if (previous is not None and previous["code"] == code
+                and 0 <= now - previous["at"] < 1800):
+            return False
+        bot_settings["critical_notice"] = {"code": code, "at": now}
+        try:
+            save_settings(required=True)
+        except Exception:
+            bot_settings["critical_notice"] = previous
+            logger.warning("Critical notice deduplication could not be persisted.")
+        return True
+
+
+def toggle_autobump_saved() -> bool:
+    """Manual ON starts a fresh snapshot without erasing persisted cooldowns."""
+    global _autobump_state_version
+    with _autobump_state_lock:
+        previous = bot_settings["auto_bump"]
+        if not previous:
+            store = getattr(_runtime_client, "review_state", None)
+            if store is None:
+                raise RuntimeError("Autobump state unavailable.")
+            store.reset_autobump_cycle()
+        bot_settings["auto_bump"] = not previous
+        try:
+            save_settings(required=True)
+        except Exception:
+            bot_settings["auto_bump"] = previous
+            raise RuntimeError("Не удалось сохранить автоподнятие.") from None
+        _autobump_state_version += 1
+        return bot_settings["auto_bump"]
 
 
 load_settings()
@@ -2424,14 +2463,10 @@ async def callback_handler(callback: CallbackQuery):
 
     # Включение/выключение автоподнятия (глобальная настройка — влияет на всех)
     if action == "toggle_bump":
-        enabling = not bot_settings["auto_bump"]
-        bot_settings["auto_bump"] = enabling
         try:
-            save_settings(required=True)
+            toggle_autobump_saved()
         except RuntimeError:
-            if enabling:
-                bot_settings["auto_bump"] = False
-            await callback.answer("Не удалось сохранить настройку. Автоподнятие не включено.", show_alert=True)
+            await callback.answer("Не удалось сохранить настройку. Состояние не изменено.", show_alert=True)
             return
         state_text = "включено" if bot_settings["auto_bump"] else "выключено"
         _audit_action(f"telegram:{user_id}", "AUTOBUMP", "global",

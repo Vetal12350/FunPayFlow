@@ -161,6 +161,7 @@ class OperationsTests(unittest.IsolatedAsyncioTestCase):
                     if isinstance(n, ast.AsyncFunctionDef) and n.name == "auto_bump_loop")
         namespace = {"Bot": object, "FunPayClient": object, "asyncio": asyncio,
                      "bot_settings": ui.bot_settings, "is_safe_mode_enabled": ui.is_safe_mode_enabled,
+                     "get_autobump_state": ui.get_autobump_state,
                      "restart_requested": lambda: False, "module_enabled": ui.module_enabled,
                      "_require_env": lambda key: "1", "get_all_recipients": lambda: [],
                      "_AmbiguousRaiseOutcome": type("_AmbiguousRaiseOutcome", (Exception,), {}),
@@ -175,7 +176,8 @@ class OperationsTests(unittest.IsolatedAsyncioTestCase):
         ui.bot_settings["auto_bump"] = True
         ui.bot_settings["safe_mode"] = True
         task = asyncio.create_task(namespace["auto_bump_loop"](
-            None, SimpleNamespace(bump_lots=bump_lots, runner_stop_requested=lambda: False)))
+            None, SimpleNamespace(bump_lots=bump_lots, runner_stop_requested=lambda: False,
+                                  get_runner_health=lambda: {"state": "healthy"})))
         await asyncio.sleep(0.05)
         self.assertEqual(calls, [])
         ui.bot_settings["safe_mode"] = False

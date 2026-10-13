@@ -6,6 +6,7 @@ from pathlib import Path
 import queue
 import ssl
 import threading
+import tempfile
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -15,11 +16,16 @@ import requests
 import urllib3.exceptions
 
 from funpayflow.funpay import FunPayClient, _AmbiguousRaiseOutcome
+from funpayflow.state import ReviewReceiptStore
 
 
 class RecoveryTests(unittest.TestCase):
     def client(self, outcomes):
         client = object.__new__(FunPayClient)
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        client.review_state = ReviewReceiptStore(Path(folder.name) / 'state.sqlite3')
+        client.review_state.initialize()
         client._account_lock = threading.RLock()
         client._runner_publish_lock = threading.Lock()
         client._runner_health_lock = threading.Lock()
@@ -256,7 +262,8 @@ class RecoveryTests(unittest.TestCase):
             get=lambda: None,
             get_user=lambda _uid: SimpleNamespace(
                 get_sorted_lots=lambda _kind: {Subcategory(): object()}),
-            raise_lots=lambda game_id: raises.append(game_id))
+            raise_lots=lambda game_id: (self.assertTrue(client._raise_action_gate.is_allowed()),
+                                        raises.append(game_id)))
         successful_polls = 0
 
         def wait(seconds):
@@ -315,9 +322,9 @@ class RecoveryTests(unittest.TestCase):
         original.join(1)
         self.assertFalse(original.is_alive())
 
-    def test_best_effort_notice_and_coalesced_transitions(self):
+    def test_critical_notice_timeout_is_best_effort(self):
         source = Path("src/funpayflow/main.py").read_text(encoding="utf-8")
-        names = {"_send_runtime_notice", "_notify_funpay_connection"}
+        names = {"_send_runtime_notice"}
         nodes = [node for node in ast.parse(source).body
                  if isinstance(node, ast.AsyncFunctionDef) and node.name in names]
         warnings = []
@@ -339,16 +346,10 @@ class RecoveryTests(unittest.TestCase):
 
         async def run():
             bot = FailingBot()
-            warned = recovered = 0
-            for state, incident in (("healthy", 0), ("backoff", 1),
-                                    ("backoff", 1), ("healthy", 1),
-                                    ("healthy", 1), ("backoff", 2),
-                                    ("healthy", 2)):
-                warned, recovered = await namespace["_notify_funpay_connection"](
-                    bot, {"state": state, "incident_id": incident}, warned, recovered)
-            return bot.calls, warned, recovered
+            await namespace["_send_runtime_notice"](bot, "Critical runtime failure")
+            return bot.calls
 
-        self.assertEqual(asyncio.run(run()), (4, 2, 2))
+        self.assertEqual(asyncio.run(run()), 1)
         self.assertEqual(len(warnings), 1)
         self.assertNotIn("PRIVATE", warnings[0])
 

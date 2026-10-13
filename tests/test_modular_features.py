@@ -434,9 +434,8 @@ class TelegramModuleTests(ModuleStateMixin, unittest.IsolatedAsyncioTestCase):
         self.assertTrue(ui.bot_settings["setup_completed"])
         self.assertTrue(ui.bot_settings["modules"]["autobump"])
         self.assertFalse(ui.module_enabled("autobump"))
-        self.assertFalse(ui.bot_settings["auto_bump"])
+        self.assertTrue(ui.bot_settings["auto_bump"])
         ui.configure_module_runtime(fresh_install=False)
-        ui.enable_autobump_on_startup()
         self.assertTrue(ui.bot_settings["auto_bump"])
 
     async def test_reenable_preserves_ordinary_settings_and_sqlite(self):
@@ -608,7 +607,6 @@ class WorkerGateTests(ModuleStateMixin, unittest.IsolatedAsyncioTestCase):
                                  enqueue_pending_critical_events=lambda: 0,
                                  start_runner=lambda: calls.append("runner"),
                                  runner_failed=lambda: False,
-                                 get_runner_health=lambda: {"state": "healthy", "incident_id": 0},
                                  describe_event=lambda event: [ActionEvent(
                                      ActionKind.NOTIFY_MESSAGE, text="synthetic")])
         checks = 0
@@ -619,14 +617,11 @@ class WorkerGateTests(ModuleStateMixin, unittest.IsolatedAsyncioTestCase):
         client.runner_stop_requested = stop_requested
         async def send_message(*args, **kwargs):
             sent.append(args)
-        async def no_connection_notice(_bot, _health, warned, recovered):
-            return warned, recovered
         namespace = {"asyncio": asyncio, "queue": queue, "Bot": object,
                      "FunPayClient": object, "QueuedCriticalEvent": type("QueuedCriticalEvent", (), {}),
                      "ReviewCheckEvent": type("ReviewCheckEvent", (), {}),
                      "ActionKind": ActionKind, "module_enabled": ui.module_enabled,
                      "_order_observation": lambda event: None,
-                     "_notify_funpay_connection": no_connection_notice,
                      "get_all_recipients": lambda: [100],
                      "get_user_settings": lambda uid: {"notifications_enabled": True,
                                                        "notify_message": True},

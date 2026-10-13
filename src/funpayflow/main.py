@@ -20,7 +20,7 @@ load_dotenv(runtime_file(".env"))
 import FunPayAPI
 from .telegram import (dp, bot_settings, get_user_settings, get_all_recipients,
                       set_runtime_status_context, clear_runtime_status_context,
-                      disable_autobump, enable_autobump_on_startup,
+                      get_autobump_state, claim_critical_notice,
                       get_reply_keyboard, is_night_mode_enabled,
                       is_safe_mode_enabled, record_withdrawal_poll,
                       set_telegram_polling_state, _set_problem, _clear_problem,
@@ -137,10 +137,10 @@ async def auto_bump_loop(bot: Bot, client: FunPayClient):
     user_id = int(_require_env("FUNPAY_USER_ID"))
 
     # Переменная для отслеживания предыдущего состояния тумблера (чтобы слать уведомления только при переключении)
-    last_state = bot_settings.get("auto_bump", False)
+    last_state, _ = get_autobump_state()
 
     while True:
-        current_state = bot_settings.get("auto_bump", False)
+        current_state, state_version = get_autobump_state()
 
         # 1. Проверяем, изменилось ли состояние (Включили или Выключили)
         if current_state != last_state:
@@ -159,7 +159,8 @@ async def auto_bump_loop(bot: Bot, client: FunPayClient):
             last_state = current_state
 
         # 2. Если тумблер включен - запускаем работу
-        if current_state and (is_safe_mode_enabled() or restart_requested()):
+        if current_state and (is_safe_mode_enabled() or restart_requested()
+                              or client.get_runner_health().get("state") == "backoff"):
             await asyncio.sleep(1)
             continue
         if current_state:
@@ -170,37 +171,16 @@ async def auto_bump_loop(bot: Bot, client: FunPayClient):
                 success, message_text, wait_time = await client.bump_lots(
                     user_id,
                     is_cancelled=lambda: (client.runner_stop_requested()
-                                          or not bot_settings["auto_bump"]
+                                          or get_autobump_state() != (True, state_version)
+                                          or client.get_runner_health().get("state") == "backoff"
                                           or is_safe_mode_enabled()
                                           or restart_requested()),
                 )
             except _AmbiguousRaiseOutcome:
-                persistence_failed = False
-                try:
-                    disable_autobump()
-                except RuntimeError:
-                    persistence_failed = True
                 if asyncio.current_task().cancelling():
-                    if persistence_failed:
-                        raise RuntimeError("Не удалось надёжно отключить автоподнятие.") from None
                     raise asyncio.CancelledError
-                notice = (
-                    "⚠️ Автоподнятие остановлено: не удалось сохранить безопасное "
-                    "состояние. Проверьте FunPay и настройку до перезапуска."
-                    if persistence_failed else
-                    "⚠️ Автоподнятие отключено. Результат последнего запроса "
-                    "поднятия неизвестен. Проверьте FunPay и включите "
-                    "автоподнятие вручную."
-                )
-                for recipient_id in get_all_recipients():
-                    try:
-                        await bot.send_message(recipient_id, notice)
-                    except Exception as e:
-                        logger.error(f"Не удалось отправить предупреждение об автоподнятии: {type(e).__name__}.")
-                if persistence_failed:
-                    raise RuntimeError("Не удалось надёжно отключить автоподнятие.") from None
-                last_state = False
-                continue
+                logger.warning("Autobump target UNKNOWN; progress saved, resume after safe pause.")
+                success, message_text, wait_time = False, "", 60
 
             if wait_time == 0:  # Прервано пользователем во время перебора
                 continue
@@ -209,7 +189,7 @@ async def auto_bump_loop(bot: Bot, client: FunPayClient):
 
             # Отправляем отчет всем, у кого включены notifications_enabled + notify_bump.
             # message_text пустой, если все лоты были на кулдауне — в этом случае ничего не шлём.
-            if bot_settings["auto_bump"] and message_text:
+            if success and bot_settings["auto_bump"] and message_text:
                 logger.bump(_strip_html(message_text))
                 for recipient_id in (get_all_recipients() if module_enabled("notifications") else []):
                     u = get_user_settings(recipient_id)
@@ -222,7 +202,7 @@ async def auto_bump_loop(bot: Bot, client: FunPayClient):
 
             # Сон с ежесекундной проверкой кнопки выключения
             for _ in range(int(wait_time)):
-                if not bot_settings["auto_bump"]:
+                if get_autobump_state() != (True, state_version):
                     logger.bump("Автоподнятие выключено пользователем во время ожидания.")
                     break  # Выходим из цикла сна. Основной цикл (while True) заметит изменения и отправит сообщение об остановке
                 await asyncio.sleep(1)
@@ -624,8 +604,6 @@ async def notifications_loop(bot: Bot, client: FunPayClient):
     review_tasks: set[asyncio.Task] = set()
     request_tasks: dict[str, asyncio.Task] = {}
     review_failed = False
-    warned_incident = 0
-    recovered_incident = 0
 
     def review_done(task: asyncio.Task) -> None:
         nonlocal review_failed
@@ -708,8 +686,6 @@ async def notifications_loop(bot: Bot, client: FunPayClient):
                 return
             if client.runner_failed():
                 raise RuntimeError("Runner producer неожиданно завершился.") from None
-            warned_incident, recovered_incident = await _notify_funpay_connection(
-                bot, client.get_runner_health(), warned_incident, recovered_incident)
             if review_failed:
                 raise RuntimeError("Review task unexpectedly failed.") from None
             # Забираем следующее событие из очереди, не блокируя asyncio-цикл
@@ -920,22 +896,6 @@ async def _send_runtime_notice(bot: Bot, message: str, *, restore_keyboard: bool
             logger.warning(f"Не удалось отправить системное уведомление: {type(e).__name__}.")
 
 
-async def _notify_funpay_connection(bot: Bot, health: dict,
-                                    warned: int, recovered: int) -> tuple[int, int]:
-    """One best-effort notice per observed polling incident, from the existing consumer."""
-    incident = health.get("incident_id")
-    if type(incident) is not int or incident <= 0:
-        return warned, recovered
-    if health.get("state") == "backoff" and incident > warned:
-        warned = incident
-        await _send_runtime_notice(
-            bot, "🟡 Временная ошибка соединения с FunPay. Выполняется автоматическое переподключение.")
-    elif health.get("state") == "healthy" and incident == warned and incident > recovered:
-        recovered = incident
-        await _send_runtime_notice(bot, "🟢 Соединение с FunPay восстановлено. Работа продолжена.")
-    return warned, recovered
-
-
 async def _supervise_tasks(bot: Bot, client: FunPayClient):
     """Завершает runtime при остановке polling или критической фоновой задачи."""
     tasks = {
@@ -1055,45 +1015,46 @@ async def main():
     # ОДИН общий клиент/аккаунт на весь бот - и для поднятия лотов, и для уведомлений.
     client = FunPayClient(golden_key)
 
-    logger.info("Инициализация системы...")
-
-    # Как в Кардинале (__init_account): самый первый запрос к аккаунту -
-    # ОБЫЧНЫЙ account.get() БЕЗ update_phpsessid=True. update_phpsessid=True
-    # используется только позже, в session_refresh_loop, раз в час - как и в
-    # Кардинале (update_session_loop). Если update_phpsessid=True вызвать
-    # самым первым запросом (до того как обычная сессия вообще установлена),
-    # похоже, это и приводит к "Необходимая cookie отсутствует или устарела".
-    try:
-        await asyncio.to_thread(client.initialize_account)
-    except Exception:
-        logger.error("Не удалось инициализировать сессию FunPay.")
-        raise RuntimeError("Начальная сессия FunPay не инициализирована.") from None
-
-    _validate_funpay_user_id(client)
-    client.review_state = ReviewReceiptStore()
-    try:
-        await asyncio.to_thread(client.review_state.initialize)
-    except Exception as e:
-        logger.error(f"Не удалось инициализировать persistent state: {type(e).__name__}.")
-        raise RuntimeError("Persistent state недоступен.") from None
-
-    logger.banner(client.account.username)
-    logger.success(f"Сессия FunPay инициализирована (аккаунт: {client.account.username}).")
-    if os.name == "nt":
-        # Обновляем заголовок окна cmd, если бот запущен через .bat на Windows.
-        # На сервере (Linux) os.name == "posix", эта строка просто не выполнится.
-        os.system("title FunPay Bot")
-
     bot = Bot(token=bot_token)
-
-    runtime_ready = False
     action = RuntimeAction.NONE
+    notify_failure = True
+    failure_code = "RUNTIME"
     try:
-        if module_enabled("autobump"):
-            enable_autobump_on_startup()
+        logger.info("Инициализация системы...")
+
+        # Как в Кардинале (__init_account): самый первый запрос к аккаунту -
+        # ОБЫЧНЫЙ account.get() БЕЗ update_phpsessid=True. update_phpsessid=True
+        # используется только позже, в session_refresh_loop, раз в час - как и в
+        # Кардинале (update_session_loop). Если update_phpsessid=True вызвать
+        # самым первым запросом (до того как обычная сессия вообще установлена),
+        # похоже, это и приводит к "Необходимая cookie отсутствует или устарела".
+        try:
+            await asyncio.to_thread(client.initialize_account)
+        except Exception as e:
+            category = client._classify_runner_error(e)
+            notify_failure = category != "RECOVERABLE"
+            failure_code = ("AUTH" if category == "AUTH" else "CERTIFICATE"
+                            if client._certificate_verification_failed(e) else "RUNTIME")
+            logger.error("Не удалось инициализировать сессию FunPay.")
+            raise RuntimeError("Начальная сессия FunPay не инициализирована.") from None
+
+        _validate_funpay_user_id(client)
+        client.review_state = ReviewReceiptStore()
+        try:
+            await asyncio.to_thread(client.review_state.initialize)
+            await asyncio.to_thread(client.review_state.recover_autobump_progress)
+        except Exception as e:
+            failure_code = "STATE"
+            logger.error(f"Не удалось инициализировать persistent state: {type(e).__name__}.")
+            raise RuntimeError("Persistent state недоступен.") from None
+
+        logger.banner(client.account.username)
+        logger.success(f"Сессия FunPay инициализирована (аккаунт: {client.account.username}).")
+        if os.name == "nt":
+            # Обновляем заголовок окна cmd, если бот запущен через .bat на Windows.
+            # На сервере (Linux) os.name == "posix", эта строка просто не выполнится.
+            os.system("title FunPay Bot")
         logger.success("Бот подключен к Telegram. Запуск фоновых процессов...")
-        await _send_runtime_notice(bot, "🟢 Бот запущен.", restore_keyboard=True)
-        runtime_ready = True
         set_runtime_status_context(client)
         action = await _supervise_tasks(bot, client)
     finally:
@@ -1101,12 +1062,28 @@ async def main():
         primary_type = sys.exc_info()[0]
         unwinding_exception = primary_type is not None
         try:
-            if runtime_ready and action is not RuntimeAction.RESTART:
-                message = ("⚠️ Бот остановлен из-за критической ошибки."
-                           if primary_type is not None and not issubclass(primary_type, asyncio.CancelledError)
-                           else "🔴 Бот остановлен.")
+            if (notify_failure and action is not RuntimeAction.RESTART
+                    and primary_type is not None
+                    and not issubclass(primary_type, asyncio.CancelledError)):
                 try:
-                    await _send_runtime_notice(bot, message)
+                    error = sys.exc_info()[1]
+                    if isinstance(error, StateError):
+                        failure_code = "STATE"
+                    elif error is not None:
+                        category = client._classify_runner_error(error)
+                        if category == "AUTH":
+                            failure_code = "AUTH"
+                        elif client._certificate_verification_failed(error):
+                            failure_code = "CERTIFICATE"
+                    health = client.get_runner_health()
+                    if health.get("state") == "failed":
+                        if health.get("last_failure_category") == "AUTH":
+                            failure_code = "AUTH"
+                        elif (health.get("last_failure_category") == "FATAL"
+                              and health.get("last_failure_type") == "SSLError"):
+                            failure_code = "CERTIFICATE"
+                    if claim_critical_notice(failure_code):
+                        await _send_runtime_notice(bot, "⚠️ Бот остановлен из-за критической ошибки.")
                 except asyncio.CancelledError:
                     if not unwinding_exception:
                         raise

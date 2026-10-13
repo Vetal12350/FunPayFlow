@@ -5,6 +5,7 @@ import math
 import re
 import sqlite3
 import time
+import uuid
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation, localcontext
@@ -13,6 +14,7 @@ from .runtime_paths import runtime_file
 
 
 DEFAULT_DB_PATH = runtime_file("state.sqlite3")
+AUTOBUMP_SAFE_INTERVAL = 7200
 
 
 class _DecimalSum:
@@ -358,10 +360,144 @@ class ReviewReceiptStore:
                         "CREATE INDEX IF NOT EXISTS idx_critical_backlog_pending "
                         "ON critical_event_backlog(state, created_at, event_id)"
                     )
+                    connection.execute(
+                        "CREATE TABLE IF NOT EXISTS autobump_progress ("
+                        "game_id INTEGER PRIMARY KEY CHECK(game_id > 0), "
+                        "cycle_id TEXT, position INTEGER, attempt_id TEXT, "
+                        "state TEXT NOT NULL CHECK(state IN "
+                        "('pending', 'claimed', 'success', 'cooldown', 'ambiguous', 'skipped')), "
+                        "eligible_at REAL NOT NULL DEFAULT 0 CHECK(eligible_at >= 0))"
+                    )
+                    connection.execute(
+                        "SELECT game_id, cycle_id, position, attempt_id, state, eligible_at "
+                        "FROM autobump_progress LIMIT 1"
+                    ).fetchone()
                     if connection.execute("PRAGMA quick_check").fetchone() != ("ok",):
                         raise StateError("Persistent state integrity check failed.")
         except (sqlite3.Error, OSError):
             raise StateError("Persistent state initialization failed.") from None
+
+    def recover_autobump_progress(self) -> None:
+        """An interrupted write is unknown, never a pending request to resend."""
+        try:
+            with closing(self._connect()) as db, db:
+                db.execute(
+                    "UPDATE autobump_progress SET state = 'ambiguous', "
+                    "eligible_at = MAX(eligible_at, ?) WHERE state = 'claimed'",
+                    (time.time() + AUTOBUMP_SAFE_INTERVAL,),
+                )
+        except (sqlite3.Error, OSError):
+            raise StateError("Autobump recovery failed.") from None
+
+    def autobump_cycle(self, game_ids: list[int]) -> list[dict]:
+        """Resume the saved ordered snapshot; new/deleted categories reconcile next cycle."""
+        if (any(type(key) is not int or key <= 0 for key in game_ids)
+                or len(game_ids) != len(set(game_ids))):
+            raise StateError("Invalid autobump targets.")
+        try:
+            with closing(self._connect()) as db, db:
+                db.row_factory = sqlite3.Row
+                db.execute("BEGIN IMMEDIATE")
+                rows = db.execute(
+                    "SELECT * FROM autobump_progress WHERE cycle_id IS NOT NULL ORDER BY position"
+                ).fetchall()
+                if not rows and game_ids:
+                    cycle_id, now = uuid.uuid4().hex, time.time()
+                    for position, game_id in enumerate(game_ids):
+                        db.execute(
+                            "INSERT INTO autobump_progress(game_id, cycle_id, position, state) "
+                            "VALUES (?, ?, ?, 'pending') ON CONFLICT(game_id) DO UPDATE SET "
+                            "cycle_id = excluded.cycle_id, position = excluded.position, "
+                            "state = CASE WHEN eligible_at <= ? AND state != 'claimed' "
+                            "THEN 'pending' ELSE state END",
+                            (game_id, cycle_id, position, now),
+                        )
+                    rows = db.execute(
+                        "SELECT * FROM autobump_progress WHERE cycle_id = ? ORDER BY position",
+                        (cycle_id,),
+                    ).fetchall()
+                return [dict(row) for row in rows]
+        except (sqlite3.Error, OSError):
+            raise StateError("Autobump progress unavailable.") from None
+
+    def claim_autobump_target(self, cycle_id: str, game_id: int, attempt_id: str) -> bool:
+        """Commit BEFORE HTTP dispatch. No SQLite transaction spans the request."""
+        try:
+            with closing(self._connect()) as db, db:
+                now = time.time()
+                return db.execute(
+                    "UPDATE autobump_progress SET state = 'claimed', attempt_id = ?, eligible_at = ? "
+                    "WHERE cycle_id = ? AND game_id = ? AND state = 'pending' AND eligible_at <= ?",
+                    (attempt_id, now + AUTOBUMP_SAFE_INTERVAL, cycle_id, game_id, now),
+                ).rowcount == 1
+        except (sqlite3.Error, OSError):
+            raise StateError("Autobump claim failed.") from None
+
+    def finish_autobump_target(self, game_id: int, attempt_id: str,
+                              outcome: str, wait_seconds: float) -> None:
+        if (outcome not in ('success', 'cooldown', 'ambiguous')
+                or type(wait_seconds) not in (int, float)
+                or not math.isfinite(wait_seconds) or wait_seconds <= 0):
+            raise StateError("Invalid autobump outcome.")
+        try:
+            with closing(self._connect()) as db, db:
+                changed = db.execute(
+                    "UPDATE autobump_progress SET state = ?, eligible_at = ? "
+                    "WHERE game_id = ? AND attempt_id = ? AND state = 'claimed'",
+                    (outcome, time.time() + wait_seconds, game_id, attempt_id),
+                ).rowcount
+                if changed != 1:
+                    raise StateError("Autobump claim no longer active.")
+        except (sqlite3.Error, OSError):
+            raise StateError("Autobump outcome persist failed.") from None
+
+    def release_autobump_claim(self, game_id: int, attempt_id: str) -> None:
+        """Only for cancellation proven to precede HTTP dispatch."""
+        try:
+            with closing(self._connect()) as db, db:
+                db.execute(
+                    "UPDATE autobump_progress SET state = 'pending', attempt_id = NULL, eligible_at = 0 "
+                    "WHERE game_id = ? AND attempt_id = ? AND state = 'claimed'",
+                    (game_id, attempt_id),
+                )
+        except (sqlite3.Error, OSError):
+            raise StateError("Autobump claim release failed.") from None
+
+    def skip_autobump_target(self, cycle_id: str, game_id: int) -> None:
+        try:
+            with closing(self._connect()) as db, db:
+                db.execute(
+                    "UPDATE autobump_progress SET state = 'skipped' "
+                    "WHERE cycle_id = ? AND game_id = ? AND state = 'pending'",
+                    (cycle_id, game_id),
+                )
+        except (sqlite3.Error, OSError):
+            raise StateError("Autobump progress persist failed.") from None
+
+    def complete_autobump_cycle(self, cycle_id: str) -> None:
+        try:
+            with closing(self._connect()) as db, db:
+                db.execute("BEGIN IMMEDIATE")
+                if db.execute(
+                    "SELECT 1 FROM autobump_progress WHERE cycle_id = ? "
+                    "AND state IN ('pending', 'claimed')", (cycle_id,),
+                ).fetchone():
+                    raise StateError("Autobump cycle is unfinished.")
+                db.execute(
+                    "UPDATE autobump_progress SET cycle_id = NULL, position = NULL WHERE cycle_id = ?",
+                    (cycle_id,),
+                )
+        except (sqlite3.Error, OSError):
+            raise StateError("Autobump cycle completion failed.") from None
+
+    def reset_autobump_cycle(self) -> None:
+        """Manual enable starts a fresh snapshot, retaining all write safety deadlines."""
+        try:
+            with closing(self._connect()) as db, db:
+                db.execute("UPDATE autobump_progress SET cycle_id = NULL, position = NULL "
+                           "WHERE cycle_id IS NOT NULL")
+        except (sqlite3.Error, OSError):
+            raise StateError("Autobump cycle reset failed.") from None
 
     def _import_legacy_stats(self, connection: sqlite3.Connection) -> None:
         """Идемпотентно переносит старый локальный JSON, если он лежит рядом с БД."""
