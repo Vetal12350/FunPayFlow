@@ -3,7 +3,7 @@
 from datetime import datetime, timedelta, timezone
 import json
 from unittest.mock import patch
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+from zoneinfo import ZoneInfoNotFoundError
 
 import pytest
 
@@ -91,24 +91,16 @@ def test_moscow_fallback_without_iana_database():
     with patch("funpayflow.autobump_schedule.ZoneInfo", side_effect=ZoneInfoNotFoundError):
         assert allows_now(policy(), instant(4))
         assert not allows_now(policy(), instant(22))
-        with pytest.raises(ValueError, match="Unavailable IANA timezone"):
+        with pytest.raises(ValueError, match="Only Europe/Moscow"):
             normalize_schedule({"timezone": "Europe/Berlin"})
 
 
-def test_dst_fold_and_spring_gap_follow_local_wall_clock():
-    try:
-        ZoneInfo("America/New_York")
-    except ZoneInfoNotFoundError:
-        pytest.skip("IANA timezone database is not installed")
-    schedule = {"enabled": True, "start": "01:00", "stop": "02:00",
-                "timezone": "America/New_York"}
-    # Both occurrences of 01:30 during the repeated autumn hour are allowed.
-    for hour in (5, 6):
-        assert allows_now(schedule, datetime(2026, 11, 1, hour, 30, tzinfo=timezone.utc))
-    assert not allows_now(schedule, datetime(2026, 11, 1, 7, tzinfo=timezone.utc))
-    schedule.update(start="01:30", stop="03:00")
-    assert allows_now(schedule, datetime(2026, 3, 8, 6, 30, tzinfo=timezone.utc))
-    assert not allows_now(schedule, datetime(2026, 3, 8, 7, tzinfo=timezone.utc))
+@pytest.mark.parametrize("zone", ["America/New_York", "Europe/Berlin", "UTC"])
+def test_other_zones_rejected_even_when_system_database_has_them(zone):
+    with patch("funpayflow.autobump_schedule.ZoneInfo", return_value=timezone.utc) as lookup:
+        with pytest.raises(ValueError, match="Only Europe/Moscow"):
+            normalize_schedule({"timezone": zone})
+        lookup.assert_not_called()
 
 
 def test_aware_datetime_in_other_offset_and_description():

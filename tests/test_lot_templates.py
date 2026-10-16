@@ -54,6 +54,31 @@ def test_discovery_is_own_common_only_and_does_not_claim_support(setup_service):
     client.account.save_lot.assert_not_called()
 
 
+def test_legacy_sqlite_without_drafts_preserves_existing_data(setup_service):
+    _, _, store = setup_service
+    store.record_audit_event('system', 'SETTINGS', 'settings', 'SAVED')
+    cycle = store.autobump_cycle([7])
+    audit = store.list_audit_events()
+    with sqlite3.connect(store.path) as db:
+        db.execute('DROP TABLE lot_template_drafts')
+        before = list(db.execute('SELECT * FROM autobump_progress'))
+    restored = ReviewReceiptStore(store.path)
+    restored.initialize()
+    restored.initialize()  # Migration is repeatable.
+    assert restored.list_audit_events() == audit
+    assert restored.list_lot_template_drafts(101, 42) == []
+    with sqlite3.connect(store.path) as db:
+        assert list(db.execute('SELECT * FROM autobump_progress')) == before
+    assert cycle[0]['game_id'] == 7
+
+
+@pytest.mark.parametrize('offset', [-1, True, '10', 2147483648])
+def test_invalid_draft_page_rejected(setup_service, offset):
+    service, _, _ = setup_service
+    with pytest.raises(LotTemplateError):
+        service.list_drafts(101, offset)
+
+
 def test_persistent_edit_preview_cancel_and_no_form_metadata(setup_service):
     service, client, store = setup_service
     draft = service.create_draft(101, 11)

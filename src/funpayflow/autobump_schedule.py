@@ -15,17 +15,16 @@ DEFAULT_AUTOBUMP_SCHEDULE = {
 
 
 def _schedule_timezone(name: str) -> tzinfo:
+    # Accept the same settings on Windows and Linux, independently of tzdata.
+    if name != "Europe/Moscow":
+        raise ValueError("Only Europe/Moscow is supported for autobump schedules")
     try:
         return ZoneInfo(name)
-    except ZoneInfoNotFoundError as exc:
+    except ZoneInfoNotFoundError:
         # Windows Python does not necessarily include an IANA database. Moscow
         # has used UTC+3 without seasonal changes since 2014; this fallback is
         # for present-day schedules, not historical timezone conversion.
-        if name == "Europe/Moscow":
-            return timezone(timedelta(hours=3), name)
-        raise ValueError(f"Unavailable IANA timezone: {name}") from exc
-    except ValueError as exc:
-        raise ValueError(f"Invalid IANA timezone: {name}") from exc
+        return timezone(timedelta(hours=3), name)
 
 
 def normalize_schedule(value: Mapping | None = None) -> dict:
@@ -62,8 +61,7 @@ def normalize_schedule(value: Mapping | None = None) -> dict:
 def allows_now(schedule: Mapping | None, now: datetime | None = None) -> bool:
     """Whether local wall time is inside [start, stop), including overnight.
 
-    DST follows the timezone's local wall clock: repeated minutes have the same
-    policy and skipped minutes do not occur. An explicit clock must be aware.
+    This version supports Europe/Moscow only. An explicit clock must be aware.
     """
     policy = normalize_schedule(schedule)
     if now is not None and (

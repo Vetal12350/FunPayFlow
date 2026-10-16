@@ -61,19 +61,25 @@ async def templates_callback(callback, action, user_id):
     await callback.answer()
     try:
         service = _service()
-        if action == 'lot_templates':
+        if action == 'lot_templates' or action.startswith('lt:list:'):
+            offset = 0 if action == 'lot_templates' else int(action.removeprefix('lt:list:'))
             rows = []
-            drafts = await asyncio.to_thread(service.list_drafts, user_id)
+            drafts = await asyncio.to_thread(service.list_drafts, user_id, offset)
             for draft in drafts:
                 rows.append([ui._button(
                     f"📝 {draft['payload']['title_ru'][:35] or draft['payload']['title_en'][:35]}",
                     f"lt:open:{draft['draft_id']}")])
+            if offset:
+                rows.append([ui._button('⬅️ Предыдущие', f'lt:list:{max(0, offset - 10)}')])
+            if len(drafts) == 10:
+                rows.append([ui._button('Следующие ➡️', f'lt:list:{offset + 10}')])
             rows.append([ui._button('🔎 Собственные лоты', 'lt:discover')])
             rows.append([ui._button('🔙 Главное меню', 'menu_main')])
             text = ('📝 <b>Шаблоны лотов</b>\n'
                     'Собственный лот → редактируемый черновик → предпросмотр.\n'
                     'Публикация пока недоступна: схема создания не подтверждена '
-                    'установленной библиотекой.\nСохранённые черновики:')
+                    'установленной библиотекой.\n'
+                    f'Сохранённые черновики · страница {offset // 10 + 1}:')
             markup = ui._menu(rows)
         elif action == 'lt:discover':
             lots = await asyncio.to_thread(service.discover)
@@ -112,7 +118,7 @@ async def templates_callback(callback, action, user_id):
             else:
                 raise LotTemplateError('Действие больше недоступно.')
             text, markup = _screen(draft)
-        await callback.message.edit_text(text, reply_markup=markup, parse_mode='HTML')
+        await ui._edit_or_keep_menu(callback.message, text, markup)
     except LotTemplateError as error:
         await callback.message.answer(str(error))  # Only fixed service messages.
     except (StateError, ValueError, IndexError):

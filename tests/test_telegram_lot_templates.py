@@ -3,6 +3,8 @@ import log_isolation
 import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
+from aiogram.exceptions import TelegramBadRequest
+from aiogram.methods import EditMessageText
 
 from funpayflow import telegram as ui
 from funpayflow import telegram_lots as view
@@ -69,3 +71,45 @@ def test_preview_escapes_html_and_has_no_publish_button(setup_service):
     assert '&lt;' in text
     assert 'lt:confirm' not in str(markup)
     assert 'заблокирована' in text
+
+
+def test_pagination_restores_oldest_of_eleven_drafts(setup_service):
+    service, client, _ = setup_service
+    oldest = service.create_draft(101, 11)['draft_id']
+    for _ in range(10):
+        service.create_draft(101, 11)
+
+    async def run():
+        cb = callback()
+        with patch.object(ui, '_owner_id', return_value=True), \
+                patch.object(ui, '_runtime_client', client), \
+                patch.object(ui, '_interaction_state', {}):
+            await view.templates_callback(cb, 'lot_templates', 101)
+            assert oldest not in str(cb.message.edit_text.call_args)
+            assert 'lt:list:10' in str(cb.message.edit_text.call_args)
+            await view.templates_callback(cb, 'lt:list:10', 101)
+            assert oldest in str(cb.message.edit_text.call_args)
+            assert 'lt:list:0' in str(cb.message.edit_text.call_args)
+            await view.templates_callback(cb, f'lt:open:{oldest}', 101)
+            assert 'Черновик лота' in str(cb.message.edit_text.call_args)
+            client.account.save_lot.assert_not_called()
+
+    asyncio.run(run())
+
+
+def test_repeated_navigation_acknowledges_unchanged_menu(setup_service):
+    _, client, _ = setup_service
+
+    async def run():
+        cb = callback()
+        cb.message.edit_text.side_effect = [None, TelegramBadRequest(
+            method=EditMessageText(text='same menu', chat_id=1, message_id=1),
+            message='Bad Request: message is not modified')]
+        with patch.object(ui, '_owner_id', return_value=True), \
+                patch.object(ui, '_runtime_client', client):
+            await view.templates_callback(cb, 'lot_templates', 101)
+            await view.templates_callback(cb, 'lot_templates', 101)
+        assert cb.answer.await_count == 2
+        client.account.save_lot.assert_not_called()
+
+    asyncio.run(run())

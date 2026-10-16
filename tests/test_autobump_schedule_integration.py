@@ -6,13 +6,17 @@ import copy
 import json
 import tempfile
 import unittest
+import threading
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from funpayflow import telegram as ui
-from funpayflow.autobump_schedule import normalize_schedule
+from funpayflow.autobump_schedule import normalize_schedule, allows_now
 from funpayflow.funpay import _AmbiguousRaiseOutcome
+from funpayflow.state import ReviewReceiptStore
+import test_autobump_resume as resume_checks
 
 
 class ScheduleIntegrationTests(unittest.IsolatedAsyncioTestCase):
@@ -48,21 +52,114 @@ class ScheduleIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(ui.bot_settings['auto_bump'])
 
     def test_failed_save_rolls_back_without_version_change(self):
+        ui.save_settings(required=True)
+        original_json = Path(ui.SETTINGS_FILE).read_bytes()
         previous = ui.get_autobump_state()
         schedule = copy.deepcopy(ui.bot_settings['autobump_schedule'])
-        with patch.object(ui, 'save_settings', side_effect=RuntimeError('synthetic')):
-            with self.assertRaises(RuntimeError):
-                ui.save_autobump_schedule(normalize_schedule({'enabled': True}))
-        self.assertEqual(ui.get_autobump_state(), previous)
-        self.assertEqual(ui.bot_settings['autobump_schedule'], schedule)
+        for target, error in [('save_settings', RuntimeError), ('os.replace', OSError)]:
+            with self.subTest(target=target), patch(
+                    f'funpayflow.telegram.{target}', side_effect=error('synthetic')):
+                with self.assertRaises(RuntimeError):
+                    ui.save_autobump_schedule(normalize_schedule({'enabled': True}))
+            self.assertEqual(ui.get_autobump_state(), previous)
+            self.assertEqual(ui.bot_settings['autobump_schedule'], schedule)
+            self.assertEqual(Path(ui.SETTINGS_FILE).read_bytes(), original_json)
 
     def test_invalid_persisted_policy_fails_closed(self):
         ui.save_settings(required=True)
         saved = json.loads(Path(ui.SETTINGS_FILE).read_text(encoding='utf-8'))
-        saved['autobump_schedule'] = {'enabled': True, 'start': 'invalid'}
-        Path(ui.SETTINGS_FILE).write_text(json.dumps(saved), encoding='utf-8')
-        with self.assertRaises(RuntimeError):
-            ui.load_settings()
+        before = copy.deepcopy(ui.bot_settings)
+        for value in [None, [], '', False, {'enabled': True, 'start': 'invalid'},
+                      {'enabled': True, 'timezone': 'America/New_York'}]:
+            with self.subTest(value=value):
+                saved['autobump_schedule'] = value
+                Path(ui.SETTINGS_FILE).write_text(json.dumps(saved), encoding='utf-8')
+                with self.assertRaises(RuntimeError):
+                    ui.load_settings()
+                self.assertEqual(ui.bot_settings, before)
+
+    async def test_policy_changes_during_account_preparation_prevent_http(self):
+        for change in ('schedule', 'manual_off', 'boundary'):
+            with self.subTest(change=change):
+                fixture = resume_checks.ResumeTests(methodName='runTest')
+                fixture.path = Path(self.folder.name) / f'{change}.sqlite3'
+                fixture.store = ReviewReceiptStore(fixture.path)
+                fixture.store.initialize()
+                entered, release = threading.Event(), threading.Event()
+                try:
+                    client, sent = fixture.client([1])
+                    client.review_state.autobump_cycle([1])
+                    progress = fixture.rows()
+                    ui._runtime_client = client
+                    ui.bot_settings['auto_bump'] = True
+                    ui.save_autobump_schedule(normalize_schedule({
+                        'enabled': True, 'start': '07:00', 'stop': '10:00'}))
+                    version = ui.get_autobump_state()
+                    clock = [datetime(2026, 10, 16, 6, 59, 59, tzinfo=timezone.utc)]
+
+                    def prepare():
+                        entered.set()
+                        assert release.wait(2)
+
+                    client.account.get = prepare
+                    with patch.object(ui, 'allows_now', side_effect=lambda policy: allows_now(policy, clock[0])):
+                        task = asyncio.create_task(client.bump_lots(1, is_cancelled=lambda:
+                            ui.get_autobump_state() != version or not ui.autobump_schedule_allows_now()))
+                        try:
+                            self.assertTrue(await asyncio.to_thread(entered.wait, 2))
+                            if change == 'schedule':
+                                ui.save_autobump_schedule(normalize_schedule({
+                                    'enabled': True, 'start': '07:00', 'stop': '09:00'}))
+                            elif change == 'manual_off':
+                                ui.toggle_autobump_saved()
+                            else:
+                                clock[0] = datetime(2026, 10, 16, 7, tzinfo=timezone.utc)
+                        finally:
+                            release.set()
+                        self.assertEqual((await task)[2], 0)
+                    self.assertEqual(sent, [])
+                    self.assertEqual(fixture.rows(), progress)
+                finally:
+                    release.set()
+
+    async def test_boundary_does_not_cancel_inflight_http_but_blocks_next_target(self):
+        fixture = resume_checks.ResumeTests(methodName='runTest')
+        fixture.path = Path(self.folder.name) / 'inflight.sqlite3'
+        fixture.store = ReviewReceiptStore(fixture.path)
+        fixture.store.initialize()
+        sleep_patch = patch('funpayflow.funpay.asyncio.sleep', new=AsyncMock())
+        sleep_patch.start()
+        entered, release = threading.Event(), threading.Event()
+        try:
+            client, sent = fixture.client([1, 2])
+            ui.save_autobump_schedule(normalize_schedule({
+                'enabled': True, 'start': '07:00', 'stop': '10:00'}))
+            clock = [datetime(2026, 10, 16, 6, 59, 59, tzinfo=timezone.utc)]
+            original = client.account.raise_lots
+
+            def http(game_id):
+                original(game_id)
+                entered.set()
+                assert release.wait(2)
+
+            client.account.raise_lots = http
+            with patch.object(ui, 'allows_now', side_effect=lambda policy: allows_now(policy, clock[0])):
+                task = asyncio.create_task(client.bump_lots(1, is_cancelled=lambda:
+                    not ui.autobump_schedule_allows_now()))
+                try:
+                    self.assertTrue(await asyncio.to_thread(entered.wait, 2))
+                    clock[0] = datetime(2026, 10, 16, 7, tzinfo=timezone.utc)
+                    self.assertFalse(task.done())
+                    self.assertEqual(fixture.rows()[1]['state'], 'claimed')
+                finally:
+                    release.set()
+                await task
+            self.assertEqual(sent, [1])
+            self.assertEqual(fixture.rows()[1]['state'], 'success')
+            self.assertEqual(fixture.rows()[2]['state'], 'pending')
+        finally:
+            release.set()
+            sleep_patch.stop()
 
     async def test_telegram_owner_toggle_edit_and_input(self):
         callback = SimpleNamespace(answer=AsyncMock(), message=SimpleNamespace(

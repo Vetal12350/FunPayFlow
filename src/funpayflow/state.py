@@ -443,14 +443,15 @@ class ReviewReceiptStore:
         except (sqlite3.Error, OSError):
             raise StateError("Lot template state write failed.") from None
 
-    def list_lot_template_drafts(self, owner_id: str, account_id: int) -> list[dict]:
+    def list_lot_template_drafts(self, owner_id: str, account_id: int,
+                                 offset: int = 0) -> list[dict]:
         try:
             with closing(self._connect()) as db:
                 rows = db.execute(
                     "SELECT draft_id FROM lot_template_drafts WHERE owner_id = ? "
                     "AND account_id = ? AND state != 'cancelled' "
-                    "ORDER BY updated_at DESC, rowid DESC LIMIT 10",
-                    (str(owner_id), account_id),
+                    "ORDER BY updated_at DESC, rowid DESC LIMIT 10 OFFSET ?",
+                    (str(owner_id), account_id, offset),
                 ).fetchall()
             return [self.get_lot_template_draft(owner_id, row[0]) for row in rows]
         except (sqlite3.Error, OSError):

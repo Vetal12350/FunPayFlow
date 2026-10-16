@@ -19,6 +19,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP, localcontext
 from aiogram import Dispatcher, F
 from aiogram.filters import Command
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, ReplyKeyboardMarkup, KeyboardButton, FSInputFile
 from .funpay import FunPayClient, NIGHT_MODE_MESSAGE_TEXT, NIGHT_MODE_ORDER_TEXT
 from .feature_registry import (MODULES_VERSION, all_features, get_feature,
@@ -469,7 +470,10 @@ def load_settings() -> None:
             print("[SETTINGS] Некорректная задержка запроса отзыва пропущена; автоотправка выключена.")
         saved["review_request_delay_seconds"] = review_delay
         notice = saved.get("critical_notice")
-        saved["autobump_schedule"] = normalize_schedule(saved.get("autobump_schedule"))
+        schedule = saved.get("autobump_schedule", {})
+        if not isinstance(schedule, dict):
+            raise ValueError("Invalid persisted autobump schedule.")
+        saved["autobump_schedule"] = normalize_schedule(schedule)
         if (notice is not None and (not isinstance(notice, dict)
                 or set(notice) != {"code", "at"}
                 or notice.get("code") not in {"AUTH", "CERTIFICATE", "STATE", "RUNTIME"}
@@ -959,6 +963,15 @@ def _button(text: str, data: str) -> InlineKeyboardButton:
 
 def _menu(rows) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def _edit_or_keep_menu(message, text, markup):
+    """Repeated navigation may leave the exact same Telegram menu in place."""
+    try:
+        await message.edit_text(text, reply_markup=markup, parse_mode="HTML")
+    except TelegramBadRequest as error:
+        if "message is not modified" not in error.message.lower():
+            raise
 
 
 def _night_mode_screen() -> tuple[str, InlineKeyboardMarkup]:
@@ -2480,6 +2493,7 @@ async def _autobump_schedule_callback(callback, action, user_id):
             await callback.message.answer(
                 "Отправьте начало, конец и часовой пояс, например:\n"
                 "07:00 01:00 Europe/Moscow\n"
+                "Поддерживается только Europe/Moscow (UTC+3).\n"
                 "Начало включительно, конец не включительно; одинаковое время запрещено.\n"
                 "❌ Отмена — выйти без сохранения.")
             return True
@@ -2491,7 +2505,7 @@ async def _autobump_schedule_callback(callback, action, user_id):
         return True
     await callback.answer()
     text, markup = _autobump_schedule_screen()
-    await callback.message.edit_text(text, reply_markup=markup, parse_mode="HTML")
+    await _edit_or_keep_menu(callback.message, text, markup)
     return True
 
 
@@ -2512,7 +2526,7 @@ async def _autobump_schedule_input(message, user_id):
                     "start": start, "stop": stop, "timezone": zone}
         save_autobump_schedule(schedule)
     except (ValueError, RuntimeError):
-        await message.answer("Не сохранено. Проверьте формат ЧЧ:ММ ЧЧ:ММ и доступный IANA timezone; Europe/Moscow поддерживается всегда.")
+        await message.answer("Не сохранено. Используйте ЧЧ:ММ ЧЧ:ММ Europe/Moscow; другие часовые пояса пока не поддерживаются.")
         return True
     _interaction_state.pop(user_id, None)
     text, markup = _autobump_schedule_screen()

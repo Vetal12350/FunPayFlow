@@ -127,9 +127,11 @@ class LotTemplateService:
     def get_draft(self, owner_id, draft_id):
         return self._summary(self._get(owner_id, draft_id))
 
-    def list_drafts(self, owner_id):
+    def list_drafts(self, owner_id, offset=0):
+        if type(offset) is not int or not 0 <= offset <= 2147483647:
+            raise LotTemplateError("Некорректная страница черновиков.")
         return [self._summary(row) for row in self.store.list_lot_template_drafts(
-            str(owner_id), self._account_id())]
+            str(owner_id), self._account_id(), offset)]
 
     @staticmethod
     def validate(payload):
