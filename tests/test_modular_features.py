@@ -386,7 +386,7 @@ class TelegramModuleTests(ModuleStateMixin, unittest.IsolatedAsyncioTestCase):
             "toggle_bump", "menu_stats", "analytics", "orders", "menu_status",
             "system", "menu_notifications", "menu_night_mode", "review_menu", "menu_logs",
             "modules_open", "restart_open",
-            "bump_schedule", "lot_templates",
+            "bump_schedule", "products",
         })
         self.assertNotIn("modules_open", callback_data(ui._system_screen(100)[1]))
         self.assertEqual(ui.get_main_keyboard(100).inline_keyboard[-1][0].callback_data,

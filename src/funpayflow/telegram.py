@@ -913,7 +913,7 @@ def get_main_keyboard(user_id: int):
     if module_enabled("logs_ui"):
         rows.append([_button("📄 Лог", "menu_logs")])
     if _owner_id(user_id):
-        rows.append([_button("📝 Шаблоны лотов", "lot_templates")])
+        rows.append([_button("📦 Лоты", "products")])
         rows.append([_button("🧩 Модули", "modules_open")])
         rows.append([_button("🔄 Перезапустить бота", "restart_open")])
     return _menu(rows)
@@ -2341,6 +2341,8 @@ NOTIFICATIONS_MENU_TEXT = "🔔 <b>Мои настройки уведомлен�
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
     user_id = message.from_user.id
+    from .telegram_products import discard_session
+    discard_session(user_id)
     if (_sales_import_session is not None
             and _sales_import_session["phase"] in {"upload", "ready"}):
         async with _sales_import_lock:
@@ -2543,6 +2545,9 @@ async def callback_handler(callback: CallbackQuery):
         return
 
     action = callback.data or ""
+    from .telegram_products import discard_session, products_callback
+    if action != "products" and not action.startswith("prd:"):
+        discard_session(user_id)
     if await _modules_callback(callback, action, user_id):
         return
     if await _restart_callback(callback, action, user_id):
@@ -2564,6 +2569,8 @@ async def callback_handler(callback: CallbackQuery):
                 _sales_import_cleanup()
     _interaction_state.pop(user_id, None)
     if await _autobump_schedule_callback(callback, action, user_id):
+        return
+    if await products_callback(callback, action, user_id):
         return
     from .telegram_lots import templates_callback
     if await templates_callback(callback, action, user_id):
@@ -2721,6 +2728,9 @@ async def text_handler(message: Message):
     user_id = message.from_user.id
 
     if is_authorized(user_id):
+        from .telegram_products import discard_session, products_input
+        if message.text in {"🛠 Главное меню", "❌ Отмена"}:
+            discard_session(user_id)
         # Если нажата кнопка вызова контекстного меню
         if message.text == "🛠 Главное меню":
             if (_sales_import_session is not None
@@ -2744,6 +2754,8 @@ async def text_handler(message: Message):
                         _sales_import_cleanup()
             _interaction_state.pop(user_id, None)
             await message.answer("Отменено.", reply_markup=get_main_keyboard(user_id))
+            return
+        if await products_input(message, user_id):
             return
         if await _autobump_schedule_input(message, user_id):
             return

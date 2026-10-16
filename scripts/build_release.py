@@ -17,6 +17,8 @@ PACKAGE_FILES = tuple(f"src/funpayflow/{name}" for name in (
     "runtime_paths.py", "logger.py", "import_funpay_sales.py", "setup_config.py",
     "console_ui.py", "render_service.py",
     "autobump_schedule.py", "lot_templates.py", "telegram_lots.py",
+    "product_store.py", "game_routes.py", "product_templates.py",
+    "product_drafts.py", "telegram_products.py",
 ))
 REQUIRED_FILES = PACKAGE_FILES + (
     "pyproject.toml", "uv.lock", ".env.example", "README.md", "README.en.md", "CHANGELOG.md",

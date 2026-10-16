@@ -13,6 +13,7 @@
 | Telegram UI, авторизация, callbacks, настройки | [telegram.py](../src/funpayflow/telegram.py): dispatcher `dp`, keyboards, `load_settings`, `save_settings`, module gates |
 | События, replay и безопасные payload | [runtime_events.py](../src/funpayflow/runtime_events.py): `ActionEvent`, `QueuedCriticalEvent`, `critical_snapshot`, `hydrate_critical` |
 | SQLite и миграции | [state.py](../src/funpayflow/state.py): `ReviewReceiptStore`, `StateError` |
+| Product templates / routes / local drafts | [PRODUCT_TEMPLATES](PRODUCT_TEMPLATES.md); `product_templates.py`, `game_routes.py`, `product_store.py`, `product_drafts.py`, `telegram_products.py`; additive schema в той же SQLite, без publish |
 | Restart и граница автоматического действия | [runtime_control.py](../src/funpayflow/runtime_control.py): `claim_restart`, `automatic_action_gate` |
 | Встроенные модули | [feature_registry.py](../src/funpayflow/feature_registry.py): definitions, profiles, validation |
 | Каталоги приватных данных | [runtime_paths.py](../src/funpayflow/runtime_paths.py) |

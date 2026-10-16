@@ -25,6 +25,7 @@ Sync может обращаться к package registry. Если сеть за
 | Polling, TLS, backoff | `test_transient_funpay_recovery.py` |
 | Supervision/restart/backlog | `test_runtime_restart.py`, `test_runtime_core.py` |
 | Telegram, модули, health | `test_modular_features.py`, `test_operations_center.py`, `test_telegram_communication.py` |
+| Product templates / routes / bulk drafts | `test_product_templates.py`, `test_game_routes.py`, `test_product_store.py`, `test_product_drafts.py`, `test_telegram_products.py`, `test_product_compatibility.py` |
 | Reviews/automation | `test_pre_live_integration.py`, `test_communication_automation.py` |
 | Заказы/аналитика/import | `test_order_history.py`, `test_sales_analytics.py`, `test_historical_sales_import.py`, `test_telegram_sales_import.py` |
 | Установка/релиз | `test_public_installation.py`, `test_public_release_foundation.py`, `test_release_package.py` |
@@ -38,7 +39,7 @@ uv run --no-sync pytest -q tests/test_autobump_resume.py tests/test_autobump_sta
 После code changes — relevant targeted tests, затем полный suite и проверки затронутой packaging/install части:
 
 ```text
-uv run --no-sync pytest -q
+uv run --no-sync pytest -q tests
 uv run --no-sync pytest -q tests/test_release_package.py tests/test_public_installation.py
 uv run --no-sync python -m compileall -q src/funpayflow tests scripts
 uv run --no-sync python tests/packaging_smoke.py

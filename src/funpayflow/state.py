@@ -388,6 +388,8 @@ class ReviewReceiptStore:
                         "payload, baseline_ids, revision, state, attempt_id, published_id, "
                         "created_at, updated_at FROM lot_template_drafts LIMIT 1"
                     ).fetchone()
+                    from .product_store import initialize_schema
+                    initialize_schema(connection)
                     if connection.execute("PRAGMA quick_check").fetchone() != ("ok",):
                         raise StateError("Persistent state integrity check failed.")
         except (sqlite3.Error, OSError):
