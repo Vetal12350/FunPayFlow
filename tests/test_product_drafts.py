@@ -111,6 +111,22 @@ class ProductDraftTests(unittest.TestCase):
         self.assertEqual(edited["payload"]["amount"], 2)
         self.assertEqual(self.service.rebuild(edited), edited)
 
+    def test_no_variant_explicit_variables_outrank_route_defaults(self):
+        self.route = self.store.save_route(dict(self.route, overrides={
+            "variables": {"region": "US", "quantity": "4"}}), expected_revision=self.route["revision"])
+        preview = self.preview(variables={"region": "EU", "quantity": "2"})
+        self.assertEqual(preview["variables"]["region"], "EU")
+        self.assertEqual(preview["payload"]["amount"], 2)
+        default = self.preview()
+        self.assertEqual(default["variables"]["region"], "US")
+        edited = self.service.rebuild(default, variables={"region": "Global", "quantity": "3"})
+        self.assertEqual(edited["variables"]["region"], "Global")
+        self.assertEqual(edited["payload"]["amount"], 3)
+        self.assertEqual(self.service.rebuild(edited), edited)
+        bulk = self.service.preview_bulk(self.template["id"], "Game | 5 | region=EU | quantity=2")
+        self.assertEqual(bulk["previews"][0]["variables"]["region"], "EU")
+        self.assertEqual(bulk["previews"][0]["payload"]["amount"], 2)
+
     def test_staging_rejects_tampered_preview_and_unavailable_route(self):
         preview = self.preview()
         preview["payload"]["price"] = "0"

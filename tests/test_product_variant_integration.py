@@ -11,7 +11,8 @@ from funpayflow.product_drafts import DraftService
 from funpayflow.product_store import ProductStore
 from funpayflow.product_variants import VariantService
 from funpayflow import telegram_products as view
-from test_telegram_products import context, seed_route, pick, callback, message
+from funpayflow import telegram as ui
+from test_telegram_products import context, seed_route, pick, callback, message, preview_action
 
 
 def variant(ctx, route, name='Deluxe', **extra):
@@ -169,7 +170,7 @@ def test_telegram_variant_pick_and_preview(context):
         assert preview['variables']['edition'] == 'Deluxe Edition'
         assert preview['emoji'] == '⭐'
         assert 'Variant: Deluxe' in view._preview_screen(view._flows[1])[0]
-        await asyncio.gather(*(view.products_callback(callback(), 'prd:save', 1) for _ in range(2)))
+        await asyncio.gather(*(view.products_callback(callback(), preview_action('prd:save'), 1) for _ in range(2)))
         assert len(ctx.store.list_drafts()) == 1
         await view.products_callback(cb, 'products', 1)
         await view.products_callback(cb, 'prd:variantpick:' + deluxe['id'], 1)
@@ -198,7 +199,8 @@ def test_telegram_management_confirm_cancel_disable_and_scope(context):
         assert not VariantService(ctx.store, ctx.routes).list(route['id'])
         await view.products_callback(cb, 'prd:variantnew', 1)
         await view.products_input(message(json.dumps(body)), 1)
-        await asyncio.gather(*(view.products_callback(callback(), 'prd:variantsave', 1) for _ in range(2)))
+        action = 'prd:variantsave:' + view._flows[1]['variant_token']
+        await asyncio.gather(*(view.products_callback(callback(), action, 1) for _ in range(2)))
         rows = VariantService(ctx.store, ctx.routes).list(route['id'])
         assert len(rows) == 1
         row = rows[0]
@@ -240,5 +242,57 @@ def test_telegram_variant_pagination_and_implicit_default(context):
         token = view._flows[1]['batch_token']
         await view.products_callback(cb, 'prd:cancel:' + token, 1)
         assert not ctx.store.list_drafts()
+
+    asyncio.run(run())
+
+
+def test_stale_variant_confirmation_cannot_save_newer_preview(context):
+    ctx = context; route = seed_route(ctx)
+
+    async def run():
+        cb = await pick(ctx, 'routes')
+        await view.products_callback(cb, f"prd:variants:{route['id']}:0", 1)
+        body = {'template_id': ctx.template['id'], 'route_id': route['id'], 'display_name': 'First'}
+        await view.products_callback(cb, 'prd:variantnew', 1)
+        await view.products_input(message(json.dumps(body)), 1)
+        stale = 'prd:variantsave:' + view._flows[1]['variant_token']
+        await view.products_callback(cb, 'prd:variantnew', 1)
+        body['display_name'] = 'Second'
+        await view.products_input(message(json.dumps(body)), 1)
+        await view.products_callback(cb, stale, 1)
+        assert not VariantService(ctx.store, ctx.routes).list(route['id'])
+        await view.products_callback(cb, 'prd:variantsave:' + view._flows[1]['variant_token'], 1)
+        assert [v['display_name'] for v in VariantService(ctx.store, ctx.routes).list(route['id'])] == ['Second']
+
+    asyncio.run(run())
+
+
+def test_integrated_search_deluxe_and_disabled_variant_callback(context):
+    ctx = context; route = seed_route(ctx)
+    deluxe = variant(ctx, route)
+
+    async def run():
+        await pick(ctx)
+        await ui.callback_handler(callback('prd:search'))
+        await ui.text_handler(message('ELDEN RING'))
+        cb = callback('prd:routepage:0')
+        await ui.callback_handler(cb)
+        assert 'Elden Ring' in str(cb.message.edit_text.call_args)
+        await ui.callback_handler(callback('prd:route:' + route['id']))
+        VariantService(ctx.store, ctx.routes).disable(deluxe['id'], deluxe['revision'])
+        await ui.callback_handler(callback('prd:variantpick:' + deluxe['id']))
+        assert 'variant_id' not in view._flows[1]
+        assert not ctx.store.list_drafts()
+        disabled = ctx.store.get_variant(deluxe['id'])
+        VariantService(ctx.store, ctx.routes).save(dict(disabled, enabled=True), disabled['id'], disabled['revision'])
+        await ui.callback_handler(callback('prd:variantpick:' + deluxe['id']))
+        for _ in range(5):
+            await ui.text_handler(message('-'))
+        await ui.text_handler(message('39.99'))
+        assert view._flows[1]['preview']['variables']['edition'] == 'Deluxe Edition'
+        await ui.callback_handler(callback(preview_action('prd:save')))
+        assert len(ctx.store.list_drafts()) == 1
+        ctx.client.account.save_lot.assert_not_called()
+        ctx.client.account.method.assert_not_called()
 
     asyncio.run(run())

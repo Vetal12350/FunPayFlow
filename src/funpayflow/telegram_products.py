@@ -5,6 +5,7 @@ from html import escape
 import json
 import re
 import sqlite3
+import uuid
 
 from .game_routes import RouteService
 from .product_store import ProductStore
@@ -139,6 +140,7 @@ def _route_screen(row):
 
 def _preview_screen(flow):
     body = flow['preview']; p = body['payload']
+    token = flow.setdefault('preview_token', uuid.uuid4().hex[:12])
     clip = _ui()._escaped_preview
     text = ('👁 <b>RU + EN draft</b>\n'
             f"Game: {clip(body['game'], 80)}\n"
@@ -162,6 +164,8 @@ def _preview_screen(flow):
             [('❌ Cancel', 'prd:discard')], [('🔙 Лоты', 'products')]]
     if body.get('status') == 'cancelled':
         rows = [[('🔙 Лоты', 'products')]]
+    rows = [[(label, action + ':' + token if action.startswith('prd:') and action.split(':')[1] in {'save', 'edit', 'text', 'discard'}
+              else action) for label, action in row] for row in rows]
     return text, _menu(rows)
 
 
@@ -252,12 +256,25 @@ async def _products_callback(callback, action, user_id):
         await callback.answer('Доступно только владельцу.', show_alert=True)
         return True
     await callback.answer()
-    ui._interaction_state.pop(user_id, None)
     try:
         store, templates, routes, drafts = _kit(user_id)
         await asyncio.to_thread(templates.ensure_builtin)
         parts = action.split(':')
         command = parts[1] if len(parts) > 1 else 'home'
+        if command in {'save', 'edit', 'text', 'discard'}:
+            flow = _active(user_id)
+            index = 3 if command in {'edit', 'text'} else 2
+            if not flow.get('preview_token') or len(parts) != index + 1 or parts[index] != flow['preview_token']:
+                raise ValueError('Предпросмотр устарел.')
+            if command == 'edit':
+                flow.pop('preview_token', None)
+        elif command == 'variantsave':
+            flow = _active(user_id)
+            if len(parts) != 3 or parts[2] != flow.get('variant_token') or 'variant_pending' not in flow:
+                raise ValueError('Предпросмотр устарел.')
+        elif user_id in _flows:
+            _flows[user_id].pop('preview_token', None)
+        ui._interaction_state.pop(user_id, None)
         if command == 'home':
             discard_session(user_id)
             await _show(callback, *_home())
@@ -365,12 +382,15 @@ async def _products_callback(callback, action, user_id):
                 [('Варианты', f"prd:variants:{saved['route_id']}:0")]]))
         elif command == 'variantsave':
             flow = _active(user_id)
+            if len(parts) != 3 or parts[2] != flow.get('variant_token'):
+                raise ValueError('Предпросмотр устарел.')
             body = flow['variant_pending']; old = flow.get('variant_edit')
             if body['route_id'] != flow['route_id']:
                 raise ValueError('Вариант другого маршрута.')
             saved = await asyncio.to_thread(VariantService(store, routes).save, body,
                 old['id'] if old else None, old['revision'] if old else None)
             flow.pop('variant_pending', None)
+            flow.pop('variant_token', None)
             ui._interaction_state.pop(user_id, None)
             await callback.message.answer('✅ Variant сохранён локально.', reply_markup=_menu([
                 [('Варианты', f"prd:variants:{saved['route_id']}:0")]]))
@@ -496,6 +516,7 @@ async def _products_callback(callback, action, user_id):
                     raise ValueError('Draft не сохранён: пакет отменён или устарел.')
                 row = result['results'][0]
             flow.update(preview=row, stored_id=row['id'], stored_revision=row['revision'], dirty=False)
+            flow.pop('preview_token', None)
             await callback.message.answer('✅ Draft сохранён локально.', reply_markup=_menu([[('Открыть', f"prd:open:{row['id']}")], [('Лоты', 'products')]]))
         elif command in {'confirm', 'cancel'}:
             flow = _active(user_id)
@@ -633,10 +654,11 @@ async def _products_input(message, user_id):
             # Verify overrides and the optional catalogue node before asking to confirm.
             body = await asyncio.to_thread(VariantService(store, routes).prepare, body)
             flow['variant_pending'] = body
+            flow['variant_token'] = uuid.uuid4().hex[:12]
             ui._interaction_state.pop(user_id, None)
             await _plain_chunks(message, json.dumps(body, ensure_ascii=False, indent=2))
             await message.answer('Сохранить variant локально?', reply_markup=_menu([
-                [('✅ Сохранить variant', 'prd:variantsave')],
+                [('✅ Сохранить variant', f"prd:variantsave:{flow['variant_token']}")],
                 [('❌ Cancel', f"prd:variants:{flow['route_id']}:0")]]))
         elif step == 'draftedit':
             field = flow['edit_field']; overrides = {}; variables = None; price = None

@@ -55,6 +55,10 @@ def message(text):
     return SimpleNamespace(text=text, from_user=SimpleNamespace(id=1), answer=AsyncMock())
 
 
+def preview_action(action):
+    return action + ':' + view._flows[1]['preview_token']
+
+
 def seed_route(ctx, index=0):
     return ctx.store.save_route(ctx.routes.from_url(ctx.template['id'],
         f'https://funpay.com/lots/{ctx.nodes[index].id}/'))
@@ -161,11 +165,11 @@ def test_single_draft_wizard_edit_save_duplicate_and_restart(context):
         await view.products_input(message('29.99'), 1)
         assert ctx.store.list_drafts() == []
         assert 'RU + EN' in str(view._preview_screen(view._flows[1]))
-        await view.products_callback(cb, 'prd:edit:emoji', 1)
+        await view.products_callback(cb, preview_action('prd:edit:emoji'), 1)
         await view.products_input(message('⚔️'), 1)
-        await view.products_callback(cb, 'prd:edit:en', 1)
+        await view.products_callback(cb, preview_action('prd:edit:en'), 1)
         await view.products_input(message('English key\nEnglish description'), 1)
-        await asyncio.gather(*(view.products_callback(callback(), 'prd:save', 1) for _ in range(2)))
+        await asyncio.gather(*(view.products_callback(callback(), preview_action('prd:save'), 1) for _ in range(2)))
         rows = ctx.store.list_drafts()
         assert len(rows) == 1
         saved = rows[0]
@@ -177,11 +181,12 @@ def test_single_draft_wizard_edit_save_duplicate_and_restart(context):
         assert len(ctx.store.list_drafts()) == 1
         await view.products_callback(cb, f"prd:open:{saved['id']}", 1)
         assert view._flows[1]['preview']['payload']['price'] == '29.99'
-        await view.products_callback(cb, 'prd:edit:price', 1)
+        await view.products_callback(cb, preview_action('prd:edit:price'), 1)
         await view.products_input(message('31.99'), 1)
-        await view.products_callback(cb, 'prd:save', 1)
+        await view.products_callback(cb, preview_action('prd:save'), 1)
         assert ctx.store.get_draft(saved['id'])['payload']['price'] == '31.99'
-        await view.products_callback(cb, 'prd:discard', 1)
+        await view.products_callback(cb, f"prd:open:{saved['id']}", 1)
+        await view.products_callback(cb, preview_action('prd:discard'), 1)
         assert ctx.store.get_draft(saved['id'])['status'] == 'cancelled'
         ctx.client.account.save_lot.assert_not_called()
         ctx.client.account.method.assert_not_called()
@@ -280,5 +285,37 @@ def test_draft_route_wrong_template_and_cancelled_preview_not_saved(context):
         await view.products_callback(cb, f"prd:route:{route['id']}", 1)
         assert 'route_id' not in view._flows[1]
         assert ctx.store.list_drafts() == []
+
+    asyncio.run(run())
+
+
+def test_stale_preview_actions_do_not_touch_another_active_draft(context):
+    ctx = context; route = seed_route(ctx)
+    previews = [ctx.drafts.create_preview(ctx.template['id'], route['id'], price=str(price)) for price in (10, 20)]
+    rows = ctx.drafts.confirm(ctx.drafts.stage(previews)['token'])['results']
+
+    async def run():
+        cb = callback()
+        await view.products_callback(cb, 'prd:open:' + rows[0]['id'], 1)
+        old_actions = [preview_action(action) for action in ('prd:save', 'prd:discard', 'prd:edit:price', 'prd:text:ru')]
+        await view.products_callback(cb, 'prd:open:' + rows[1]['id'], 1)
+        current = deepcopy(view._flows[1])
+        for action in old_actions:
+            await view.products_callback(cb, action, 1)
+            assert view._flows[1] == current
+        assert ctx.store.get_draft(rows[0]['id']) == rows[0]
+        assert ctx.store.get_draft(rows[1]['id']) == rows[1]
+        await view.products_callback(cb, preview_action('prd:edit:price'), 1)
+        pending = deepcopy(ui._interaction_state[1])
+        await ui.callback_handler(callback(old_actions[0]))
+        assert ui._interaction_state[1] == pending
+        await view.products_input(message('21'), 1)
+        old_save = preview_action('prd:save')
+        await view.products_callback(cb, preview_action('prd:edit:price'), 1)
+        await view.products_input(message('22'), 1)
+        await view.products_callback(cb, old_save, 1)
+        assert ctx.store.get_draft(rows[1]['id'])['payload']['price'] == '20'
+        await view.products_callback(cb, preview_action('prd:save'), 1)
+        assert ctx.store.get_draft(rows[1]['id'])['payload']['price'] == '22'
 
     asyncio.run(run())

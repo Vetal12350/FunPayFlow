@@ -2567,10 +2567,10 @@ async def callback_handler(callback: CallbackQuery):
                     and _sales_import_session["owner"] == user_id
                     and _sales_import_session["phase"] in {"upload", "ready"}):
                 _sales_import_cleanup()
+    if await products_callback(callback, action, user_id):
+        return
     _interaction_state.pop(user_id, None)
     if await _autobump_schedule_callback(callback, action, user_id):
-        return
-    if await products_callback(callback, action, user_id):
         return
     from .telegram_lots import templates_callback
     if await templates_callback(callback, action, user_id):

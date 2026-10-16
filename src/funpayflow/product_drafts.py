@@ -65,7 +65,8 @@ class DraftService:
                 raise ProductValidationError("game: must match the verified route; customize product_name instead")
         combined = {**route_overrides, **variant_overrides, **draft_overrides}
         combined["variables"] = {**route_overrides.get("variables", {}),
-                                 **variant_overrides.get("variables", {}), **draft_overrides.get("variables", {})}
+                                 **variant_overrides.get("variables", {}), **variables,
+                                 **draft_overrides.get("variables", {})}
         values = {"product_name": canonical_game, **variables, "game": canonical_game}
         rendered = model.render(values, combined)
         quantity = rendered["variables"].get("quantity", "1")
