@@ -372,10 +372,139 @@ class ReviewReceiptStore:
                         "SELECT game_id, cycle_id, position, attempt_id, state, eligible_at "
                         "FROM autobump_progress LIMIT 1"
                     ).fetchone()
+                    connection.execute(
+                        "CREATE TABLE IF NOT EXISTS lot_template_drafts ("
+                        "draft_id TEXT PRIMARY KEY, owner_id TEXT NOT NULL, "
+                        "account_id INTEGER NOT NULL, source_id INTEGER NOT NULL, "
+                        "subcategory_id INTEGER NOT NULL, payload TEXT NOT NULL, "
+                        "baseline_ids TEXT NOT NULL, revision INTEGER NOT NULL DEFAULT 0, "
+                        "state TEXT NOT NULL CHECK(state IN "
+                        "('draft', 'previewed', 'cancelled', 'claimed', 'ambiguous', 'published')), "
+                        "attempt_id TEXT, published_id INTEGER, "
+                        "created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)"
+                    )
+                    connection.execute(
+                        "SELECT draft_id, owner_id, account_id, source_id, subcategory_id, "
+                        "payload, baseline_ids, revision, state, attempt_id, published_id, "
+                        "created_at, updated_at FROM lot_template_drafts LIMIT 1"
+                    ).fetchone()
                     if connection.execute("PRAGMA quick_check").fetchone() != ("ok",):
                         raise StateError("Persistent state integrity check failed.")
         except (sqlite3.Error, OSError):
             raise StateError("Persistent state initialization failed.") from None
+
+    def create_lot_template_draft(self, owner_id: str, account_id: int, source_id: int,
+                                  subcategory_id: int, payload: dict,
+                                  baseline_ids: list[int]) -> dict:
+        draft_id = uuid.uuid4().hex
+        now = int(time.time())
+        try:
+            with closing(self._connect()) as db, db:
+                db.execute(
+                    "INSERT INTO lot_template_drafts (draft_id, owner_id, account_id, "
+                    "source_id, subcategory_id, payload, baseline_ids, state, created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, 'draft', ?, ?)",
+                    (draft_id, str(owner_id), account_id, source_id, subcategory_id,
+                     json.dumps(payload, ensure_ascii=False), json.dumps(baseline_ids), now, now),
+                )
+        except (sqlite3.Error, OSError):
+            raise StateError("Lot template state write failed.") from None
+        return self.get_lot_template_draft(owner_id, draft_id)
+
+    def get_lot_template_draft(self, owner_id: str, draft_id: str) -> dict | None:
+        try:
+            with closing(self._connect()) as db:
+                db.row_factory = sqlite3.Row
+                row = db.execute(
+                    "SELECT * FROM lot_template_drafts WHERE draft_id = ? AND owner_id = ?",
+                    (draft_id, str(owner_id)),
+                ).fetchone()
+                if row is None:
+                    return None
+                result = dict(row)
+                result['payload'] = json.loads(result['payload'])
+                result['baseline_ids'] = json.loads(result['baseline_ids'])
+                return result
+        except (sqlite3.Error, OSError, ValueError, TypeError):
+            raise StateError("Lot template state read failed.") from None
+
+    def update_lot_template_draft(self, owner_id: str, draft_id: str, revision: int,
+                                  payload: dict, *, preview: bool = False) -> bool:
+        """CAS revision makes edits invalidate previously rendered confirmations."""
+        try:
+            with closing(self._connect()) as db, db:
+                return db.execute(
+                    "UPDATE lot_template_drafts SET payload = ?, revision = revision + 1, "
+                    "state = ?, updated_at = ? WHERE draft_id = ? AND owner_id = ? "
+                    "AND revision = ? AND state IN ('draft', 'previewed')",
+                    (json.dumps(payload, ensure_ascii=False), 'previewed' if preview else 'draft',
+                     int(time.time()), draft_id, str(owner_id), revision),
+                ).rowcount == 1
+        except (sqlite3.Error, OSError):
+            raise StateError("Lot template state write failed.") from None
+
+    def list_lot_template_drafts(self, owner_id: str, account_id: int) -> list[dict]:
+        try:
+            with closing(self._connect()) as db:
+                rows = db.execute(
+                    "SELECT draft_id FROM lot_template_drafts WHERE owner_id = ? "
+                    "AND account_id = ? AND state != 'cancelled' "
+                    "ORDER BY updated_at DESC, rowid DESC LIMIT 10",
+                    (str(owner_id), account_id),
+                ).fetchall()
+            return [self.get_lot_template_draft(owner_id, row[0]) for row in rows]
+        except (sqlite3.Error, OSError):
+            raise StateError("Lot template state read failed.") from None
+
+    def cancel_lot_template_draft(self, owner_id: str, draft_id: str) -> bool:
+        try:
+            with closing(self._connect()) as db, db:
+                return db.execute(
+                    "UPDATE lot_template_drafts SET state = 'cancelled', updated_at = ? "
+                    "WHERE draft_id = ? AND owner_id = ? AND state IN ('draft', 'previewed')",
+                    (int(time.time()), draft_id, str(owner_id)),
+                ).rowcount == 1
+        except (sqlite3.Error, OSError):
+            raise StateError("Lot template state write failed.") from None
+
+    def claim_lot_template_draft(self, owner_id: str, draft_id: str,
+                                 revision: int, attempt_id: str) -> bool:
+        """Future verified transport must commit this claim before its first write."""
+        try:
+            with closing(self._connect()) as db, db:
+                return db.execute(
+                    "UPDATE lot_template_drafts SET state = 'claimed', attempt_id = ?, "
+                    "updated_at = ? WHERE draft_id = ? AND owner_id = ? "
+                    "AND revision = ? AND state = 'previewed'",
+                    (attempt_id, int(time.time()), draft_id, str(owner_id), revision),
+                ).rowcount == 1
+        except (sqlite3.Error, OSError):
+            raise StateError("Lot template claim failed.") from None
+
+    def finish_lot_template_draft(self, owner_id: str, draft_id: str,
+                                  attempt_id: str, published_id: int | None = None) -> bool:
+        """An uncertain result never restores a draft to a sendable state."""
+        if published_id is not None and (type(published_id) is not int or published_id <= 0):
+            raise StateError("Invalid published lot ID.")
+        try:
+            with closing(self._connect()) as db, db:
+                return db.execute(
+                    "UPDATE lot_template_drafts SET state = ?, published_id = ?, updated_at = ? "
+                    "WHERE draft_id = ? AND owner_id = ? AND attempt_id = ? "
+                    "AND state IN ('claimed', 'ambiguous')",
+                    ('published' if published_id else 'ambiguous', published_id,
+                     int(time.time()), draft_id, str(owner_id), attempt_id),
+                ).rowcount == 1
+        except (sqlite3.Error, OSError):
+            raise StateError("Lot template outcome write failed.") from None
+
+    def recover_lot_template_drafts(self) -> None:
+        try:
+            with closing(self._connect()) as db, db:
+                db.execute("UPDATE lot_template_drafts SET state = 'ambiguous', updated_at = ? "
+                           "WHERE state = 'claimed'", (int(time.time()),))
+        except (sqlite3.Error, OSError):
+            raise StateError("Lot template recovery failed.") from None
 
     def recover_autobump_progress(self) -> None:
         """An interrupted write is unknown, never a pending request to resend."""

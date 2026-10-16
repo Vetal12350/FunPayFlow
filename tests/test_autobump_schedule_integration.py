@@ -1,0 +1,158 @@
+"""Offline schedule persistence, Telegram and worker gate regressions."""
+import log_isolation
+import ast
+import asyncio
+import copy
+import json
+import tempfile
+import unittest
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
+
+from funpayflow import telegram as ui
+from funpayflow.autobump_schedule import normalize_schedule
+from funpayflow.funpay import _AmbiguousRaiseOutcome
+
+
+class ScheduleIntegrationTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.folder = tempfile.TemporaryDirectory()
+        self.addCleanup(self.folder.cleanup)
+        settings = copy.deepcopy(ui.bot_settings)
+        path, client, modules = ui.SETTINGS_FILE, ui._runtime_client, ui._effective_modules
+        interactions = dict(ui._interaction_state)
+        self.addCleanup(lambda: (ui.bot_settings.clear(), ui.bot_settings.update(settings),
+                                setattr(ui, 'SETTINGS_FILE', path),
+                                setattr(ui, '_runtime_client', client),
+                                setattr(ui, '_effective_modules', modules),
+                                ui._interaction_state.clear(),
+                                ui._interaction_state.update(interactions)))
+        ui.bot_settings.clear()
+        ui.bot_settings.update(copy.deepcopy(ui._DEFAULT_GLOBAL_SETTINGS))
+        ui.SETTINGS_FILE = str(Path(self.folder.name) / 'settings.json')
+        ui.configure_module_runtime(fresh_install=False)
+
+    def test_restart_and_legacy_settings(self):
+        schedule = normalize_schedule({'enabled': True})
+        ui.save_autobump_schedule(schedule)
+        ui.bot_settings['autobump_schedule'] = normalize_schedule()
+        ui.load_settings()
+        self.assertEqual(ui.bot_settings['autobump_schedule'], schedule)
+        saved = json.loads(Path(ui.SETTINGS_FILE).read_text(encoding='utf-8'))
+        del saved['autobump_schedule']
+        saved['auto_bump'] = False
+        Path(ui.SETTINGS_FILE).write_text(json.dumps(saved), encoding='utf-8')
+        ui.load_settings()
+        self.assertEqual(ui.bot_settings['autobump_schedule'], normalize_schedule())
+        self.assertFalse(ui.bot_settings['auto_bump'])
+
+    def test_failed_save_rolls_back_without_version_change(self):
+        previous = ui.get_autobump_state()
+        schedule = copy.deepcopy(ui.bot_settings['autobump_schedule'])
+        with patch.object(ui, 'save_settings', side_effect=RuntimeError('synthetic')):
+            with self.assertRaises(RuntimeError):
+                ui.save_autobump_schedule(normalize_schedule({'enabled': True}))
+        self.assertEqual(ui.get_autobump_state(), previous)
+        self.assertEqual(ui.bot_settings['autobump_schedule'], schedule)
+
+    def test_invalid_persisted_policy_fails_closed(self):
+        ui.save_settings(required=True)
+        saved = json.loads(Path(ui.SETTINGS_FILE).read_text(encoding='utf-8'))
+        saved['autobump_schedule'] = {'enabled': True, 'start': 'invalid'}
+        Path(ui.SETTINGS_FILE).write_text(json.dumps(saved), encoding='utf-8')
+        with self.assertRaises(RuntimeError):
+            ui.load_settings()
+
+    async def test_telegram_owner_toggle_edit_and_input(self):
+        callback = SimpleNamespace(answer=AsyncMock(), message=SimpleNamespace(
+            answer=AsyncMock(), edit_text=AsyncMock()))
+        with patch.object(ui, '_owner_id', return_value=True):
+            await ui._autobump_schedule_callback(callback, 'bump_schedule:toggle', 1)
+            self.assertTrue(ui.bot_settings['autobump_schedule']['enabled'])
+            await ui._autobump_schedule_callback(callback, 'bump_schedule:edit', 1)
+            message = SimpleNamespace(text='09:00 18:00 Europe/Moscow', answer=AsyncMock())
+            self.assertTrue(await ui._autobump_schedule_input(message, 1))
+            self.assertEqual(ui.bot_settings['autobump_schedule']['start'], '09:00')
+        text, keyboard = ui._autobump_schedule_screen()
+        self.assertIn('круглосуточно', text)
+        self.assertIn('Europe/Moscow', text)
+        self.assertIn('bump_schedule', str(keyboard))
+        self.assertEqual(ui._action_feature('bump_schedule:edit'), 'autobump')
+
+    async def test_non_owner_cannot_change_schedule(self):
+        callback = SimpleNamespace(answer=AsyncMock(), message=SimpleNamespace(edit_text=AsyncMock()))
+        with patch.object(ui, '_owner_id', return_value=False):
+            await ui._autobump_schedule_callback(callback, 'bump_schedule:toggle', 2)
+        self.assertFalse(ui.bot_settings['autobump_schedule']['enabled'])
+        callback.message.edit_text.assert_not_awaited()
+
+    async def test_worker_outer_and_late_gate_without_mutating_settings(self):
+        tree = ast.parse(Path('src/funpayflow/main.py').read_text(encoding='utf-8'))
+        node = next(n for n in tree.body if getattr(n, 'name', '') == 'auto_bump_loop')
+        for allowed in (False, True):
+            with self.subTest(allowed=allowed):
+                policy = normalize_schedule({'enabled': True})
+                ui.bot_settings['autobump_schedule'] = policy
+                ui.bot_settings['auto_bump'] = True
+                called = []
+                gate = [allowed]
+
+                async def bump(*args, is_cancelled):
+                    self.assertFalse(is_cancelled())
+                    gate[0] = False
+                    self.assertTrue(is_cancelled())
+                    called.append(1)
+                    return False, '', 60
+
+                async def sleep(_):
+                    raise asyncio.CancelledError
+
+                namespace = dict(Bot=object, FunPayClient=object,
+                                 asyncio=SimpleNamespace(sleep=sleep),
+                                 _require_env=lambda _: '1', get_autobump_state=ui.get_autobump_state,
+                                 is_safe_mode_enabled=lambda: False, restart_requested=lambda: False,
+                                 module_enabled=lambda _: False, bot_settings=ui.bot_settings,
+                                 logger=SimpleNamespace(bump=lambda *_: None))
+                exec(compile(ast.Module(body=[node], type_ignores=[]), '<worker>', 'exec'), namespace)
+                client = SimpleNamespace(bump_lots=bump, runner_stop_requested=lambda: False,
+                                         get_runner_health=lambda: {'state': 'healthy'})
+                with patch.object(ui, 'autobump_schedule_allows_now', side_effect=lambda: gate[0]):
+                    with self.assertRaises(asyncio.CancelledError):
+                        await namespace['auto_bump_loop'](None, client)
+                self.assertEqual(called, [1] if allowed else [])
+                self.assertTrue(ui.bot_settings['auto_bump'])
+                self.assertEqual(ui.bot_settings['autobump_schedule'], policy)
+
+    async def test_unknown_network_outcome_preserves_enabled_policy(self):
+        policy = normalize_schedule({'enabled': True})
+        ui.bot_settings['autobump_schedule'] = policy
+        ui.bot_settings['auto_bump'] = True
+        node = next(n for n in ast.parse(Path('src/funpayflow/main.py').read_text(
+            encoding='utf-8')).body if getattr(n, 'name', '') == 'auto_bump_loop')
+
+        async def sleep(_):
+            raise asyncio.CancelledError
+
+        namespace = dict(Bot=object, FunPayClient=object,
+                         asyncio=SimpleNamespace(sleep=sleep, current_task=asyncio.current_task,
+                                                 CancelledError=asyncio.CancelledError),
+                         _require_env=lambda _: '1', get_autobump_state=ui.get_autobump_state,
+                         is_safe_mode_enabled=lambda: False, restart_requested=lambda: False,
+                         module_enabled=lambda _: False, bot_settings=ui.bot_settings,
+                         _AmbiguousRaiseOutcome=_AmbiguousRaiseOutcome,
+                         logger=SimpleNamespace(bump=lambda *_: None, warning=lambda *_: None))
+        exec(compile(ast.Module(body=[node], type_ignores=[]), '<worker>', 'exec'), namespace)
+        client = SimpleNamespace(bump_lots=AsyncMock(side_effect=_AmbiguousRaiseOutcome),
+                                 runner_stop_requested=lambda: False,
+                                 get_runner_health=lambda: {'state': 'healthy'})
+        with patch.object(ui, 'autobump_schedule_allows_now', return_value=True):
+            with self.assertRaises(asyncio.CancelledError):
+                await namespace['auto_bump_loop'](None, client)
+        client.bump_lots.assert_awaited_once()
+        self.assertTrue(ui.bot_settings['auto_bump'])
+        self.assertEqual(ui.bot_settings['autobump_schedule'], policy)
+
+
+if __name__ == '__main__':
+    unittest.main()

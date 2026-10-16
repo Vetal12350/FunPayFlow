@@ -132,6 +132,7 @@ def release_lock():
 
 
 async def auto_bump_loop(bot: Bot, client: FunPayClient):
+    from funpayflow.telegram import autobump_schedule_allows_now
     # ADMIN_ID нужен для валидации конфига при старте
     _require_env("ADMIN_ID")
     user_id = int(_require_env("FUNPAY_USER_ID"))
@@ -160,6 +161,7 @@ async def auto_bump_loop(bot: Bot, client: FunPayClient):
 
         # 2. Если тумблер включен - запускаем работу
         if current_state and (is_safe_mode_enabled() or restart_requested()
+                              or not autobump_schedule_allows_now()
                               or client.get_runner_health().get("state") == "backoff"):
             await asyncio.sleep(1)
             continue
@@ -174,6 +176,7 @@ async def auto_bump_loop(bot: Bot, client: FunPayClient):
                                           or get_autobump_state() != (True, state_version)
                                           or client.get_runner_health().get("state") == "backoff"
                                           or is_safe_mode_enabled()
+                                          or not autobump_schedule_allows_now()
                                           or restart_requested()),
                 )
             except _AmbiguousRaiseOutcome:
@@ -202,8 +205,9 @@ async def auto_bump_loop(bot: Bot, client: FunPayClient):
 
             # Сон с ежесекундной проверкой кнопки выключения
             for _ in range(int(wait_time)):
-                if get_autobump_state() != (True, state_version):
-                    logger.bump("Автоподнятие выключено пользователем во время ожидания.")
+                if (get_autobump_state() != (True, state_version)
+                        or not autobump_schedule_allows_now()):
+                    logger.bump("Ожидание автоподнятия прервано: настройки или расписание изменились.")
                     break  # Выходим из цикла сна. Основной цикл (while True) заметит изменения и отправит сообщение об остановке
                 await asyncio.sleep(1)
         else:

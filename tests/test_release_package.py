@@ -250,7 +250,10 @@ class ExtractedReleaseSmoke(unittest.TestCase):
             self.assertFalse((release_root / "README.ru.md").exists())
             for name in ("Setup.bat", "Start.bat", "docs/VPS_INSTALL.md", "app/ResolveDataDir.bat",
                          "linux/install.sh", "linux/systemd/funpayflow.service.in",
-                         "app/src/funpayflow/render_service.py", "app/README.md"):
+                         "app/src/funpayflow/render_service.py", "app/README.md",
+                         "app/src/funpayflow/autobump_schedule.py",
+                         "app/src/funpayflow/lot_templates.py",
+                         "app/src/funpayflow/telegram_lots.py"):
                 self.assertTrue((release_root / name).is_file(), name)
             self.assertFalse((release_root / "ResolveDataDir.bat").exists())
             private = temporary / "fresh private data with spaces"

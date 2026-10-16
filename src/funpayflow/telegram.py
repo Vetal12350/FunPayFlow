@@ -28,6 +28,7 @@ from .import_funpay_sales import import_zip
 from .state import StateError, normalize_reporting_currency
 from .runtime_control import claim_restart, restart_requested, signal_restart
 from .runtime_paths import imports_dir, logs_dir, runtime_file
+from .autobump_schedule import DEFAULT_AUTOBUMP_SCHEDULE, normalize_schedule, allows_now
 from . import logger
 
 dp = Dispatcher()
@@ -325,6 +326,7 @@ DEFAULT_REVIEW_REQUEST_DELAY_SECONDS = 300
 # Глобальные настройки — общие для всего бота
 _DEFAULT_GLOBAL_SETTINGS: dict = {
     "auto_bump": True,
+    "autobump_schedule": dict(DEFAULT_AUTOBUMP_SCHEDULE),
     "critical_notice": None,
     "night_mode": False,
     "safe_mode": False,
@@ -467,6 +469,7 @@ def load_settings() -> None:
             print("[SETTINGS] Некорректная задержка запроса отзыва пропущена; автоотправка выключена.")
         saved["review_request_delay_seconds"] = review_delay
         notice = saved.get("critical_notice")
+        saved["autobump_schedule"] = normalize_schedule(saved.get("autobump_schedule"))
         if (notice is not None and (not isinstance(notice, dict)
                 or set(notice) != {"code", "at"}
                 or notice.get("code") not in {"AUTH", "CERTIFICATE", "STATE", "RUNTIME"}
@@ -537,6 +540,7 @@ def save_settings(*, required: bool = False) -> None:
         )
         data = {
             "auto_bump": bot_settings["auto_bump"],
+            "autobump_schedule": normalize_schedule(bot_settings.get("autobump_schedule")),
             "critical_notice": bot_settings["critical_notice"],
             "night_mode": bot_settings["night_mode"],
             "safe_mode": bot_settings["safe_mode"],
@@ -676,6 +680,26 @@ def get_autobump_state() -> tuple[bool, int]:
         return bot_settings["auto_bump"], _autobump_state_version
 
 
+def autobump_schedule_allows_now() -> bool:
+    with _autobump_state_lock:
+        schedule = dict(bot_settings["autobump_schedule"])
+    return allows_now(schedule)
+
+
+def save_autobump_schedule(value: dict) -> None:
+    global _autobump_state_version
+    schedule = normalize_schedule(value)
+    with _autobump_state_lock:
+        previous = bot_settings["autobump_schedule"]
+        bot_settings["autobump_schedule"] = schedule
+        try:
+            save_settings(required=True)
+        except Exception:
+            bot_settings["autobump_schedule"] = previous
+            raise RuntimeError("Не удалось сохранить расписание.") from None
+        _autobump_state_version += 1
+
+
 def claim_critical_notice(code: str) -> bool:
     """Coalesce the same fatal category across process restarts for 30 minutes."""
     if code not in {"AUTH", "CERTIFICATE", "STATE", "RUNTIME"}:
@@ -755,7 +779,7 @@ def _owner_id(user_id: int) -> bool:
 def _action_feature(action: str) -> str | None:
     """One guard for old buttons and direct callback paths."""
     prefix = action.split(":", 1)[0]
-    if action == "toggle_bump":
+    if action == "toggle_bump" or action.startswith("bump_schedule"):
         return "autobump"
     if prefix in {"menu_notifications"} or action.startswith("notif_"):
         return "notifications"
@@ -868,6 +892,7 @@ def get_main_keyboard(user_id: int):
     rows = []
     if module_enabled("autobump"):
         rows.append([_button(f"🚀 Автоподнятие лотов: {bump_status}", "toggle_bump")])
+        rows.append([_button("🕒 Расписание поднятия", "bump_schedule")])
     if module_enabled("statistics"):
         rows.append([_button("📊 Статистика", "menu_stats")])
     if module_enabled("sales_analytics"):
@@ -884,6 +909,7 @@ def get_main_keyboard(user_id: int):
     if module_enabled("logs_ui"):
         rows.append([_button("📄 Лог", "menu_logs")])
     if _owner_id(user_id):
+        rows.append([_button("📝 Шаблоны лотов", "lot_templates")])
         rows.append([_button("🧩 Модули", "modules_open")])
         rows.append([_button("🔄 Перезапустить бота", "restart_open")])
     return _menu(rows)
@@ -2421,6 +2447,79 @@ async def cmd_log(message: Message):
     await _send_log_file(message, date_str)
 
 
+def _autobump_schedule_screen():
+    schedule = normalize_schedule(bot_settings["autobump_schedule"])
+    text = ("🕒 <b>Расписание автоподнятия</b>\n"
+            f"Пользователь: {on_icon(bot_settings['auto_bump'])}\n"
+            f"Расписание: {on_icon(schedule['enabled'])}\n"
+            f"Окно: {schedule['start']} → {schedule['stop']}\n"
+            f"Часовой пояс: {escape(schedule['timezone'])}\n"
+            f"Сейчас разрешено расписанием: {on_icon(allows_now(schedule))}\n\n"
+            "Ручное выключение имеет приоритет. Остальные функции работают круглосуточно.")
+    return text, _menu([
+        [_button("Включить / выключить расписание", "bump_schedule:toggle")],
+        [_button("Изменить время и часовой пояс", "bump_schedule:edit")],
+        [_button("🔙 Главное меню", "menu_main")],
+    ])
+
+
+async def _autobump_schedule_callback(callback, action, user_id):
+    if not action.startswith("bump_schedule"):
+        return False
+    if not _owner_id(user_id):
+        await callback.answer("Только владелец может менять расписание.", show_alert=True)
+        return True
+    try:
+        if action == "bump_schedule:toggle":
+            schedule = dict(bot_settings["autobump_schedule"])
+            schedule["enabled"] = not schedule["enabled"]
+            save_autobump_schedule(schedule)
+        elif action == "bump_schedule:edit":
+            _interaction_state[user_id] = {"action": "bump_schedule_edit"}
+            await callback.answer()
+            await callback.message.answer(
+                "Отправьте начало, конец и часовой пояс, например:\n"
+                "07:00 01:00 Europe/Moscow\n"
+                "Начало включительно, конец не включительно; одинаковое время запрещено.\n"
+                "❌ Отмена — выйти без сохранения.")
+            return True
+        elif action != "bump_schedule":
+            await callback.answer("Действие больше недоступно.")
+            return True
+    except (ValueError, RuntimeError):
+        await callback.answer("Не удалось сохранить расписание. Состояние не изменено.", show_alert=True)
+        return True
+    await callback.answer()
+    text, markup = _autobump_schedule_screen()
+    await callback.message.edit_text(text, reply_markup=markup, parse_mode="HTML")
+    return True
+
+
+async def _autobump_schedule_input(message, user_id):
+    if _interaction_state.get(user_id, {}).get("action") != "bump_schedule_edit":
+        return False
+    if not _owner_id(user_id) or not module_enabled("autobump"):
+        _interaction_state.pop(user_id, None)
+        await message.answer("Изменение расписания недоступно.")
+        return True
+    if (message.text or "").startswith("/"):
+        _interaction_state.pop(user_id, None)
+        await message.answer("Изменение расписания отменено. Команда не сохранена.")
+        return True
+    try:
+        start, stop, zone = (message.text or "").split()
+        schedule = {**bot_settings["autobump_schedule"],
+                    "start": start, "stop": stop, "timezone": zone}
+        save_autobump_schedule(schedule)
+    except (ValueError, RuntimeError):
+        await message.answer("Не сохранено. Проверьте формат ЧЧ:ММ ЧЧ:ММ и доступный IANA timezone; Europe/Moscow поддерживается всегда.")
+        return True
+    _interaction_state.pop(user_id, None)
+    text, markup = _autobump_schedule_screen()
+    await message.answer(text, reply_markup=markup, parse_mode="HTML")
+    return True
+
+
 @dp.callback_query()
 async def callback_handler(callback: CallbackQuery):
     user_id = callback.from_user.id
@@ -2450,6 +2549,11 @@ async def callback_handler(callback: CallbackQuery):
                     and _sales_import_session["phase"] in {"upload", "ready"}):
                 _sales_import_cleanup()
     _interaction_state.pop(user_id, None)
+    if await _autobump_schedule_callback(callback, action, user_id):
+        return
+    from .telegram_lots import templates_callback
+    if await templates_callback(callback, action, user_id):
+        return
     if await _night_callback(callback, action, user_id):
         return
     if await _review_callback(callback, action, user_id):
@@ -2626,6 +2730,11 @@ async def text_handler(message: Message):
                         _sales_import_cleanup()
             _interaction_state.pop(user_id, None)
             await message.answer("Отменено.", reply_markup=get_main_keyboard(user_id))
+            return
+        if await _autobump_schedule_input(message, user_id):
+            return
+        from .telegram_lots import templates_input
+        if await templates_input(message, user_id):
             return
         if await _primary_currency_input(message, user_id):
             return
