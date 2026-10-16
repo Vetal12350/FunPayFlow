@@ -13,7 +13,7 @@ def normalize_game(value):
 
 
 def initialize_schema(connection):
-    for table in ("product_templates", "game_routes", "product_drafts"):
+    for table in ("product_templates", "game_routes", "product_drafts", "product_variants"):
         connection.execute(f"CREATE TABLE IF NOT EXISTS {table} ("
                            "id TEXT NOT NULL, owner_id TEXT NOT NULL, account_id INTEGER NOT NULL, "
                            "body TEXT NOT NULL, revision INTEGER NOT NULL, created_at REAL NOT NULL, "
@@ -24,6 +24,8 @@ def initialize_schema(connection):
                        "ON game_routes(owner_id,account_id,template_id,game_key)")
     connection.execute("CREATE UNIQUE INDEX IF NOT EXISTS product_templates_unique_name "
                        "ON product_templates(owner_id,account_id,game_key) WHERE game_key IS NOT NULL")
+    connection.execute("CREATE UNIQUE INDEX IF NOT EXISTS product_variants_unique_name "
+                       "ON product_variants(owner_id,account_id,game_key)")
     connection.execute("CREATE TABLE IF NOT EXISTS product_batches (token TEXT PRIMARY KEY, "
                        "owner_id TEXT NOT NULL, account_id INTEGER NOT NULL, kind TEXT NOT NULL, "
                        "status TEXT NOT NULL, body TEXT NOT NULL, result TEXT)")
@@ -76,6 +78,15 @@ class ProductStore:
         game_key = template_id = None
         if table == "product_templates" and body.get("name"):
             game_key = normalize_game(body["name"])
+        if table == "product_variants":
+            from .product_variants import validate_variant
+            template_id = body.get("template_id")
+            template = self._get(db, "product_templates", template_id)
+            parent = self._get(db, "game_routes", body.get("route_id"))
+            body = validate_variant(body, template, parent)
+            if old and (old["template_id"], old["route_id"]) != (body["template_id"], body["route_id"]):
+                raise ValueError("Область варианта нельзя изменить.")
+            game_key = json.dumps([body["route_id"], normalize_game(body["display_name"])], ensure_ascii=False)
         if table == "game_routes":
             allowed = {"template_id", "game_name", "game_aliases", "node_id", "section_name", "metadata", "overrides", "game_key"}
             if set(body) - allowed:
@@ -200,6 +211,49 @@ class ProductStore:
         if len(matches) > 1:
             raise ValueError("Название игры неоднозначно; выберите конкретный маршрут.")
         return matches[0] if matches else None
+
+    def get_variant(self, variant_id):
+        return self._read("product_variants", variant_id)
+
+    def save_variant(self, body, variant_id=None, expected_revision=None):
+        return self._write("product_variants", body, variant_id, expected_revision)
+
+    def disable_variant(self, variant_id, expected_revision):
+        # A status-only action must remain available after template/catalogue edits.
+        if type(expected_revision) is not int or expected_revision <= 0:
+            raise ValueError("Некорректная версия записи.")
+        with closing(self.store._connect()) as db, db:
+            db.execute("BEGIN IMMEDIATE")
+            body = self._get(db, "product_variants", variant_id)
+            if body is None or body["revision"] != expected_revision:
+                raise ValueError("Вариант не найден или изменён.")
+            for key in ("id", "revision", "created_at", "updated_at"):
+                body.pop(key, None)
+            body["enabled"] = False
+            db.execute("UPDATE product_variants SET body=?,revision=revision+1,updated_at=? "
+                       "WHERE id=? AND owner_id=? AND account_id=? AND revision=?",
+                       (json.dumps(body, ensure_ascii=False, allow_nan=False), time.time(),
+                        variant_id, *self._scope(), expected_revision))
+            return self._get(db, "product_variants", variant_id)
+
+    def list_variants(self, route_id, limit=50, offset=0, enabled_only=True):
+        if (type(limit) is not int or type(offset) is not int or not 1 <= limit <= 100
+                or not 0 <= offset <= 1_000_000 or type(enabled_only) is not bool):
+            raise ValueError("Некорректная страница списка.")
+        with closing(self.store._connect()) as db:
+            found, skip = [], offset
+            for row in db.execute("SELECT * FROM product_variants WHERE owner_id=? AND account_id=? "
+                                  "ORDER BY created_at DESC,id", self._scope()):
+                body = self._decode(row)
+                if body["route_id"] != route_id or (enabled_only and not body["enabled"]):
+                    continue
+                if skip:
+                    skip -= 1
+                    continue
+                found.append(body)
+                if len(found) == limit:
+                    break
+            return found
 
     def stage_batch(self, kind, bodies):
         if kind not in ("routes", "drafts") or not isinstance(bodies, list) or not 1 <= len(bodies) <= 100:

@@ -10,6 +10,7 @@ from .game_routes import RouteService
 from .product_store import ProductStore
 from .product_templates import TemplateService, default_template, validate_overrides
 from .product_drafts import DraftService, validate_price
+from .product_variants import VariantService
 from .state import StateError
 
 
@@ -132,6 +133,7 @@ def _route_screen(row):
             f"Aliases: {escape(', '.join(row.get('game_aliases', []))[:250])}\n"
             f"Emoji: {escape(row.get('overrides', {}).get('emoji', 'template default'))}")
     return text, _menu([[('Aliases / emoji', f"prd:routeedit:{row['id']}")],
+                        [('🎚 Варианты / Editions', f"prd:variants:{row['id']}:0")],
                         [('🔙 Routes', 'prd:routepage:0')], [('Лоты', 'products')]])
 
 
@@ -141,6 +143,7 @@ def _preview_screen(flow):
     text = ('👁 <b>RU + EN draft</b>\n'
             f"Game: {clip(body['game'], 80)}\n"
             f"Template: {clip(body['template_name'], 60)}\n"
+            + (f"Variant: {clip(body['variant_name'], 80)}\n" if body.get('variant_id') else '') +
             f"Section: {clip(body['section'], 80)} · node {body['node']}\n"
             f"Emoji: {clip(body['emoji'], 64)}\n"
             f"RU title: {clip(p['title_ru'], 200)}\n"
@@ -164,8 +167,22 @@ def _preview_screen(flow):
 
 async def _wizard_prompt(message, user_id, flow, templates):
     template = await asyncio.to_thread(templates.get, flow['template_id'])
+    defaults = dict(template['defaults'])
+    texts = {key: template[key] for key in ('title_ru', 'title_en', 'description_ru', 'description_en')}
+    if flow.get('route_id'):
+        store, _, routes, _ = _kit(user_id)
+        route = await asyncio.to_thread(routes.resolve_route, flow['route_id'])
+        inherited = [route.get('overrides', {})]
+        if flow.get('variant_id'):
+            variant = await asyncio.to_thread(VariantService(store, routes).get, flow['variant_id'])
+            if variant['route_id'] != route['id']:
+                raise ValueError('Вариант другого маршрута.')
+            inherited.append(variant.get('overrides', {}))
+        for override in inherited:
+            defaults.update(override.get('variables', {}))
+            texts.update({key: override[key] for key in texts if key in override})
     used = set(re.findall(r'\{\{([a-z][a-z0-9_]*)\}\}', ' '.join(
-        template[key] for key in ('title_ru', 'title_en', 'description_ru', 'description_en')))) | {'quantity'}
+        texts.values()))) | {'quantity'}
     fields = [key for key in template['allowed_variables'] if key != 'game' and key in used]
     if flow['purpose'] == 'single':
         fields.append('price')
@@ -174,12 +191,21 @@ async def _wizard_prompt(message, user_id, flow, templates):
         field = fields[index]
         flow['field'] = field
         _pending(user_id, flow, 'variables')
-        default = template['defaults'].get(field, 'название игры' if field == 'product_name' else 'обязательно')
+        default = defaults.get(field, 'название игры' if field == 'product_name' else 'обязательно')
         await message.answer(f"{_TITLES.get(field, field)} [{default}]\n"
                              'Введите значение; «-» — оставить default. ❌ Отмена — выйти.',
                              parse_mode=None)
         return False
     return True
+
+
+async def _variant_picker(callback, user_id, variants, offset=0):
+    flow = _active(user_id)
+    rows = await asyncio.to_thread(variants.list, flow['route_id'], limit=_PAGE + 1, offset=offset)
+    keyboard = [[(row['display_name'][:50], f"prd:variantpick:{row['id']}")] for row in rows[:_PAGE]]
+    keyboard += _page_buttons('prd:variantpage', offset, len(rows) > _PAGE)
+    keyboard += [[('Без варианта / defaults', 'prd:variantpick:base')], [('🔙 Игры', 'prd:routepage:0')]]
+    await _show(callback, '🎚 <b>Выберите вариант</b>', _menu(keyboard))
 
 
 async def _stage_screen(message, user_id, flow, kind, bodies, details, store, drafts):
@@ -259,10 +285,95 @@ async def _products_callback(callback, action, user_id):
             if row['template_id'] != flow['template_id']:
                 raise ValueError('Маршрут относится к другому шаблону.')
             if flow['purpose'] == 'routes':
+                flow['route_id'] = row['id']
                 await _show(callback, *_route_screen(row))
             else:
                 flow.update(route_id=row['id'], variables={}, field_index=0)
+                flow.pop('variant_id', None)
+                variants = VariantService(store, routes)
+                if await asyncio.to_thread(variants.list, row['id'], limit=1):
+                    await _variant_picker(callback, user_id, variants)
+                else:
+                    await _wizard_prompt(callback.message, user_id, flow, templates)
+        elif command in {'variantpage', 'variantpick'}:
+            flow = _active(user_id)
+            if flow.get('purpose') != 'single' or not flow.get('route_id'):
+                raise ValueError('Выберите игру.')
+            variants = VariantService(store, routes)
+            if command == 'variantpage':
+                await _variant_picker(callback, user_id, variants, int(parts[2]))
+            else:
+                variant = None if parts[2] == 'base' else await asyncio.to_thread(variants.get, parts[2])
+                if variant is not None and variant['route_id'] != flow['route_id']:
+                    raise ValueError('Вариант другого маршрута.')
+                flow.update(variables={}, field_index=0)
+                flow.pop('variant_id', None)
+                if variant is not None:
+                    flow['variant_id'] = variant['id']
                 await _wizard_prompt(callback.message, user_id, flow, templates)
+        elif command == 'variants':
+            flow = _active(user_id)
+            flow.pop('variant_pending', None)
+            row = await asyncio.to_thread(routes.resolve_route, parts[2])
+            if flow.get('purpose') != 'routes' or row['template_id'] != flow['template_id']:
+                raise ValueError('Откройте Game Routes.')
+            flow['route_id'] = row['id']
+            offset = int(parts[3])
+            rows = await asyncio.to_thread(VariantService(store, routes).list, row['id'],
+                                           limit=_PAGE + 1, offset=offset, enabled_only=False)
+            keyboard = [[(('✅ ' if v['enabled'] else '⏸ ') + v['display_name'][:45],
+                          f"prd:variantedit:{v['id']}")] for v in rows[:_PAGE]]
+            for buttons, variant in zip(keyboard, rows):
+                if variant['enabled']:
+                    buttons.append(('⏸', f"prd:variantdisable:{variant['id']}:{variant['revision']}"))
+            keyboard += _page_buttons(f"prd:variants:{row['id']}", offset, len(rows) > _PAGE)
+            keyboard += [[('➕ Новый variant', 'prd:variantnew')], [('🔙 Route', f"prd:route:{row['id']}")]]
+            await _show(callback, '🎚 <b>Варианты / Editions</b>\n'
+                        'Без варианта используются прежние defaults. Отключение сохраняет старые drafts.', _menu(keyboard))
+        elif command in {'variantedit', 'variantnew'}:
+            flow = _active(user_id)
+            if flow.get('purpose') != 'routes' or not flow.get('route_id'):
+                raise ValueError('Откройте Game Routes.')
+            old = None if command == 'variantnew' else await asyncio.to_thread(
+                VariantService(store, routes).get, parts[2], enabled_only=False)
+            if old is not None and old['route_id'] != flow['route_id']:
+                raise ValueError('Вариант другого маршрута.')
+            flow['variant_edit'] = old
+            flow.pop('variant_pending', None)
+            body = old or {'template_id': flow['template_id'], 'route_id': flow['route_id'],
+                'display_name': 'Deluxe', 'aliases': ['Deluxe Edition', 'DE'], 'enabled': True,
+                'overrides': {'variables': {'edition': 'Deluxe Edition'}, 'emoji': '⭐'}}
+            _pending(user_id, flow, 'variantedit')
+            await callback.message.answer('Отправьте полный JSON variant. overrides: variables, emoji, '
+                'title_ru/en, description_ru/en. Необязательный route_override_url — '
+                'подтверждённый раздел той же игры. enabled=false отключает variant.\n'
+                'Сначала preview, затем подтверждение.', parse_mode=None)
+            await _plain_chunks(callback.message, json.dumps(body, ensure_ascii=False, indent=2))
+            if old is not None and old['enabled']:
+                await callback.message.answer('Отключить variant для новых drafts?', reply_markup=_menu([
+                    [('⏸ Отключить', f"prd:variantdisable:{old['id']}:{old['revision']}")]]))
+        elif command == 'variantdisable':
+            flow = _active(user_id)
+            old = await asyncio.to_thread(store.get_variant, parts[2])
+            if (not old or flow.get('purpose') != 'routes' or old['route_id'] != flow.get('route_id')
+                    or old['revision'] != int(parts[3])):
+                raise ValueError('Экран устарел.')
+            saved = await asyncio.to_thread(VariantService(store, routes).disable, old['id'], old['revision'])
+            flow.pop('variant_edit', None)
+            flow.pop('variant_pending', None)
+            await callback.message.answer('⏸ Variant отключён; сохранённые drafts остаются.', reply_markup=_menu([
+                [('Варианты', f"prd:variants:{saved['route_id']}:0")]]))
+        elif command == 'variantsave':
+            flow = _active(user_id)
+            body = flow['variant_pending']; old = flow.get('variant_edit')
+            if body['route_id'] != flow['route_id']:
+                raise ValueError('Вариант другого маршрута.')
+            saved = await asyncio.to_thread(VariantService(store, routes).save, body,
+                old['id'] if old else None, old['revision'] if old else None)
+            flow.pop('variant_pending', None)
+            ui._interaction_state.pop(user_id, None)
+            await callback.message.answer('✅ Variant сохранён локально.', reply_markup=_menu([
+                [('Варианты', f"prd:variants:{saved['route_id']}:0")]]))
         elif command in {'routeimport', 'catalog', 'own'}:
             flow = _active(user_id)
             if flow['purpose'] != 'routes':
@@ -461,11 +572,12 @@ async def _products_input(message, user_id):
             if await _wizard_prompt(message, user_id, flow, templates):
                 if flow['purpose'] == 'bulk':
                     _pending(user_id, flow, 'massdrafts')
-                    await message.answer('До 100 строк: Game | price\n'
+                    await message.answer('До 100 строк: Game | price или Game | variant | price\n'
                         'Дополнительно: | region=EU | emoji=⚔️\n'
                         'Пример: Elden Ring | 29.99\nСначала summary, затем явное сохранение.')
                 else:
-                    preview = await asyncio.to_thread(drafts.create_preview, flow['template_id'], flow['route_id'], flow['variables'], flow.get('price'))
+                    preview = await asyncio.to_thread(drafts.create_preview, flow['template_id'], flow['route_id'],
+                                                      flow['variables'], flow.get('price'), variant_id=flow.get('variant_id'))
                     flow.update(preview=preview, dirty=True)
                     ui._interaction_state.pop(user_id, None)
                     text, markup = _preview_screen(flow)
@@ -484,7 +596,7 @@ async def _products_input(message, user_id):
             warnings = sum(row.get('status') in {'duplicate', 'warning'} for row in preview['errors'])
             details = (f"Строк: {len(preview['previews']) + len(preview['errors'])}\n"
                        f"Ready: {len(preview['previews'])}; warnings: {warnings}; errors: {len(preview['errors']) - warnings}\n" +
-                       '\n'.join(f"✅ {row['game'][:45]} · {row['payload']['price']} · node {row['node']}"
+                       '\n'.join(f"✅ {row['game'][:35]} · {row.get('variant_name', 'defaults')[:30]} · {row['payload']['price']} · node {row['node']}"
                                  for row in preview['previews'][:6]) + '\n' +
                        '\n'.join(f"⚠ Строка {row['line']}: {row['error'][:70]}" for row in preview['errors'][:6]))
             if len(preview['previews']) > 6 or len(preview['errors']) > 6:
@@ -514,6 +626,18 @@ async def _products_input(message, user_id):
             ui._interaction_state.pop(user_id, None)
             await message.answer(f"✅ Template сохранён: {saved['name']}", parse_mode=None,
                                  reply_markup=_menu([[('Templates', 'prd:templates:0')]]))
+        elif step == 'variantedit':
+            body = json.loads(value)
+            if not isinstance(body, dict) or body.get('route_id') != flow['route_id'] or body.get('template_id') != flow['template_id']:
+                raise ValueError('Вариант другого маршрута.')
+            # Verify overrides and the optional catalogue node before asking to confirm.
+            body = await asyncio.to_thread(VariantService(store, routes).prepare, body)
+            flow['variant_pending'] = body
+            ui._interaction_state.pop(user_id, None)
+            await _plain_chunks(message, json.dumps(body, ensure_ascii=False, indent=2))
+            await message.answer('Сохранить variant локально?', reply_markup=_menu([
+                [('✅ Сохранить variant', 'prd:variantsave')],
+                [('❌ Cancel', f"prd:variants:{flow['route_id']}:0")]]))
         elif step == 'draftedit':
             field = flow['edit_field']; overrides = {}; variables = None; price = None
             if field == 'price':

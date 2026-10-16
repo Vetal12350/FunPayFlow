@@ -27,7 +27,7 @@ def test_preexisting_database_migration_and_legacy_reader_compatibility(tmp_path
     old.initialize()  # Settle the existing review-receipt backfill before this migration.
     with closing(sqlite3.connect(path)) as db, db:
         # Simulate the old DB: every original table is retained with its real schema.
-        for table in ('product_batches', 'product_drafts', 'game_routes', 'product_templates'):
+        for table in ('product_variants', 'product_batches', 'product_drafts', 'game_routes', 'product_templates'):
             db.execute('DROP TABLE ' + table)
         before = snapshot(db)
     upgraded = ReviewReceiptStore(path)
@@ -40,7 +40,7 @@ def test_preexisting_database_migration_and_legacy_reader_compatibility(tmp_path
             name: {'schema_same': after[name][0] == value[0],
                    'old_rows': len(value[1]), 'new_rows': len(after[name][1])}
             for name, value in before.items() if after[name] != value}
-        assert set(after) - set(before) == {'product_templates', 'game_routes', 'product_drafts', 'product_batches'}
+        assert set(after) - set(before) == {'product_templates', 'game_routes', 'product_drafts', 'product_batches', 'product_variants'}
         assert db.execute('PRAGMA quick_check').fetchall() == [('ok',)]
     # Existing-reader contracts still work after new registry records are added.
     assert old.get_lot_template_draft('1', legacy['draft_id']) == legacy

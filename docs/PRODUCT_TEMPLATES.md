@@ -6,7 +6,7 @@
 
 Владелец открывает `📦 Лоты`:
 
-- **Создать:** template → поиск/страница/recent game route → переменные → цена → RU/EN preview → сохранить draft.
+- **Создать:** template → поиск/страница/recent game route → variant (если есть) → переменные → цена → RU/EN preview → сохранить draft.
 - **Массовые drafts:** template → общие переменные → строки `Game | price` → summary → подтвердить готовые строки.
 - **Game Routes:** template → собственный лот, URL или cached catalog → preview → подтвердить.
 - **Product Templates:** список и полный JSON editor. При создании копии поменять internal `name`.
@@ -26,7 +26,25 @@ Preview сокращает длинные поля, но «Полный RU/EN» 
 
 Defaults GAME_KEY: platform Steam, region Global, edition Standard, quantity 1. `game` фиксируется route; `product_name` по умолчанию равен игре и редактируется отдельно. В wizard «-» оставляет default; цена обязательна.
 
-Emoji: **draft override > route override > template default**. Встроенный default — 🔑. Emoji входит в оба итоговых заголовка, а не только в UI. Явные текстовые overrides имеют тот же приоритет. Draft хранит template snapshot: последующее изменение template не переписывает уже подготовленный текст.
+Emoji: **draft override > variant override > route override > template default**. Встроенный default — 🔑. Emoji входит в оба итоговых заголовка, а не только в UI. Явные текстовые overrides имеют тот же приоритет. Draft хранит template snapshot: последующее изменение template не переписывает уже подготовленный текст.
+
+## Product Variants / Editions
+
+Variant — необязательная scoped запись для **template + родительский route**, без копирования всего template. Хранит stable ID, `display_name`, `aliases`, `enabled`, `overrides`, необязательный `route_override`, timestamps и revision. `overrides` поддерживает `variables` (defaults), `emoji` и отдельные `title_ru`, `title_en`, `description_ru`, `description_en` с теми же безопасными placeholders.
+
+Наследование: **draft > variant > parent route > template**. Если variant не переопределяет текст, используется базовый текст с variant variables. Оба языка обязательны в итоговом draft. Явно введённые wizard/row variables выше variant defaults; «-» оставляет наследуемое значение. Черновик сохраняет variant snapshot: изменение/отключение variant не переписывает подготовленный draft. Проверка node по актуальному кешу сохраняется при редактировании.
+
+Пример: один GAME_KEY и один Elden Ring route. Без variant действуют прежние defaults (edition Standard, emoji 🔑). Deluxe variant задаёт `edition=Deluxe Edition`, `emoji=⭐`; тот же template/route формирует Deluxe RU/EN. Draft override `emoji=🎁` имеет приоритет над ⭐. Отдельные GameRoute и ProductTemplate для Standard/Deluxe не нужны.
+
+В Telegram: Game Routes → route → «Варианты / Editions». Создание/редактирование через небольшой JSON editor, preview и явное сохранение. `enabled=false` либо ⏸ отключает variant для новых drafts без удаления старых записей. При выборе игры показываются enabled variants с пагинацией и кнопкой «Без варианта / defaults». Без variants дополнительного шага нет. Поиск имени/alias в массовом вводе точный, Unicode case-insensitive; конфликтующие aliases дают ошибку строки, без угадывания.
+
+Для другого раздела **той же игры** editor принимает `route_override_url` — явный URL подтверждённого COMMON node. Он преобразуется в безопасный snapshot `template_id/game_name/node_id/section_name/metadata`; исходный route остаётся единственным и не меняется. При замене уже сохранённого override удалить прежний `route_override` и указать новый URL; `route_override=null` возвращает родительский node. Другие игры, неподтверждённые nodes и service/hidden fields отклоняются. При stale template/catalogue variant можно безопасно отключить отдельной кнопкой ⏸.
+
+Пример JSON (идентификаторы template/route берутся из editor):
+
+```json
+{"template_id":"GAME_KEY","route_id":"example-route","display_name":"Deluxe","aliases":["Deluxe Edition","DE"],"enabled":true,"overrides":{"variables":{"edition":"Deluxe Edition"},"emoji":"⭐"}}
+```
 
 ## Routes и каталог
 
@@ -54,14 +72,15 @@ Drafts:
 ```text
 Game A | 29.99
 Game B | 24.99 | region=EU | emoji=🎁
+Game A | Deluxe | 39.99
 ```
 
-Общие variables берутся из wizard; per-row значения имеют приоритет. Идентичные route+payload внутри пакета пропускаются как duplicate; разные цены/варианты остаются отдельными drafts. Цена сохраняется десятичной строкой, без валютного пересчёта и без влияния на продажи/оборот.
+Общие variables берутся из wizard; per-row значения имеют приоритет. Форматы: `Game | price` и `Game | variant name/alias | price`, затем optional `key=value`. Без variant сохраняется прежнее поведение, даже если у игры есть variants. Неизвестный/disabled/неоднозначный variant даёт ошибку строки, остальные строки продолжают обрабатываться. Идентичные route+variant+node+payload внутри пакета пропускаются как duplicate; разные цены/варианты/nodes остаются отдельными drafts. Цена сохраняется десятичной строкой, без валютного пересчёта и без влияния на продажи/оборот.
 
 Ограничения: 100 строк, batch до 2 MB, title до 200 символов с emoji, description до 10 000, variable до 500. Telegram имеет собственный лимит одного входящего сообщения; большие списки следует разбивать на пакеты. Favorites/pinned UI не реализован; есть search, pagination и recent по последним сохранённым drafts.
 
 ## Persistence и compatibility
 
-Таблицы `product_templates`, `game_routes`, `product_drafts`, `product_batches` добавляются в существующую `state.sqlite3` через `ReviewReceiptStore.initialize()`. Новая БД не создаётся. Существующие таблицы/данные и старые lot drafts не заменяются. Подтверждение пакета атомарно, с per-row savepoints и сохранённым результатом для повторного callback. SQLite/network транзакции не смешиваются: новые batch writes вообще не вызывают HTTP.
+Таблицы `product_templates`, `game_routes`, `product_drafts`, `product_batches`, `product_variants` добавляются в существующую `state.sqlite3` через `ReviewReceiptStore.initialize()`. Variant migration добавляет только таблицу/индексы; старые templates/routes/drafts и pending batches не переписываются. Новая БД не создаётся. Существующие таблицы/данные и старые lot drafts не заменяются. Подтверждение пакета атомарно, с per-row savepoints и сохранённым результатом для повторного callback. SQLite/network транзакции не смешиваются: новые batch writes вообще не вызывают HTTP.
 
 Для настоящего Publish отдельно нужны доказанный fresh create-form contract, безопасная сборка только разрешённых пользовательских полей, durable dispatch/UNKNOWN handling и строгая remote verification. Этот пакет их не включает.
