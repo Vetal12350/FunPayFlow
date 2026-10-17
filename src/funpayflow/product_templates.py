@@ -125,6 +125,19 @@ def _validate_tokens(text, allowed):
     return names
 
 
+def validate_variable_value(template, variable, value):
+    """Validate one picker/custom input against the same renderer constraints."""
+    if variable == 'game' or variable not in template['allowed_variables']:
+        raise ProductValidationError('variable: not editable')
+    value = _variables({variable: value}, template['allowed_variables'])[variable]
+    rule = template['validation_rules'].get(variable, {})
+    if not rule.get('min_length', 0) <= len(value) <= rule.get('max_length', 500):
+        raise ProductValidationError('variable: length rule failed')
+    if 'choices' in rule and value not in rule['choices']:
+        raise ProductValidationError('variable: value is not an allowed choice')
+    return value
+
+
 @dataclass(frozen=True)
 class ProductTemplate:
     definition: dict

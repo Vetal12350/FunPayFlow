@@ -51,6 +51,8 @@ class DraftService:
         allowed = template["allowed_variables"]
         if not isinstance(variables, dict):
             raise ProductValidationError("variables: object required")
+        variables = validate_overrides({"variables": variables}, allowed)["variables"]
+        parent_route = deepcopy(route)
         if variant is not None:
             route = self.variants.resolve_route(variant, route, template=template)
         route_overrides = validate_overrides(route.get("overrides") or {}, allowed)
@@ -77,6 +79,9 @@ class DraftService:
             "node": route["node_id"], "section": route["section_name"],
             "emoji": rendered["emoji"], "variables": rendered["variables"],
             "overrides": deepcopy(draft_overrides),
+            "input_variables": deepcopy(variables),
+            "route_revision": parent_route.get("revision", 1),
+            "route_snapshot": parent_route,
             "payload": {key: rendered[key] for key in ("title_ru", "title_en", "description_ru", "description_en")}
                        | {"price": validate_price(price), "amount": int(quantity)},
         }
@@ -85,6 +90,48 @@ class DraftService:
                           variant_snapshot=deepcopy(variant))
         return result
 
+    def variable_input(self, preview):
+        """Return explicit inputs, never promote known inherited defaults to inputs.
+
+        Old drafts lack provenance. Preserve marked overrides and values differing
+        from their snapshot defaults; values equal to a default remain inherited.
+        """
+        if "input_variables" in preview:
+            values = deepcopy(preview["input_variables"])
+        else:
+            template = preview["template_snapshot"]
+            route = preview.get("route_snapshot") or self._route(preview["route_id"], preview["template_id"])
+            inherited = {**template["defaults"], "product_name": route["game_name"],
+                         "game": route["game_name"], **route.get("overrides", {}).get("variables", {}),
+                         **preview.get("variant_snapshot", {}).get("overrides", {}).get("variables", {})}
+            values = {key: value for key, value in preview["variables"].items()
+                      if inherited.get(key) != value}
+        values.update(preview.get("overrides", {}).get("variables", {}))
+        return values
+
+    @staticmethod
+    def input_warnings(preview):
+        if "input_variables" not in preview:
+            return ["Legacy draft has no input provenance; values equal to inherited defaults remain inherited. Review all variables."]
+        return []
+
+    def clone_preview(self, draft_id, expected_revision):
+        """Create an unsaved preview from a scoped, current persisted source."""
+        source = self.store.get_draft(draft_id)
+        if (type(expected_revision) is not int or expected_revision < 1 or source is None
+                or source.get("revision") != expected_revision or source.get("status") == "cancelled"):
+            raise ProductValidationError("source draft changed, cancelled or not found; refresh the draft list")
+        return self._canonical_preview(source, source.get("variant_id"))
+
+    def _canonical_preview(self, preview, variant_id):
+        return self.create_preview(preview["template_id"], preview["route_id"],
+                                   variables=self.variable_input(preview), price=preview["payload"]["price"],
+                                   overrides=deepcopy(preview.get("overrides", {})), variant_id=variant_id)
+
+    def switch_variant(self, preview, variant_id):
+        """Reapply explicit inputs to the selected current canonical variant."""
+        return self._canonical_preview(preview, variant_id)
+
     def rebuild(self, preview, *, price=None, overrides=None, variables=None):
         """Regenerate with the reviewed template snapshot and current verified route."""
         template = deepcopy(preview["template_snapshot"])
@@ -92,9 +139,9 @@ class DraftService:
         merged = {**preview.get("overrides", {}), **(overrides or {})}
         merged["variables"] = {**preview.get("overrides", {}).get("variables", {}),
                                **(overrides or {}).get("variables", {})}
-        values = {**preview["variables"], **(variables or {})}
+        values = {**preview.get("input_variables", preview["variables"]), **(variables or {})}
         variant = preview.get("variant_snapshot")
-        if variant is not None:
+        if variant is not None and "input_variables" not in preview:
             # Inherited rendered values must not become explicit draft overrides on rebuild.
             values = {**merged.get("variables", {}), **(variables or {})}
         # An explicit variable edit replaces earlier variable overrides as well.
@@ -102,8 +149,13 @@ class DraftService:
             merged["variables"].pop(key, None)
         if not merged["variables"] and "variables" not in preview.get("overrides", {}) and "variables" not in (overrides or {}):
             merged.pop("variables")
-        return self._render(template, route, values,
-                            preview["payload"]["price"] if price is None else price, merged, variant)
+        result = self._render(template, route, values,
+                              preview["payload"]["price"] if price is None else price, merged, variant)
+        if "input_variables" not in preview:
+            # Existing reviewed previews/batches keep their original wire shape.
+            for key in ("input_variables", "route_revision", "route_snapshot"):
+                result.pop(key, None)
+        return result
 
     def preview_bulk(self, template_id, text, common=None):
         """Rows: Game | [explicit variant |] price [| variable=value | emoji=value]."""

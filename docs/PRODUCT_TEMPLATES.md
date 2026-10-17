@@ -26,6 +26,16 @@ Preview сокращает длинные поля, но «Полный RU/EN» 
 
 Defaults GAME_KEY: platform Steam, region Global, edition Standard, quantity 1. `game` фиксируется route; `product_name` по умолчанию равен игре и редактируется отдельно. В wizard «-» оставляет default; цена обязательна.
 
+Variables используют гибридный UI: `validation_rules.<variable>.choices` — уже существующий строгий enum и источник кнопок с пагинацией. Без enum можно кнопкой оставить известное inherited/default значение (в GAME_KEY это Steam / Global / Standard). Списки платформ/регионов не угадываются и не извлекаются из FunPay filters. Route/variant поддерживают defaults через `overrides.variables`, но отдельных choices/constraints у них сейчас нет; recent-value registry не добавлялся. «Другое» открывает text input с теми же enum/length/type checks; строгий enum не обходится custom вводом. Свободные поля без defaults/enum остаются текстовыми. Quantity — variable с editor ±1/10, presets, custom и Done, диапазон 1..999999999. Цена — прежний decimal input. Старый ввод «-» продолжает работать.
+
+## Создать похожий
+
+После сохранения и в карточке сохранённого draft доступно «📑 Создать похожий». Общий `DraftService.clone_preview` проверяет scope/source revision и current route/template/enabled variant, затем создаёт только transient preview. Новый ID/revision появляются при Save; исходник, его status и timestamps не меняются. При stale/conflicting route UI предлагает выбрать актуальный маршрут через существующее «Создать».
+
+Compact editor строит variable buttons из `allowed_variables` текущего template (кроме фиксированного `game`), содержит variant selector при наличии вариантов, цену, preview, save и cancel. Variant switch заново рендерит current canonical template → route → variant → explicit draft overrides. Новое JSON metadata `input_variables` отличает explicit inputs от resolved `variables`; `route_snapshot`/revision позволяют отличать наследование. Rendered RU/EN тексты и inherited emoji/defaults не становятся draft overrides. Явные emoji/text/variable overrides сохраняются. Schema SQLite не меняется.
+
+Legacy drafts без input provenance продолжают открываться/редактироваться и staging сохраняет старую форму данных. При clone переносим явно маркированные overrides и значения, отличающиеся от доступных inherited defaults; равные defaults оставляем inherited. Полностью восстановить историю ввода без старого route snapshot невозможно, поэтому UI показывает предупреждение проверить variables. Каждый clone использует current definitions, а не старый rendered snapshot; UI сообщает об этом. Отмена несохранённого clone ничего не записывает и не отменяет source. Save идемпотентен в рамках flow/batch; можно снова создать похожий с новым ID. Saved-list labels показывают короткие game/edition/region/platform/price/quantity summaries. Stateful picker/variant/clone callbacks проверяют token/context до сброса активного ввода; старые безtoken variant buttons отклоняются.
+
 Emoji: **draft override > variant override > route override > template default**. Встроенный default — 🔑. Emoji входит в оба итоговых заголовка, а не только в UI. Явные текстовые overrides имеют тот же приоритет. Draft хранит template snapshot: последующее изменение template не переписывает уже подготовленный текст.
 
 ## Product Variants / Editions

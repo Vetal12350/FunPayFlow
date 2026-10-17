@@ -161,7 +161,7 @@ def test_telegram_variant_pick_and_preview(context):
         await view.products_callback(cb, 'prd:route:' + route['id'], 1)
         assert 'Выберите вариант' in str(cb.message.edit_text.call_args)
         assert not view._flows[1].get('step')
-        await view.products_callback(cb, 'prd:variantpick:' + deluxe['id'], 1)
+        await view.products_callback(cb, 'prd:vp:' + view._flows[1]['variant_picker']['token'] + ':pick:' + deluxe['id'], 1)
         for _ in range(5):
             await view.products_input(message('-'), 1)
         await view.products_input(message('39.99'), 1)
@@ -223,10 +223,10 @@ def test_telegram_variant_pagination_and_implicit_default(context):
     async def run():
         cb = await pick(ctx)
         await view.products_callback(cb, 'prd:route:' + route['id'], 1)
-        assert 'prd:variantpage:8' in str(cb.message.edit_text.call_args)
-        await view.products_callback(cb, 'prd:variantpage:8', 1)
-        assert 'prd:variantpage:0' in str(cb.message.edit_text.call_args)
-        await view.products_callback(cb, 'prd:variantpick:base', 1)
+        assert 'prd:vp:' + view._flows[1]['variant_picker']['token'] + ':page:8' in str(cb.message.edit_text.call_args)
+        await view.products_callback(cb, 'prd:vp:' + view._flows[1]['variant_picker']['token'] + ':page:8', 1)
+        assert 'prd:vp:' + view._flows[1]['variant_picker']['token'] + ':page:0' in str(cb.message.edit_text.call_args)
+        await view.products_callback(cb, 'prd:vp:' + view._flows[1]['variant_picker']['token'] + ':pick:base', 1)
         for _ in range(5):
             await view.products_input(message('-'), 1)
         await view.products_input(message('29.99'), 1)
@@ -280,12 +280,13 @@ def test_integrated_search_deluxe_and_disabled_variant_callback(context):
         assert 'Elden Ring' in str(cb.message.edit_text.call_args)
         await ui.callback_handler(callback('prd:route:' + route['id']))
         VariantService(ctx.store, ctx.routes).disable(deluxe['id'], deluxe['revision'])
-        await ui.callback_handler(callback('prd:variantpick:' + deluxe['id']))
+        await ui.callback_handler(callback('prd:vp:' + view._flows[1]['variant_picker']['token'] + ':pick:' + deluxe['id']))
         assert 'variant_id' not in view._flows[1]
         assert not ctx.store.list_drafts()
         disabled = ctx.store.get_variant(deluxe['id'])
         VariantService(ctx.store, ctx.routes).save(dict(disabled, enabled=True), disabled['id'], disabled['revision'])
-        await ui.callback_handler(callback('prd:variantpick:' + deluxe['id']))
+        await ui.callback_handler(callback('prd:route:' + route['id']))
+        await ui.callback_handler(callback('prd:vp:' + view._flows[1]['variant_picker']['token'] + ':pick:' + deluxe['id']))
         for _ in range(5):
             await ui.text_handler(message('-'))
         await ui.text_handler(message('39.99'))
