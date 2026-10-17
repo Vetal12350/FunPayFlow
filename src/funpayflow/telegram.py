@@ -364,6 +364,9 @@ _restart_confirmations: dict[int, str] = {}
 _night_mode_state_lock = threading.Lock()
 _night_reply_echoes = deque([NIGHT_MODE_MESSAGE_TEXT, NIGHT_MODE_ORDER_TEXT], maxlen=8)
 _interaction_state: dict[int, dict] = {}
+# Schedule editors never share pending text input with Product or other dialogs.
+_schedule_sessions: dict[int, dict] = {}
+_schedule_locks: dict[int, asyncio.Lock] = {}
 _sales_import_lock = asyncio.Lock()
 _sales_import_session: dict | None = None
 _MAX_SALES_ZIP_BYTES = 19_000_000
@@ -690,10 +693,13 @@ def autobump_schedule_allows_now() -> bool:
     return allows_now(schedule)
 
 
-def save_autobump_schedule(value: dict) -> None:
+def save_autobump_schedule(value: dict, *, expected: tuple[dict, int] | None = None) -> None:
     global _autobump_state_version
     schedule = normalize_schedule(value)
     with _autobump_state_lock:
+        if expected is not None and (bot_settings["autobump_schedule"] != expected[0]
+                                     or _autobump_state_version != expected[1]):
+            raise ValueError("Schedule settings changed while editing")
         previous = bot_settings["autobump_schedule"]
         bot_settings["autobump_schedule"] = schedule
         try:
@@ -2341,6 +2347,7 @@ NOTIFICATIONS_MENU_TEXT = "🔔 <b>Мои настройки уведомлен�
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
     user_id = message.from_user.id
+    _discard_schedule_editor(user_id)
     from .telegram_products import discard_session
     discard_session(user_id)
     if (_sales_import_session is not None
@@ -2462,77 +2469,140 @@ async def cmd_log(message: Message):
     await _send_log_file(message, date_str)
 
 
-def _autobump_schedule_screen():
-    schedule = normalize_schedule(bot_settings["autobump_schedule"])
-    text = ("🕒 <b>Расписание автоподнятия</b>\n"
-            f"Пользователь: {on_icon(bot_settings['auto_bump'])}\n"
-            f"Расписание: {on_icon(schedule['enabled'])}\n"
-            f"Окно: {schedule['start']} → {schedule['stop']}\n"
-            f"Часовой пояс: {escape(schedule['timezone'])}\n"
-            f"Сейчас разрешено расписанием: {on_icon(allows_now(schedule))}\n\n"
-            "Ручное выключение имеет приоритет. Остальные функции работают круглосуточно.")
+def _discard_schedule_editor(user_id: int) -> None:
+    _schedule_sessions.pop(user_id, None)
+    if _interaction_state.get(user_id, {}).get("action") == "bump_schedule_edit":
+        _interaction_state.pop(user_id, None)
+
+
+def _schedule_session(user_id: int, field: str | None = None) -> dict:
+    with _autobump_state_lock:
+        base = dict(bot_settings["autobump_schedule"])
+        version = _autobump_state_version
+    session = {"token": secrets.token_hex(8), "revision": 0, "field": field,
+               "base": base, "version": version}
+    if field:
+        hour, minute = map(int, base[field].split(":"))
+        session["minute"] = hour * 60 + minute
+    _schedule_sessions[user_id] = session
+    return session
+
+
+def _schedule_action(session: dict, action: str) -> str:
+    return f"bump_schedule:{session['token']}:{session['revision']}:{action}"
+
+
+def _autobump_schedule_screen(session: dict | None = None):
+    with _autobump_state_lock:
+        schedule = normalize_schedule(bot_settings["autobump_schedule"])
+        user_enabled = bot_settings["auto_bump"]
+    start = sum(int(x) * scale for x, scale in zip(schedule["start"].split(":"), (60, 1)))
+    stop = sum(int(x) * scale for x, scale in zip(schedule["stop"].split(":"), (60, 1)))
+    duration = (stop - start) % 1440
+    hours, minutes = divmod(duration, 60)
+    duration_text = (f"{hours} ч" if hours else "") + (f" {minutes} мин" if minutes else "")
+    overnight = " следующего дня" if stop < start else ""
+    text = ("🕒 <b>Расписание автоподнятия</b>\n\n"
+            f"Статус: {'✅ Включено' if schedule['enabled'] else '❌ Выключено'}\n"
+            f"🌅 Начало: {schedule['start']}\n🌙 Конец: {schedule['stop']}\n"
+            f"🌍 {escape(schedule['timezone'])}\n\n"
+            f"Работает: {schedule['start']} → {schedule['stop']}{overnight} ({duration_text.strip()})\n"
+            f"Перерыв: {schedule['stop']} → {schedule['start']}\n"
+            f"Ручное автоподнятие: {on_icon(user_enabled)}\n\n"
+            "При выключенном расписании время не ограничено. Ручное выключение имеет приоритет. "
+            "Остальные функции работают круглосуточно.")
+    # Without a live session this renderer exposes no mutation callbacks.
+    action = lambda value: _schedule_action(session, value) if session else "bump_schedule"
     return text, _menu([
-        [_button("Включить / выключить расписание", "bump_schedule:toggle")],
-        [_button("Изменить время и часовой пояс", "bump_schedule:edit")],
-        [_button("🔙 Главное меню", "menu_main")],
+        [_button(f"🌅 Начало: {schedule['start']}", action("start"))],
+        [_button(f"🌙 Конец: {schedule['stop']}", action("stop"))],
+        [_button("✅ Расписание: ВКЛ" if schedule["enabled"] else "❌ Расписание: ВЫКЛ", action("toggle"))],
+        [_button("↩️ Назад", action("back"))],
     ])
+
+
+def _schedule_editor_screen(session: dict):
+    title = "🌅 Начало" if session["field"] == "start" else "🌙 Конец"
+    hour, minute = divmod(session["minute"], 60)
+    action = lambda value: _schedule_action(session, value)
+    rows = [[_button(left, action(f"add{ -delta}")), _button(right, action(f"add{delta}"))]
+            for delta, left, right in [(60, "−1 ч", "+1 ч"),
+                                       (15, "−15 мин", "+15 мин"), (5, "−5 мин", "+5 мин")]]
+    rows += [[_button(f"{minute:02}", action(f"minute{minute}")) for minute in (0, 15, 30, 45)],
+             [_button("✅ Сохранить", action("save"))],
+             [_button("❌ Отмена", action("cancel"))],
+             [_button("↩️ Назад", action("back"))]]
+    return (f"{title} автоподнятия\n\nТекущее: <b>{hour:02}:{minute:02}</b>\n\n"
+            "Изменения применяются только после сохранения.", _menu(rows))
 
 
 async def _autobump_schedule_callback(callback, action, user_id):
     if not action.startswith("bump_schedule"):
         return False
-    if not _owner_id(user_id):
-        await callback.answer("Только владелец может менять расписание.", show_alert=True)
-        return True
-    try:
-        if action == "bump_schedule:toggle":
-            schedule = dict(bot_settings["autobump_schedule"])
-            schedule["enabled"] = not schedule["enabled"]
-            save_autobump_schedule(schedule)
-        elif action == "bump_schedule:edit":
-            _interaction_state[user_id] = {"action": "bump_schedule_edit"}
-            await callback.answer()
-            await callback.message.answer(
-                "Отправьте начало, конец и часовой пояс, например:\n"
-                "07:00 01:00 Europe/Moscow\n"
-                "Поддерживается только Europe/Moscow (UTC+3).\n"
-                "Начало включительно, конец не включительно; одинаковое время запрещено.\n"
-                "❌ Отмена — выйти без сохранения.")
+    async with _schedule_locks.setdefault(user_id, asyncio.Lock()):
+        if not _owner_id(user_id) or not module_enabled("autobump"):
+            _discard_schedule_editor(user_id)
+            await callback.answer("Изменение расписания недоступно.", show_alert=True)
             return True
-        elif action != "bump_schedule":
-            await callback.answer("Действие больше недоступно.")
-            return True
-    except (ValueError, RuntimeError):
-        await callback.answer("Не удалось сохранить расписание. Состояние не изменено.", show_alert=True)
-        return True
-    await callback.answer()
-    text, markup = _autobump_schedule_screen()
-    await _edit_or_keep_menu(callback.message, text, markup)
+        if action == "bump_schedule":
+            from .telegram_products import discard_session
+            discard_session(user_id)
+            _interaction_state.pop(user_id, None)
+            session = _schedule_session(user_id)
+        else:
+            parts = action.split(":")
+            session = _schedule_sessions.get(user_id)
+            if (len(parts) != 4 or session is None or parts[1] != session["token"]
+                    or parts[2] != str(session["revision"])):
+                await callback.answer("Кнопка устарела. Откройте расписание заново.")
+                return True
+            operation = parts[3]
+            field = session["field"]
+            if field is None and operation in {"start", "stop"}:
+                session = _schedule_session(user_id, operation)
+            elif operation in {"cancel", "back"}:
+                _discard_schedule_editor(user_id)
+                if field is None:
+                    await callback.answer()
+                    await _edit_or_keep_menu(callback.message, MAIN_MENU_TEXT, get_main_keyboard(user_id))
+                    return True
+                session = _schedule_session(user_id)
+            elif (field is None and operation == "toggle") or (field is not None and operation == "save"):
+                # Consume before persistence/await: repeated Save/toggle cannot repeat a write.
+                _discard_schedule_editor(user_id)
+                value = dict(session["base"])
+                if field is None:
+                    value["enabled"] = not value["enabled"]
+                else:
+                    hour, minute = divmod(session["minute"], 60)
+                    value[field] = f"{hour:02}:{minute:02}"
+                try:
+                    save_autobump_schedule(value, expected=(session["base"], session["version"]))
+                except (ValueError, RuntimeError):
+                    await callback.answer("Не сохранено: настройки изменились, время совпадает или запись недоступна. Откройте расписание заново.", show_alert=True)
+                    return True
+                session = _schedule_session(user_id)
+            elif field is not None and operation in {"add-60", "add60", "add-15", "add15", "add-5", "add5"}:
+                session["minute"] = (session["minute"] + int(operation[3:])) % 1440
+                session["revision"] += 1
+            elif field is not None and operation in {"minute0", "minute15", "minute30", "minute45"}:
+                session["minute"] = session["minute"] // 60 * 60 + int(operation[6:])
+                session["revision"] += 1
+            else:
+                await callback.answer("Действие больше недоступно.")
+                return True
+        await callback.answer()
+        text, markup = (_schedule_editor_screen(session) if session["field"]
+                        else _autobump_schedule_screen(session))
+        await _edit_or_keep_menu(callback.message, text, markup)
     return True
 
 
 async def _autobump_schedule_input(message, user_id):
     if _interaction_state.get(user_id, {}).get("action") != "bump_schedule_edit":
         return False
-    if not _owner_id(user_id) or not module_enabled("autobump"):
-        _interaction_state.pop(user_id, None)
-        await message.answer("Изменение расписания недоступно.")
-        return True
-    if (message.text or "").startswith("/"):
-        _interaction_state.pop(user_id, None)
-        await message.answer("Изменение расписания отменено. Команда не сохранена.")
-        return True
-    try:
-        start, stop, zone = (message.text or "").split()
-        schedule = {**bot_settings["autobump_schedule"],
-                    "start": start, "stop": stop, "timezone": zone}
-        save_autobump_schedule(schedule)
-    except (ValueError, RuntimeError):
-        await message.answer("Не сохранено. Используйте ЧЧ:ММ ЧЧ:ММ Europe/Moscow; другие часовые пояса пока не поддерживаются.")
-        return True
-    _interaction_state.pop(user_id, None)
-    text, markup = _autobump_schedule_screen()
-    await message.answer(text, reply_markup=markup, parse_mode="HTML")
+    _discard_schedule_editor(user_id)
+    await message.answer("Текстовый редактор устарел. Откройте расписание и выберите время кнопками.")
     return True
 
 
@@ -2540,11 +2610,15 @@ async def _autobump_schedule_input(message, user_id):
 async def callback_handler(callback: CallbackQuery):
     user_id = callback.from_user.id
     if not is_authorized(user_id):
+        _discard_schedule_editor(user_id)
         _interaction_state.pop(user_id, None)
         await callback.answer("⛔ Доступ запрещен!", show_alert=True)
         return
 
     action = callback.data or ""
+    if await _autobump_schedule_callback(callback, action, user_id):
+        return
+    _discard_schedule_editor(user_id)
     from .telegram_products import discard_session, products_callback
     if action != "products" and not action.startswith("prd:"):
         discard_session(user_id)
@@ -2570,8 +2644,6 @@ async def callback_handler(callback: CallbackQuery):
     if await products_callback(callback, action, user_id):
         return
     _interaction_state.pop(user_id, None)
-    if await _autobump_schedule_callback(callback, action, user_id):
-        return
     from .telegram_lots import templates_callback
     if await templates_callback(callback, action, user_id):
         return
@@ -2730,6 +2802,7 @@ async def text_handler(message: Message):
     if is_authorized(user_id):
         from .telegram_products import discard_session, products_input
         if message.text in {"🛠 Главное меню", "❌ Отмена"}:
+            _discard_schedule_editor(user_id)
             discard_session(user_id)
         # Если нажата кнопка вызова контекстного меню
         if message.text == "🛠 Главное меню":

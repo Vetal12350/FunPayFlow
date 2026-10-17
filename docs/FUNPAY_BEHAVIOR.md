@@ -56,6 +56,16 @@ Timeout/TLS/connection failure после начала `lots/raise` не док�
 
 Не обходить existing late action gate, общий Account RLock и [runtime_control](../src/funpayflow/runtime_control.py). Уже начатый HTTP нельзя надёжно отменить. Часы `eligible_at` — wall clock: корректное системное время важно для resume.
 
+## Telegram schedule editor и bump reports
+
+Время настраивается inline-кнопками: отдельные Start/End editors, ±1 час / 15 / 5 минут, quick minutes 00/15/30/45. До Save изменения находятся только в temporary session. Cancel/Back/navigation их отбрасывают. Generation + screen revision отклоняют старые/repeated callbacks; snapshot/version check при Save защищает от перезаписи уже изменившихся настроек. Ошибка atomic save возвращает прежнее RAM/JSON состояние. Старый text-input workflow не сохраняет значения и предлагает открыть кнопочный editor. Runtime window `[start, stop)`, manual OFF, SAFE_MODE и late gates не менялись.
+
+Окно `06:00 → 04:00` отображается как работа до следующего дня (22 ч), с перерывом `04:00 → 06:00`, timezone Europe/Moscow. Выключение расписания сохраняет выбранное время и снимает только временное ограничение.
+
+`bump_reports.py` формирует HTML по logical game entries: максимум **3600 UTF-16 units serialized HTML** с учётом header/footer/нумерации, то есть с запасом относительно Telegram 4096. Обычная entry не разрезается; аномально длинное имя делится по исходным символам до escaping и получает continuation markers без потери текста. Короткий report сохраняет прежнюю строку; длинный результат `bump_lots` содержит список готовых сообщений. Все имена escape ровно один раз; console report декодирует entities после снятия markup.
+
+Delivery идёт последовательно для каждого получателя. При ошибке одного chunk оставшиеся chunks этому получателю не отправляются; следующий получатель обрабатывается независимо. Ошибка логируется существующей безопасной policy, без retry, повторного raise, изменения cooldown/progress или падения runtime. Durable Telegram queue не добавлялась.
+
 ## События, UI и observability
 
 Критические snapshots попадают в SQLite до RAM publication; replay использует modifying claims. Не очищать backlog/queue ради reconnect, не переносить review fingerprints в volatile-only дедупликацию. Night replies защищены от self-echo; review requests имеют отдельный persistent claim. Для изменения этих путей читать соответствующие функции и тесты отдельно.

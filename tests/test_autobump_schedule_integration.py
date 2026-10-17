@@ -26,6 +26,9 @@ class ScheduleIntegrationTests(unittest.IsolatedAsyncioTestCase):
         settings = copy.deepcopy(ui.bot_settings)
         path, client, modules = ui.SETTINGS_FILE, ui._runtime_client, ui._effective_modules
         interactions = dict(ui._interaction_state)
+        sessions, locks = dict(ui._schedule_sessions), dict(ui._schedule_locks)
+        self.addCleanup(lambda: (ui._schedule_sessions.clear(), ui._schedule_sessions.update(sessions),
+                                ui._schedule_locks.clear(), ui._schedule_locks.update(locks)))
         self.addCleanup(lambda: (ui.bot_settings.clear(), ui.bot_settings.update(settings),
                                 setattr(ui, 'SETTINGS_FILE', path),
                                 setattr(ui, '_runtime_client', client),
@@ -161,16 +164,20 @@ class ScheduleIntegrationTests(unittest.IsolatedAsyncioTestCase):
             release.set()
             sleep_patch.stop()
 
-    async def test_telegram_owner_toggle_edit_and_input(self):
+    async def test_telegram_owner_toggle_and_legacy_input_fails_closed(self):
         callback = SimpleNamespace(answer=AsyncMock(), message=SimpleNamespace(
             answer=AsyncMock(), edit_text=AsyncMock()))
         with patch.object(ui, '_owner_id', return_value=True):
-            await ui._autobump_schedule_callback(callback, 'bump_schedule:toggle', 1)
+            await ui._autobump_schedule_callback(callback, 'bump_schedule', 1)
+            action = ui._schedule_action(ui._schedule_sessions[1], 'toggle')
+            await ui._autobump_schedule_callback(callback, action, 1)
             self.assertTrue(ui.bot_settings['autobump_schedule']['enabled'])
-            await ui._autobump_schedule_callback(callback, 'bump_schedule:edit', 1)
+            ui._interaction_state[1] = {'action': 'bump_schedule_edit'}
             message = SimpleNamespace(text='09:00 18:00 Europe/Moscow', answer=AsyncMock())
+            before = copy.deepcopy(ui.bot_settings['autobump_schedule'])
             self.assertTrue(await ui._autobump_schedule_input(message, 1))
-            self.assertEqual(ui.bot_settings['autobump_schedule']['start'], '09:00')
+            self.assertEqual(ui.bot_settings['autobump_schedule'], before)
+            self.assertNotIn(1, ui._interaction_state)
         text, keyboard = ui._autobump_schedule_screen()
         self.assertIn('круглосуточно', text)
         self.assertIn('Europe/Moscow', text)

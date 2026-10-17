@@ -11,13 +11,13 @@ import uuid
 import urllib3.exceptions
 from urllib.parse import urlsplit
 from decimal import Decimal, InvalidOperation
-from html import escape
 import requests
 from bs4 import BeautifulSoup
 import FunPayAPI
 from FunPayAPI.common.enums import SubCategoryTypes
 from . import logger
 from .runtime_control import automatic_action_gate
+from .bump_reports import build_bump_report_chunks, format_seconds as _format_seconds
 from .state import StateError, AUTOBUMP_SAFE_INTERVAL
 from .runtime_events import (ActionEvent, ActionKind, QueuedCriticalEvent,
                             critical_snapshot, hydrate_critical, html_preview)
@@ -123,23 +123,6 @@ def _apply_funpay_cookie_patch():
 
     requests.sessions.Session.request = patched_request
     _funpay_cookie_patch_applied = True
-
-
-def _format_seconds(seconds: int) -> str:
-    """
-    Форматирует секунды в читаемый вид для Telegram-уведомлений.
-    7200 → "2 ч 00 мин",  90 → "1 мин 30 сек",  45 → "45 сек"
-    """
-    seconds = max(0, int(seconds))
-    if seconds >= 3600:
-        h = seconds // 3600
-        m = (seconds % 3600) // 60
-        return f"{h} ч {m:02d} мин"
-    elif seconds >= 60:
-        m = seconds // 60
-        s = seconds % 60
-        return f"{m} мин {s:02d} сек" if s else f"{m} мин"
-    return f"{seconds} сек"
 
 
 class FunPayClient:
@@ -543,17 +526,11 @@ class FunPayClient:
         # Формируем Telegram-уведомление только по успешно поднятым лотам.
         # Если ничего не поднялось (всё на кулдауне) — сообщение не отправляется.
         if raised_cats:
-            msg_lines = ["🚀 <b>Лоты подняты!</b>"]
             for g_name, n_count, w_time in raised_cats:
-                msg_lines.append("")
-                time_str = _format_seconds(w_time)
                 logger.success(f"Лот поднят: {g_name}")
-                msg_lines.append(f"🎮 <b>{escape(str(g_name))}</b>")
-                msg_lines.append("✅ Лоты подняты")
-                msg_lines.append(f"⏳ Повтор для этой игры: через {time_str}")
-            msg_lines.append("")
-            msg_lines.append(f"🔄 Следующая общая проверка: через {_format_seconds(min_wait_final)}")
-            summary_text = "\n".join(msg_lines)
+            chunks = build_bump_report_chunks(raised_cats, min_wait_final)
+            # Retain the existing short-report string; long reports carry complete pages.
+            summary_text = chunks[0] if len(chunks) == 1 else chunks
         else:
             summary_text = ""  # Всё на кулдауне — уведомление не нужно
 

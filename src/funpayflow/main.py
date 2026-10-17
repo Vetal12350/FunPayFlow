@@ -133,6 +133,7 @@ def release_lock():
 
 async def auto_bump_loop(bot: Bot, client: FunPayClient):
     from funpayflow.telegram import autobump_schedule_allows_now
+    from html import unescape
     # ADMIN_ID нужен для валидации конфига при старте
     _require_env("ADMIN_ID")
     user_id = int(_require_env("FUNPAY_USER_ID"))
@@ -193,15 +194,19 @@ async def auto_bump_loop(bot: Bot, client: FunPayClient):
             # Отправляем отчет всем, у кого включены notifications_enabled + notify_bump.
             # message_text пустой, если все лоты были на кулдауне — в этом случае ничего не шлём.
             if success and bot_settings["auto_bump"] and message_text:
-                logger.bump(_strip_html(message_text))
+                reports = message_text if isinstance(message_text, list) else [message_text]
+                for report in reports:
+                    logger.bump(unescape(_strip_html(report)))
                 for recipient_id in (get_all_recipients() if module_enabled("notifications") else []):
                     u = get_user_settings(recipient_id)
                     if u.get("notifications_enabled", True) and u.get("notify_bump", True):
-                        try:
-                            await bot.send_message(recipient_id, message_text, parse_mode="HTML")
-                        except Exception as e:
-                            if not _is_ignorable_send_error(e):
-                                logger.bump(f"Не удалось отправить отчет: {type(e).__name__}.")
+                        for report in reports:
+                            try:
+                                await bot.send_message(recipient_id, report, parse_mode="HTML")
+                            except Exception as e:
+                                if not _is_ignorable_send_error(e):
+                                    logger.bump(f"Не удалось отправить отчет: {type(e).__name__}.")
+                                break  # Notification-only failure; no resend or repeat raise.
 
             # Сон с ежесекундной проверкой кнопки выключения
             for _ in range(int(wait_time)):

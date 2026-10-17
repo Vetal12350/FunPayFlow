@@ -10,6 +10,7 @@
 | --- | --- |
 | Запуск и supervision | [main.py](../src/funpayflow/main.py): `run`, `_application_loop`, `main`, `_supervise_tasks` |
 | FunPay Account, Runner, HTTP | [funpay.py](../src/funpayflow/funpay.py): `FunPayClient`, `listen_events`, `bump_lots` |
+| Bump report rendering / chunk limit | `bump_reports.py`: pure logical-entry HTML rendering; delivery в `main.auto_bump_loop`, без изменения raise mechanics |
 | Telegram UI, авторизация, callbacks, настройки | [telegram.py](../src/funpayflow/telegram.py): dispatcher `dp`, keyboards, `load_settings`, `save_settings`, module gates |
 | События, replay и безопасные payload | [runtime_events.py](../src/funpayflow/runtime_events.py): `ActionEvent`, `QueuedCriticalEvent`, `critical_snapshot`, `hydrate_critical` |
 | SQLite и миграции | [state.py](../src/funpayflow/state.py): `ReviewReceiptStore`, `StateError` |

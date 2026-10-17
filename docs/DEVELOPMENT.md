@@ -22,6 +22,7 @@ Sync может обращаться к package registry. Если сеть за
 | Область | Первые релевантные тесты в `tests/` |
 | --- | --- |
 | Autobump, cursor, toggle, UNKNOWN | `test_autobump_resume.py`, `test_autobump_startup.py` |
+| Schedule buttons / bump report delivery | `test_schedule_buttons.py`, `test_bump_reports.py`, `test_autobump_schedule_integration.py` |
 | Polling, TLS, backoff | `test_transient_funpay_recovery.py` |
 | Supervision/restart/backlog | `test_runtime_restart.py`, `test_runtime_core.py` |
 | Telegram, модули, health | `test_modular_features.py`, `test_operations_center.py`, `test_telegram_communication.py` |
