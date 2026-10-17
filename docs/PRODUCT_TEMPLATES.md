@@ -6,7 +6,7 @@
 
 Владелец открывает `📦 Лоты`:
 
-- **Создать:** template → поиск/страница/recent game route → variant (если есть) → переменные → цена → RU/EN preview → сохранить draft.
+- **Создать:** template → saved route или поиск игры в каталоге → явное подтверждение нового route → variant (если есть) → переменные → цена → RU/EN preview → сохранить draft.
 - **Массовые drafts:** template → общие переменные → строки `Game | price` → summary → подтвердить готовые строки.
 - **Game Routes:** template → собственный лот, URL или cached catalog → preview → подтвердить.
 - **Product Templates:** список и полный JSON editor. При создании копии поменять internal `name`.
@@ -53,6 +53,12 @@ Variant — необязательная scoped запись для **template +
 Поддержаны только COMMON nodes, подтверждённые в каталоге текущего Account. У установленной библиотеки `SubCategory.public_link` имеет вид `https://funpay.com/lots/ID/`, а private link — тот же путь с `trade`. URL с чужим host, credentials, port, query, fragment или `/chips/` не принимается. Произвольные URL не загружаются.
 
 Каталог — уже инициализированный cache `Account.subcategories`; новый scraper/дополнительный Account не создаётся. Поиск каталога не делает HTTP. Из собственного лота read-only читаются game/category, node и section. Source lot ID используется только для выбора, не сохраняется как будущий target. Формы, CSRF, delivery secrets и hidden поля не читаются и не копируются.
+
+В одиночном «Создать» сначала ищутся сохранённые routes: canonical name, alias, затем partial match. Поиск нормализует регистр Unicode, края и повторные пробелы. При найденном route каталог не читается. Если соответствия нет, `game_catalog.py` лениво копирует `Account.subcategories` в память на **900 секунд**; scope — runtime client + owner + account ID + объект Account, максимум 32 scope. Каталог в SQLite не сохраняется, фонового poller нет. В FunPayAPI 1.1.0 getter возвращает список, заполненный при `Account.get()`: «Обновить каталог» перечитывает именно этот список, а не загружает новый каталог с сайта. Он повторяет текущий поиск и меняет generation; прежние кнопки не действуют.
+
+Несколько игр и разделов показываются с пагинацией и фактическими названиями. COMMON/category metadata не доказывают пригодность раздела для GAME_KEY, поэтому автоподбора по названию товара нет. Даже единственный результат требует «✅ Использовать». Перед записью повторно проверяются node, игра, template и account; совместимый concurrent route переиспользуется, конфликт отклоняется без перезаписи. Query не становится alias. После confirm мастер сразу продолжает variant/defaults и draft; отмена draft сохраняет подтверждённый route. До confirm Cancel/Back ничего не записывают. Кнопки привязаны к текущим session/context/token и generation каталога.
+
+При временной Timeout/ConnectionError можно показать прежний snapshot с явным предупреждением; подтверждение всё равно обязательно. Ошибка без snapshot или нетранзиентная ошибка даёт безопасный Retry UI без текста исключения. Force refresh позволяет повторить чтение; TTL ограничивает повторные lazy попытки. Existing Game Routes editor и names-only route import сохраняют прежний read-only путь. **Mass drafts пока используют только saved routes**: неизвестная игра — ошибка строки, без автоматического подтверждения или цепочки диалогов; сначала создайте route одиночным flow либо существующим route import. Recent остаётся общей существующей системой.
 
 При нескольких разделах игры names-only import даёт warning и требует явного URL. Registry подтверждает существование node, но не обещает поддержку будущего publish или пригодность раздела для всех типов товаров. Назначение product type владелец проверяет в preview. Изменение каталога требует повторного подтверждения route.
 

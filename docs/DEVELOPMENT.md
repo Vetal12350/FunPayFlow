@@ -27,6 +27,7 @@ Sync может обращаться к package registry. Если сеть за
 | Supervision/restart/backlog | `test_runtime_restart.py`, `test_runtime_core.py` |
 | Telegram, модули, health | `test_modular_features.py`, `test_operations_center.py`, `test_telegram_communication.py` |
 | Product templates / routes / bulk drafts | `test_product_templates.py`, `test_product_variants.py`, `test_product_variant_integration.py`, `test_game_routes.py`, `test_product_store.py`, `test_product_drafts.py`, `test_telegram_products.py`, `test_product_compatibility.py` |
+| Lazy catalog / realtime create | `test_game_catalog.py`, `test_realtime_routes.py`: TTL/isolation, saved-first, explicit confirm, stale buttons, Cyberpunk/Elden Ring до сохранённого draft |
 | Reviews/automation | `test_pre_live_integration.py`, `test_communication_automation.py` |
 | Заказы/аналитика/import | `test_order_history.py`, `test_sales_analytics.py`, `test_historical_sales_import.py`, `test_telegram_sales_import.py` |
 | Установка/релиз | `test_public_installation.py`, `test_public_release_foundation.py`, `test_release_package.py` |

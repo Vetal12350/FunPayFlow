@@ -7,7 +7,8 @@ import re
 import sqlite3
 import uuid
 
-from .game_routes import RouteService
+from .game_routes import RouteService, RouteError
+from .game_catalog import GameCatalog, saved_routes
 from .product_store import ProductStore
 from .product_templates import TemplateService, default_template, validate_overrides
 from .product_drafts import DraftService, validate_price
@@ -105,11 +106,16 @@ async def _template_picker(callback, purpose, offset, templates):
     await _show(callback, '🧩 <b>Выберите Product Template</b>', _menu(keyboard))
 
 
-async def _route_list(callback, user_id, store, offset=0, recent=False):
+async def _route_list(callback, user_id, store, offset=0, recent=False, catalog_fallback=True):
     flow = _active(user_id)
-    rows = await asyncio.to_thread(store.list_routes, template_id=flow['template_id'],
+    flow.pop('catalog_state', None)
+    rows = await asyncio.to_thread(saved_routes, store, template_id=flow['template_id'],
                                    query='' if recent else flow.get('query', ''), limit=_PAGE + 1,
                                    offset=offset, recent=recent)
+    if not rows and offset == 0 and not recent and catalog_fallback and flow['purpose'] == 'single':
+        _, _, routes, _ = _kit(user_id)
+        await _catalog_results(callback, user_id, store, routes)
+        return
     keyboard = [[(f"{row['game_name'][:32]} · {row['section_name'][:20]}",
                   f"prd:route:{row['id']}")] for row in rows[:_PAGE]]
     keyboard += _page_buttons('prd:recent' if recent else 'prd:routepage', offset,
@@ -124,7 +130,147 @@ async def _route_list(callback, user_id, store, offset=0, recent=False):
     title = '🕘 Недавние / последние routes' if recent else '🗺 Выберите Game Route'
     await _show(callback, f'<b>{title}</b>\n'
                 f"Найденные маршруты · страница {offset // _PAGE + 1}.\n"
-                'Нет игры? Добавьте соответствие в Game Routes.', _menu(keyboard))
+                'Поиск сначала использует ваши routes; для новой игры предложит каталог FunPay.', _menu(keyboard))
+
+
+def _catalog_action(state, operation, value=0):
+    return f"prd:rt:{state['token']}:{operation}:{value}"
+
+
+def _catalog_context(routes, store, template_id):
+    return (id(routes.client), id(routes.client.account), store.owner_id, store.account_id, template_id)
+
+
+async def _catalog_error(callback, flow):
+    state = flow['catalog_state']
+    state.update(token=uuid.uuid4().hex[:12], view='games')
+    await _show(callback, 'Каталог недоступен или выбор устарел. Обновите каталог и повторите выбор. '
+                'Ничего не сохранено.', _menu([
+                    [('🔄 Обновить каталог', _catalog_action(state, 'refresh'))],
+                    [('🔍 Другой поиск', _catalog_action(state, 'search'))],
+                    [('❌ Отмена', _catalog_action(state, 'cancel'))]]))
+
+
+async def _catalog_results(callback, user_id, store, routes, *, offset=0, category_id=None,
+                           force=False, auto=True):
+    flow = _active(user_id)
+    previous = flow.get('catalog_state', {})
+    state = {'token': uuid.uuid4().hex[:12], 'generation': previous.get('generation'),
+             'context': _catalog_context(routes, store, flow['template_id']),
+             'view': 'games' if category_id is None else 'sections', 'category_id': category_id}
+    flow['catalog_state'] = state
+    catalog = GameCatalog(routes.client, store)
+    try:
+        if category_id is None:
+            result = await asyncio.to_thread(catalog.games, flow.get('query', ''),
+                                             limit=_PAGE + 1, offset=offset, force=force)
+            if _flows.get(user_id) is not flow:
+                return
+            rows = result['games']
+            state.update(generation=result['generation'], games=rows[:_PAGE])
+            if auto and offset == 0 and len(rows) == 1:
+                await _catalog_results(callback, user_id, store, routes, category_id=rows[0]['category_id'])
+                return
+            keyboard = [[(row['game_name'][:60], _catalog_action(state, 'game', row['category_id']))]
+                        for row in rows[:_PAGE]]
+            operation = 'gpage'
+            text = '🔎 <b>Найдено в FunPay</b>\nВыберите игру.' if rows else '🔎 Совпадений в каталоге FunPay нет.'
+        else:
+            result = await asyncio.to_thread(catalog.sections, category_id, state['generation'],
+                                             limit=_PAGE + 1, offset=offset)
+            if _flows.get(user_id) is not flow:
+                return
+            rows = result['rows']
+            state['nodes'] = rows[:_PAGE]
+            if auto and offset == 0 and len(rows) == 1:
+                await _catalog_confirmation(callback, user_id, store, routes, rows[0]['node_id'])
+                return
+            keyboard = [[(row['section_name'][:60], _catalog_action(state, 'node', row['node_id']))]
+                        for row in rows[:_PAGE]]
+            operation = 'spage'
+            game = rows[0]['game_name'] if rows else 'Игра'
+            text = (f"🔎 <b>{escape(game[:150])}</b>\nВыберите реальный раздел FunPay. "
+                    'Тип товара не определяется автоматически.')
+        if _flows.get(user_id) is not flow:
+            return
+        if offset:
+            keyboard.append([('⬅️ Назад', _catalog_action(state, operation, max(0, offset - _PAGE)))])
+        if len(rows) > _PAGE:
+            keyboard.append([('Далее ➡️', _catalog_action(state, operation, offset + _PAGE))])
+        text += '\n' + (result['warning'] if result['stale'] else 'Источник: каталог текущего Account.')
+        keyboard += [[('🔄 Обновить каталог', _catalog_action(state, 'refresh'))],
+                     [('🔍 Другой поиск', _catalog_action(state, 'search'))],
+                     [('🔙 Назад', _catalog_action(state, 'back'))],
+                     [('❌ Отмена', _catalog_action(state, 'cancel'))]]
+        await _show(callback, text, _menu(keyboard))
+    except RouteError:
+        if _flows.get(user_id) is flow:
+            await _catalog_error(callback, flow)
+
+
+async def _catalog_confirmation(callback, user_id, store, routes, node_id):
+    flow = _active(user_id); state = flow['catalog_state']
+    if node_id not in {row['node_id'] for row in state['nodes']}:
+        raise ValueError('Раздел не был показан.')
+    catalog = GameCatalog(routes.client, store)
+    candidate = await asyncio.to_thread(catalog.candidate, state['category_id'], node_id, state['generation'])
+    snapshot = await asyncio.to_thread(catalog.snapshot)
+    if _flows.get(user_id) is not flow:
+        return
+    if snapshot['generation'] != state['generation']:
+        raise RouteError('Каталог изменился.')
+    state.update(token=uuid.uuid4().hex[:12], view='confirm', candidate=candidate)
+    await _show(callback, '👁 <b>Подтвердите GameRoute</b>\n'
+        f"Игра: {escape(candidate['game_name'][:150])}\n"
+        f"Раздел: {escape(candidate['section_name'][:150])} · node {candidate['node_id']}\n"
+        'Подтверждение сохранит только локальное соответствие и продолжит создание draft.\n'
+        + (snapshot['warning'] if snapshot['stale'] else 'Публикация FunPay отсутствует.'), _menu([
+            [('✅ Использовать', _catalog_action(state, 'confirm'))],
+            [('🔄 Обновить каталог', _catalog_action(state, 'refresh'))],
+            [('🔍 Другой поиск', _catalog_action(state, 'search'))],
+            [('🔙 Назад', _catalog_action(state, 'back'))],
+            [('❌ Отмена', _catalog_action(state, 'cancel'))]]))
+
+
+def _save_catalog_route(store, routes, template_id, state):
+    catalog = GameCatalog(routes.client, store)
+    candidate = catalog.candidate(state['category_id'], state['candidate']['node_id'], state['generation'])
+    if candidate != state['candidate']:
+        raise ValueError('Каталог изменился.')
+    body = routes.from_url(template_id, f"https://funpay.com/lots/{candidate['node_id']}/")
+    if any(body[key] != candidate[key] for key in ('game_name', 'node_id', 'section_name', 'metadata')):
+        raise ValueError('Раздел изменился.')
+    def compatible():
+        existing = store.find_route(template_id, candidate['game_name'])
+        if not existing:
+            return None
+        verified = routes.resolve_route(existing['id'])
+        if any(verified[key] != body[key] for key in ('template_id', 'game_name', 'node_id', 'section_name', 'metadata')):
+            raise ValueError('Существует конфликтующий route.')
+        return verified
+    existing = compatible()
+    if existing:
+        return existing
+    try:
+        return store.save_route(body)
+    except ValueError:
+        existing = compatible()  # A concurrent compatible insert can be reused, never overwritten.
+        if existing:
+            return existing
+        raise
+
+
+async def _start_route_draft(callback, user_id, row, store, routes, templates):
+    flow = _active(user_id)
+    for key in ('catalog_state', 'search_token', 'variant_id', 'preview', 'preview_token',
+                'stored_id', 'stored_revision', 'batch_token', 'price'):
+        flow.pop(key, None)
+    flow.update(route_id=row['id'], variables={}, field_index=0)
+    variants = VariantService(store, routes)
+    if await asyncio.to_thread(variants.list, row['id'], limit=1):
+        await _variant_picker(callback, user_id, variants)
+    else:
+        await _wizard_prompt(callback.message, user_id, flow, templates)
 
 
 def _route_screen(row):
@@ -256,11 +402,23 @@ async def _products_callback(callback, action, user_id):
         await callback.answer('Доступно только владельцу.', show_alert=True)
         return True
     await callback.answer()
+    catalog_valid = False
     try:
         store, templates, routes, drafts = _kit(user_id)
         await asyncio.to_thread(templates.ensure_builtin)
         parts = action.split(':')
         command = parts[1] if len(parts) > 1 else 'home'
+        if command == 'rt':
+            flow = _active(user_id); state = flow.get('catalog_state')
+            if (len(parts) != 5 or not state or parts[2] != state['token']
+                    or flow.get('purpose') != 'single'
+                    or state['context'] != _catalog_context(routes, store, flow['template_id'])):
+                raise ValueError('Результаты устарели.')
+            catalog_valid = True
+        elif command == 'find':
+            flow = _active(user_id)
+            if len(parts) != 3 or parts[2] != flow.get('search_token'):
+                raise ValueError('Поиск устарел.')
         if command in {'save', 'edit', 'text', 'discard'}:
             flow = _active(user_id)
             index = 3 if command in {'edit', 'text'} else 2
@@ -274,6 +432,9 @@ async def _products_callback(callback, action, user_id):
                 raise ValueError('Предпросмотр устарел.')
         elif user_id in _flows:
             _flows[user_id].pop('preview_token', None)
+        if command not in {'rt', 'find'} and user_id in _flows:
+            _flows[user_id].pop('catalog_state', None)
+            _flows[user_id].pop('search_token', None)
         ui._interaction_state.pop(user_id, None)
         if command == 'home':
             discard_session(user_id)
@@ -293,6 +454,49 @@ async def _products_callback(callback, action, user_id):
                 await _route_list(callback, user_id, store)
         elif command in {'routepage', 'recent'}:
             await _route_list(callback, user_id, store, int(parts[2]), command == 'recent')
+        elif command == 'find':
+            await _route_list(callback, user_id, store)
+        elif command == 'rt':
+            operation, value = parts[3:5]
+            catalog = GameCatalog(routes.client, store)
+            if operation not in {'cancel', 'back', 'search', 'refresh'}:
+                snapshot = await asyncio.to_thread(catalog.snapshot)
+                if snapshot['generation'] != state['generation']:
+                    raise RouteError('Каталог изменился.')
+            if operation == 'cancel':
+                discard_session(user_id)
+                await _show(callback, *_home())
+            elif operation == 'search':
+                flow.pop('catalog_state', None)
+                _pending(user_id, flow, 'search')
+                await callback.message.answer('Введите название игры или сохранённый alias.')
+            elif operation == 'refresh':
+                await _catalog_results(callback, user_id, store, routes, force=True)
+            elif operation == 'back':
+                if state['view'] == 'confirm':
+                    await _catalog_results(callback, user_id, store, routes,
+                                           category_id=state['category_id'], auto=False)
+                elif state['view'] == 'sections':
+                    await _catalog_results(callback, user_id, store, routes, auto=False)
+                else:
+                    await _route_list(callback, user_id, store, catalog_fallback=False)
+            elif operation == 'gpage' and state['view'] == 'games':
+                await _catalog_results(callback, user_id, store, routes, offset=int(value), auto=False)
+            elif operation == 'game' and state['view'] == 'games':
+                if int(value) not in {row['category_id'] for row in state['games']}:
+                    raise ValueError('Игра не была показана.')
+                await _catalog_results(callback, user_id, store, routes, category_id=int(value))
+            elif operation == 'spage' and state['view'] == 'sections':
+                await _catalog_results(callback, user_id, store, routes, category_id=state['category_id'],
+                                       offset=int(value), auto=False)
+            elif operation == 'node' and state['view'] == 'sections':
+                await _catalog_confirmation(callback, user_id, store, routes, int(value))
+            elif operation == 'confirm' and state['view'] == 'confirm':
+                row = await asyncio.to_thread(_save_catalog_route, store, routes, flow['template_id'], state)
+                if _flows.get(user_id) is flow:
+                    await _start_route_draft(callback, user_id, row, store, routes, templates)
+            else:
+                raise ValueError('Действие устарело.')
         elif command == 'search':
             flow = _active(user_id); _pending(user_id, flow, 'search')
             await callback.message.answer('Введите название игры или alias. ❌ Отмена — выйти.')
@@ -305,13 +509,7 @@ async def _products_callback(callback, action, user_id):
                 flow['route_id'] = row['id']
                 await _show(callback, *_route_screen(row))
             else:
-                flow.update(route_id=row['id'], variables={}, field_index=0)
-                flow.pop('variant_id', None)
-                variants = VariantService(store, routes)
-                if await asyncio.to_thread(variants.list, row['id'], limit=1):
-                    await _variant_picker(callback, user_id, variants)
-                else:
-                    await _wizard_prompt(callback.message, user_id, flow, templates)
+                await _start_route_draft(callback, user_id, row, store, routes, templates)
         elif command in {'variantpage', 'variantpick'}:
             flow = _active(user_id)
             if flow.get('purpose') != 'single' or not flow.get('route_id'):
@@ -537,7 +735,10 @@ async def _products_callback(callback, action, user_id):
         else:
             raise ValueError('Действие устарело.')
     except (ValueError, KeyError, IndexError, StateError, sqlite3.Error):
-        await callback.message.answer('Не удалось выполнить действие. Проверьте данные или откройте «Лоты» заново. Ничего не опубликовано.')
+        if catalog_valid and _flows.get(user_id) is flow and flow.get('catalog_state'):
+            await _catalog_error(callback, flow)
+        else:
+            await callback.message.answer('Не удалось выполнить действие. Проверьте данные или откройте «Лоты» заново. Ничего не опубликовано.')
     return True
 
 
@@ -577,6 +778,10 @@ async def _products_input(message, user_id):
             flow['query' if step == 'search' else 'catalog_query'] = value.strip()
             ui._interaction_state.pop(user_id, None)
             action = 'prd:routepage:0' if step == 'search' else 'prd:catalog:0'
+            if step == 'search' and flow.get('purpose') == 'single':
+                flow.pop('catalog_state', None)
+                flow['search_token'] = uuid.uuid4().hex[:12]
+                action = 'prd:find:' + flow['search_token']
             await message.answer('🔎 Поиск готов.', reply_markup=_menu([[('Показать результаты', action)], [('Лоты', 'products')]]))
         elif step == 'variables':
             field = flow['field']
