@@ -89,7 +89,7 @@ def test_verified_alternate_node_text_override_snapshot_and_restart(context):
     with pytest.raises(ValueError):
         service.rebuild(preview)
     ctx.client.account.save_lot.assert_not_called()
-    ctx.client.account.method.assert_not_called()
+    assert all(call.args[0] == 'get' and call.args[1].startswith('lots/offerEdit?node=') for call in ctx.client.account.method.call_args_list)
 
 
 def test_bulk_aliases_legacy_mixed_variants_and_no_mutation(context):
@@ -112,7 +112,7 @@ def test_bulk_aliases_legacy_mixed_variants_and_no_mutation(context):
     assert len(ctx.drafts.confirm(staged['token'])['results']) == 4
     assert len(ctx.store.list_drafts()) == 4
     ctx.client.account.save_lot.assert_not_called()
-    ctx.client.account.method.assert_not_called()
+    assert all(call.args[0] == 'get' and call.args[1].startswith('lots/offerEdit?node=') for call in ctx.client.account.method.call_args_list)
 
 
 def test_bulk_distinct_variant_nodes_are_not_deduplicated(context):
@@ -238,9 +238,8 @@ def test_telegram_variant_pagination_and_implicit_default(context):
             await view.products_input(message('-'), 1)
         result = message('Elden Ring | Edition 1 | 20\nElden Ring | Unknown | 30')
         await view.products_input(result, 1)
-        assert 'Edition 1' in str(result.answer.call_args)
-        token = view._flows[1]['batch_token']
-        await view.products_callback(cb, 'prd:cancel:' + token, 1)
+        assert 'Ready: 0' in str(result.answer.call_args)
+        assert 'batch_token' not in view._flows[1]
         assert not ctx.store.list_drafts()
 
     asyncio.run(run())
@@ -294,6 +293,6 @@ def test_integrated_search_deluxe_and_disabled_variant_callback(context):
         await ui.callback_handler(callback(preview_action('prd:save')))
         assert len(ctx.store.list_drafts()) == 1
         ctx.client.account.save_lot.assert_not_called()
-        ctx.client.account.method.assert_not_called()
+        assert all(call.args[0] == 'get' and call.args[1].startswith('lots/offerEdit?node=') for call in ctx.client.account.method.call_args_list)
 
     asyncio.run(run())

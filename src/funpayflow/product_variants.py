@@ -15,7 +15,7 @@ _ROUTE_FIELDS = {"template_id", "game_name", "node_id", "section_name", "metadat
 def validate_variant(body, template, parent_route):
     if not isinstance(body, dict) or not template or not parent_route:
         raise ProductValidationError("variant: template or route not found")
-    fields = {"template_id", "route_id", "display_name", "aliases", "overrides", "route_override", "enabled"}
+    fields = {"template_id", "route_id", "display_name", "aliases", "overrides", "route_override", "enabled", "node_values"}
     if set(body) - fields - _META or not {"template_id", "route_id", "display_name"} <= set(body):
         raise ProductValidationError("variant: unknown or missing fields")
     clean = deepcopy(body)
@@ -37,6 +37,14 @@ def validate_variant(body, template, parent_route):
             raise ProductValidationError("variant: duplicate alias")
         keys.add(key)
     clean["overrides"] = validate_overrides(clean.get("overrides", {}), template["allowed_variables"])
+    if 'node_values' in clean:
+        from .product_templates import validate_node_bindings
+        values = clean['node_values']
+        if not isinstance(values, dict) or len(values) > 50:
+            raise ProductValidationError('variant: invalid node values')
+        for key, value in values.items():
+            validate_node_bindings({'field': key}, ['field'])
+            safe_text(value, 'node option', 500, empty=True)
     if type(clean.setdefault("enabled", True)) is not bool:
         raise ProductValidationError("variant: enabled must be boolean")
     override = clean.get("route_override")

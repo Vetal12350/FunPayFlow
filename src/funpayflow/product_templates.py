@@ -83,7 +83,7 @@ def validate_template(body):
         raise ProductValidationError("template: object required")
     fields = {"name", "display_name", "default_emoji", *TEXT_FIELDS, "allowed_variables", "defaults", "validation_rules"}
     metadata = {"id", "revision", "created_at", "updated_at"}
-    if set(body) - fields - metadata or not fields <= set(body):
+    if set(body) - fields - metadata - {'node_bindings'} or not fields <= set(body):
         raise ProductValidationError("template: unknown or missing fields")
     clean = deepcopy(body)
     safe_text(clean["name"], "name", 80)
@@ -96,6 +96,8 @@ def validate_template(body):
             or set(allowed) & _RESERVED_VARIABLES):
         raise ProductValidationError("allowed_variables: unique names including standard variables required")
     clean["defaults"] = _variables(clean["defaults"], allowed)
+    if 'node_bindings' in clean:
+        clean['node_bindings'] = validate_node_bindings(clean['node_bindings'], allowed)
     for field in TEXT_FIELDS:
         text = safe_text(clean[field], field, 200 if field.startswith("title_") else 10000)
         _validate_tokens(text, allowed)
@@ -123,6 +125,18 @@ def _validate_tokens(text, allowed):
     if names - set(allowed) or any(c in _TOKEN.sub("", text) for c in "{}"):
         raise ProductValidationError("template text: only controlled {{variable}} placeholders are allowed")
     return names
+
+
+def validate_node_bindings(bindings, allowed):
+    """Explicit content-variable -> technical field name, never a label guess."""
+    if not isinstance(bindings, dict) or set(bindings) - set(allowed) or set(bindings) & {'game', 'quantity', 'product_name'}:
+        raise ProductValidationError('node_bindings: invalid variable')
+    for name in bindings.values():
+        if not isinstance(name, str) or not re.fullmatch(r'fields(?:\[[A-Za-z0-9_.:-]{1,64}\]){1,4}', name):
+            raise ProductValidationError('node_bindings: technical select name required')
+        if any(part in name.casefold() for part in ('csrf', 'token', 'password', 'cookie', 'session', 'offer_id')):
+            raise ProductValidationError('node_bindings: service field forbidden')
+    return deepcopy(bindings)
 
 
 def validate_variable_value(template, variable, value):

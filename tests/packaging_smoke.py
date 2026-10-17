@@ -17,7 +17,7 @@ MODULES = {f"funpayflow/{name}" for name in (
     "logger.py", "import_funpay_sales.py", "runtime_paths.py",
     "console_ui.py", "setup_config.py", "render_service.py",
     "autobump_schedule.py", "bump_reports.py", "lot_templates.py", "telegram_lots.py",
-    "product_store.py", "game_routes.py", "game_catalog.py", "product_templates.py",
+    "product_store.py", "game_routes.py", "game_catalog.py", "node_form.py", "node_products.py", "telegram_node_fields.py", "product_templates.py",
     "product_drafts.py", "telegram_products.py", "product_variants.py",
 )}
 

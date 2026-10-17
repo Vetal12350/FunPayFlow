@@ -1,0 +1,24 @@
+<!-- Synthetic conceptual fixture. Keys/options are test data, not captured account HTML. -->
+<html><body>
+<form class="form-offer-editor" action="/lots/offerSave" method="post">
+  <input type="hidden" name="csrf_token" value="SYNTHETIC_CSRF">
+  <input type="hidden" name="form_created_at" value="SYNTHETIC_TIME">
+  <input type="hidden" name="node_id" value="976">
+  <input type="hidden" name="offer_id" value="0">
+  <div class="form-group required"><label for="platform">Платформа</label>
+    <select id="platform" name="fields[platform]" required>
+      <option value="pc" selected>PC</option><option value="ps">PS</option><option value="xbox">Xbox</option>
+    </select>
+  </div>
+  <div class="form-group"><label for="edition">Тип издания</label>
+    <select id="edition" name="fields[edition]">
+      <option value="standard" selected>Standard Edition</option><option value="ultimate">Ultimate Edition</option><option value="dlc">DLC</option>
+    </select>
+  </div>
+  <div class="form-group hidden"><label>Служебное поле</label>
+    <select name="fields[internal]"><option value="SYNTHETIC_HIDDEN">Скрыто</option></select>
+  </div>
+  <div class="form-group"><label>Название</label><input name="fields[summary][ru]" value="SYNTHETIC_PRIVATE_DESCRIPTION"></div>
+  <input name="price" value="0"><input name="amount" value="1">
+</form>
+</body></html>

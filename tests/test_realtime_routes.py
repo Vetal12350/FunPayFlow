@@ -85,9 +85,9 @@ def test_complete_create_saved_lookup_and_restart(ctx, query, game):
         await search(ctx, query)
         await dispatch('prd:route:' + routes[0]['id'])
         assert ctx.client.account.reads == reads
-        assert ui._interaction_state[1]['flow']['step'] == 'variables'
+        assert ui._interaction_state[1]['flow']['step'] == 'nodefields'
         ctx.client.account.save_lot.assert_not_called()
-        ctx.client.account.method.assert_not_called()
+        assert all(call.args[0] == 'get' and call.args[1].startswith('lots/offerEdit?node=') for call in ctx.client.account.method.call_args_list)
         ctx.client.account.get_user.assert_not_called()
     asyncio.run(run())
 

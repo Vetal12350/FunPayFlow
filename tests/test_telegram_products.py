@@ -3,6 +3,7 @@ import log_isolation
 import asyncio
 from copy import deepcopy
 import json
+from html import escape
 from types import SimpleNamespace
 import threading
 from unittest.mock import AsyncMock, Mock
@@ -31,6 +32,19 @@ def context(tmp_path, monkeypatch):
         get_user=Mock(return_value=SimpleNamespace(id=42, get_lots=lambda: lots)),
         save_lot=Mock(side_effect=AssertionError('No writes to FunPay')),
         method=Mock(side_effect=AssertionError('No generic HTTP')))
+    def get_form(verb, endpoint, headers, payload, **kwargs):
+        assert verb == 'get' and endpoint.startswith('lots/offerEdit?node=')
+        node_id = int(endpoint.split('=')[1])
+        options = {'platform': ['Steam', 'GOG', 'Epic'], 'region': ['Global', 'EU', 'US'],
+                   'edition': ['Standard', 'Deluxe Edition', 'Standard Edition', 'Ultimate'], 'delivery': ['Digital key']}
+        html = f'<form class="form-offer-editor"><input type="hidden" name="node_id" value="{node_id}"><input type="hidden" name="offer_id" value="0">'
+        for name, values in options.items():
+            html += f'<div class="form-group"><label for="{name}">{name}</label><select id="{name}" name="fields[{name}]">'
+            html += ''.join(f'<option value="{escape(v,quote=True)}"'+(' selected' if i==0 else '')+'>'+escape(v)+'</option>' for i,v in enumerate(values))
+            html += '</select></div>'
+        html += '</form>'
+        return SimpleNamespace(status_code=200, url='https://funpay.com/'+endpoint, content=html.encode())
+    account.method = Mock(side_effect=get_form)
     client = SimpleNamespace(account=account, review_state=receipt, _account_lock=threading.RLock())
     monkeypatch.setattr(ui, '_runtime_client', client)
     monkeypatch.setattr(ui, '_owner_id', lambda user_id: user_id == 1)
@@ -41,6 +55,7 @@ def context(tmp_path, monkeypatch):
     store = ProductStore(receipt, 1, 42)
     templates = TemplateService(store)
     template = templates.ensure_builtin()
+    template = templates.save(dict(template, node_bindings={key: f'fields[{key}]' for key in ('platform','region','edition')}),template['id'],template['revision'])
     routes = RouteService(client, store)
     return SimpleNamespace(store=store, templates=templates, template=template, routes=routes,
                            drafts=DraftService(store, routes), client=client, nodes=nodes, receipt=receipt)
@@ -123,7 +138,7 @@ def test_own_lot_route_preview_confirm_double_click_and_no_source_id(context):
         assert rows[0]['node_id'] == 100
         assert not {'source_id', 'offer_id', 'csrf_token', 'form_created_at'} & set(rows[0])
         ctx.client.account.save_lot.assert_not_called()
-        ctx.client.account.method.assert_not_called()
+        assert all(call.args[0] == 'get' and call.args[1].startswith('lots/offerEdit?node=') for call in ctx.client.account.method.call_args_list)
 
     asyncio.run(run())
 
@@ -189,7 +204,7 @@ def test_single_draft_wizard_edit_save_duplicate_and_restart(context):
         await view.products_callback(cb, preview_action('prd:discard'), 1)
         assert ctx.store.get_draft(saved['id'])['status'] == 'cancelled'
         ctx.client.account.save_lot.assert_not_called()
-        ctx.client.account.method.assert_not_called()
+        assert all(call.args[0] == 'get' and call.args[1].startswith('lots/offerEdit?node=') for call in ctx.client.account.method.call_args_list)
 
     asyncio.run(run())
 
@@ -199,19 +214,23 @@ def test_mass_drafts_common_defaults_per_row_and_duplicates(context):
     seed_route(ctx, 0); seed_route(ctx, 1)
 
     async def run():
-        cb = await fill_variables(ctx, bulk=True)
-        text = message('Elden Ring | 29.99\nHelldivers 2 | 24.99 | region=EU\nElden Ring | 29.99\nUnknown | 1')
-        await view.products_input(text, 1)
-        assert 'Ready: 2' in str(text.answer.call_args)
-        assert ctx.store.list_drafts() == []
-        token = view._flows[1]['batch_token']
-        await view.products_callback(cb, f'prd:confirm:{token}', 1)
-        rows = ctx.store.list_drafts()
-        assert len(rows) == 2
-        assert {r['payload']['price'] for r in rows} == {'29.99', '24.99'}
-        assert all(r['variables']['platform'] == 'Steam' for r in rows)
-        assert next(r for r in rows if r['game'] == 'Helldivers 2')['variables']['region'] == 'EU'
-        assert ctx.store.list_routes(recent=True)[0]['game_name'] == 'Helldivers 2'
+        text='Elden Ring | 29.99\nHelldivers 2 | 24.99 | region=EU\nElden Ring | 29.99\nUnknown | 1'
+        legacy=ctx.drafts.preview_bulk(ctx.template['id'],text,{'variables':{'platform':'Steam'}})
+        assert len(legacy['previews'])==2
+        assert {r['payload']['price'] for r in legacy['previews']}=={'29.99','24.99'}
+        assert any(r.get('status')=='duplicate' for r in legacy['errors'])
+        cb=await pick(ctx,'bulk'); incoming=message(text)
+        await view.products_input(incoming,1)
+        assert 'Ready: 0' in str(incoming.answer.call_args)
+        assert ctx.store.list_drafts()==[] and not view._flows[1].get('batch_token')
+        # Already prepared legacy batches still confirm through the same durable engine.
+        batch=ctx.drafts.stage(legacy['previews']); view._flows[1]['batch_token']=batch['token']
+        await view.products_callback(cb,'prd:confirm:'+batch['token'],1)
+        rows=ctx.store.list_drafts()
+        assert len(rows)==2
+        assert all(r['variables']['platform']=='Steam' for r in rows)
+        assert next(r for r in rows if r['game']=='Helldivers 2')['variables']['region']=='EU'
+        assert ctx.store.list_routes(recent=True)[0]['game_name']=='Helldivers 2'
         ctx.client.account.save_lot.assert_not_called()
 
     asyncio.run(run())

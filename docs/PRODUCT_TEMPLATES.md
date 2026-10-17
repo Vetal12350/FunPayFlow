@@ -1,13 +1,13 @@
 # Product Templates и Game Routes
 
-Этот слой создаёт **только локальные черновики**. Publish отсутствует; installed FunPayAPI 1.1.0 по-прежнему не подтверждает безопасный create-form contract. Никаких `save_lot`, modifying HTTP, AI-перевода или конвертации цен здесь нет.
+Этот слой создаёт **только локальные черновики**. Publish отсутствует. Отдельный GET-only adapter читает create-form выбранного node; write/verification contract не реализован, FunPayAPI 1.1.0 не менялась. Никаких `save_lot`, modifying HTTP, AI-перевода или конвертации цен здесь нет.
 
 ## Telegram
 
 Владелец открывает `📦 Лоты`:
 
-- **Создать:** template → saved route или поиск игры в каталоге → явное подтверждение нового route → variant (если есть) → переменные → цена → RU/EN preview → сохранить draft.
-- **Массовые drafts:** template → общие переменные → строки `Game | price` → summary → подтвердить готовые строки.
+- **Создать:** template → saved route или поиск игры в каталоге → явное подтверждение нового route → variant (если есть) → реальные Node Fields → content variables / quantity → цена → RU/EN preview → сохранить draft.
+- **Массовые drafts:** новый ввод требует `needs_resolution` для Node Fields; скрытых fetch/confirm для каждой строки нет. Уже подготовленные legacy batches сохраняют прежнее подтверждение.
 - **Game Routes:** template → собственный лот, URL или cached catalog → preview → подтвердить.
 - **Product Templates:** список и полный JSON editor. При создании копии поменять internal `name`.
 - **Черновики из собственного лота:** прежний flow и прежняя таблица без миграции/удаления записей.
@@ -26,13 +26,13 @@ Preview сокращает длинные поля, но «Полный RU/EN» 
 
 Defaults GAME_KEY: platform Steam, region Global, edition Standard, quantity 1. `game` фиксируется route; `product_name` по умолчанию равен игре и редактируется отдельно. В wizard «-» оставляет default; цена обязательна.
 
-Variables используют гибридный UI: `validation_rules.<variable>.choices` — уже существующий строгий enum и источник кнопок с пагинацией. Без enum можно кнопкой оставить известное inherited/default значение (в GAME_KEY это Steam / Global / Standard). Списки платформ/регионов не угадываются и не извлекаются из FunPay filters. Route/variant поддерживают defaults через `overrides.variables`, но отдельных choices/constraints у них сейчас нет; recent-value registry не добавлялся. «Другое» открывает text input с теми же enum/length/type checks; строгий enum не обходится custom вводом. Свободные поля без defaults/enum остаются текстовыми. Quantity — variable с editor ±1/10, presets, custom и Done, диапазон 1..999999999. Цена — прежний decimal input. Старый ввод «-» продолжает работать.
+Template-only content variables используют гибридный UI: `validation_rules.<variable>.choices` — уже существующий строгий enum и источник кнопок с пагинацией. Без enum можно кнопкой оставить известное inherited/default значение. Generic GAME_KEY Platform/Region/Edition больше не являются prompts нового create flow: их заменяют реальные Node Fields. Списки платформ/регионов не угадываются и не извлекаются из FunPay filters. Route/variant поддерживают defaults через `overrides.variables`, но отдельных choices/constraints у них сейчас нет; recent-value registry не добавлялся. «Другое» открывает text input с теми же enum/length/type checks; строгий enum не обходится custom вводом. Свободные поля без defaults/enum остаются текстовыми. Quantity — variable с editor ±1/10, presets, custom и Done, диапазон 1..999999999. Цена — прежний decimal input. Старый ввод «-» продолжает работать.
 
 ## Создать похожий
 
 После сохранения и в карточке сохранённого draft доступно «📑 Создать похожий». Общий `DraftService.clone_preview` проверяет scope/source revision и current route/template/enabled variant, затем создаёт только transient preview. Новый ID/revision появляются при Save; исходник, его status и timestamps не меняются. При stale/conflicting route UI предлагает выбрать актуальный маршрут через существующее «Создать».
 
-Compact editor строит variable buttons из `allowed_variables` текущего template (кроме фиксированного `game`), содержит variant selector при наличии вариантов, цену, preview, save и cancel. Variant switch заново рендерит current canonical template → route → variant → explicit draft overrides. Новое JSON metadata `input_variables` отличает explicit inputs от resolved `variables`; `route_snapshot`/revision позволяют отличать наследование. Rendered RU/EN тексты и inherited emoji/defaults не становятся draft overrides. Явные emoji/text/variable overrides сохраняются. Schema SQLite не меняется.
+Compact editor показывает реальные Node Fields отдельно и строит content-variable buttons из `allowed_variables` текущего template (кроме фиксированного `game`, generic node variables и explicit bindings), содержит variant selector при наличии вариантов, цену, preview, save и cancel. Variant switch заново рендерит current canonical template → route → variant → explicit draft overrides. Новое JSON metadata `input_variables` отличает explicit inputs от resolved `variables`; `route_snapshot`/revision позволяют отличать наследование. Rendered RU/EN тексты и inherited emoji/defaults не становятся draft overrides. Явные emoji/text/variable overrides сохраняются. Schema SQLite не меняется.
 
 Legacy drafts без input provenance продолжают открываться/редактироваться и staging сохраняет старую форму данных. При clone переносим явно маркированные overrides и значения, отличающиеся от доступных inherited defaults; равные defaults оставляем inherited. Полностью восстановить историю ввода без старого route snapshot невозможно, поэтому UI показывает предупреждение проверить variables. Каждый clone использует current definitions, а не старый rendered snapshot; UI сообщает об этом. Отмена несохранённого clone ничего не записывает и не отменяет source. Save идемпотентен в рамках flow/batch; можно снова создать похожий с новым ID. Saved-list labels показывают короткие game/edition/region/platform/price/quantity summaries. Stateful picker/variant/clone callbacks проверяют token/context до сброса активного ввода; старые безtoken variant buttons отклоняются.
 
@@ -68,7 +68,7 @@ Variant — необязательная scoped запись для **template +
 
 Несколько игр и разделов показываются с пагинацией и фактическими названиями. COMMON/category metadata не доказывают пригодность раздела для GAME_KEY, поэтому автоподбора по названию товара нет. Даже единственный результат требует «✅ Использовать». Перед записью повторно проверяются node, игра, template и account; совместимый concurrent route переиспользуется, конфликт отклоняется без перезаписи. Query не становится alias. После confirm мастер сразу продолжает variant/defaults и draft; отмена draft сохраняет подтверждённый route. До confirm Cancel/Back ничего не записывают. Кнопки привязаны к текущим session/context/token и generation каталога.
 
-При временной Timeout/ConnectionError можно показать прежний snapshot с явным предупреждением; подтверждение всё равно обязательно. Ошибка без snapshot или нетранзиентная ошибка даёт безопасный Retry UI без текста исключения. Force refresh позволяет повторить чтение; TTL ограничивает повторные lazy попытки. Existing Game Routes editor и names-only route import сохраняют прежний read-only путь. **Mass drafts пока используют только saved routes**: неизвестная игра — ошибка строки, без автоматического подтверждения или цепочки диалогов; сначала создайте route одиночным flow либо существующим route import. Recent остаётся общей существующей системой.
+При временной Timeout/ConnectionError можно показать прежний snapshot с явным предупреждением; подтверждение всё равно обязательно. Ошибка без snapshot или нетранзиентная ошибка даёт безопасный Retry UI без текста исключения. Force refresh позволяет повторить чтение; TTL ограничивает повторные lazy попытки. Existing Game Routes editor и names-only route import сохраняют прежний read-only путь. **Legacy mass engine использует saved routes**: неизвестная игра — ошибка строки, без автоматического подтверждения или цепочки диалогов; сначала создайте route одиночным flow либо существующим route import. Recent остаётся общей существующей системой.
 
 При нескольких разделах игры names-only import даёт warning и требует явного URL. Registry подтверждает существование node, но не обещает поддержку будущего publish или пригодность раздела для всех типов товаров. Назначение product type владелец проверяет в preview. Изменение каталога требует повторного подтверждения route.
 
@@ -100,3 +100,14 @@ Game A | Deluxe | 39.99
 Таблицы `product_templates`, `game_routes`, `product_drafts`, `product_batches`, `product_variants` добавляются в существующую `state.sqlite3` через `ReviewReceiptStore.initialize()`. Variant migration добавляет только таблицу/индексы; старые templates/routes/drafts и pending batches не переписываются. Новая БД не создаётся. Существующие таблицы/данные и старые lot drafts не заменяются. Подтверждение пакета атомарно, с per-row savepoints и сохранённым результатом для повторного callback. SQLite/network транзакции не смешиваются: новые batch writes вообще не вызывают HTTP.
 
 Для настоящего Publish отдельно нужны доказанный fresh create-form contract, безопасная сборка только разрешённых пользовательских полей, durable dispatch/UNKNOWN handling и строгая remote verification. Этот пакет их не включает.
+
+
+## Динамические параметры node
+
+Новый create flow использует [NODE_FORMS](NODE_FORMS.md): authenticated GET create-form, реальные visible selects по HTML name, DOM order, полный набор options и отдельное persistence. Duplicate labels не объединяются. Cache — память, 900s, без фонового worker. Если форма недоступна/неожиданна, generic Steam/Global/Standard fallback запрещён. Product name/game заполняются из GameRoute.
+
+Content binding задаётся **явно** через optional `node_bindings` в ProductTemplate: variable → подтверждённый technical select name. Names в fixtures синтетические: их нельзя копировать как реальные настройки без проверки формы. Неизвестные legacy generic placeholders рендерятся как «—» с предупреждением, а не как выдуманные параметры. У real selects нет arbitrary custom value. Remaining template-only fields сохраняют гибридный picker/text UX.
+
+Variant может хранить optional `node_values` (technical name → technical option value), а также прежние emoji/text overrides. Legacy variable preset допускается только через explicit binding и однозначное точное совпадение option value/label. Конфликт с реальным выбранным параметром не скрывается. Create Similar и reopen проверяют current schema; пропавший option требует нового выбора, изменение только label обновляет display без изменения source. Legacy drafts открываются с предупреждением и не преобразуются автоматически; при clone владелец заново подтверждает реальные поля.
+
+Новые mass rows всегда `needs_resolution`: полноценный bulk node-field editor отложен. Старые drafts/batches, renderer и legacy service tests остаются совместимыми, schema SQLite не менялась.

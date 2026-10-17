@@ -11,7 +11,10 @@ from .game_routes import RouteService, RouteError
 from .game_catalog import GameCatalog, saved_routes
 from .product_store import ProductStore
 from .product_templates import TemplateService, default_template, validate_overrides, validate_variable_value
-from .product_drafts import DraftService, validate_price
+from .product_drafts import validate_price
+from .node_products import NodeDraftService, LEGACY_NODE_VARIABLES, LEGACY_WARNING, STALE_WARNING, NodeSelectionError, NodeVariantConflictError, VARIANT_WARNING
+from .node_form import NodeFormError
+from . import telegram_node_fields as node_ui
 from .product_variants import VariantService
 from .state import StateError
 
@@ -46,7 +49,7 @@ def _kit(user_id):
         raise ValueError('Хранилище недоступно.')
     store = ProductStore(client.review_state, user_id, client.account.id)
     routes = RouteService(client, store)
-    return store, TemplateService(store), routes, DraftService(store, routes)
+    return store, TemplateService(store), routes, NodeDraftService(store, routes)
 
 
 def _menu(rows):
@@ -263,7 +266,7 @@ def _save_catalog_route(store, routes, template_id, state):
 async def _start_route_draft(callback, user_id, row, store, routes, templates):
     flow = _active(user_id)
     for key in ('catalog_state', 'search_token', 'variant_id', 'preview', 'preview_token',
-                'stored_id', 'stored_revision', 'batch_token', 'price'):
+                'stored_id', 'stored_revision', 'batch_token', 'price', 'node_state', 'node_ready'):
         flow.pop(key, None)
     flow.update(route_id=row['id'], variables={}, field_index=0)
     variants = VariantService(store, routes)
@@ -310,6 +313,15 @@ def _preview_screen(flow):
             f"Variables: {clip(json.dumps(body['variables'], ensure_ascii=False), 200)}\n\n"
             'Тексты здесь сокращены; полный RU/EN доступен ниже.\n'
             'Сохраняется только локальный draft. PUBLISH отсутствует.')
+    if 'node_fields' in body:
+        field_lines = [f"{row['display_label'][:65]}: {row['option_label'][:90]}" for row in body['node_fields']]
+        text = '📋 <b>Параметры FunPay</b>\n' + escape('\n'.join(field_lines[:8])) + '\n\n' + text
+        if len(field_lines) > 8:
+            text += '\nПолные параметры доступны отдельной кнопкой.'
+        if body.get('node_warning'):
+            text += '\n⚠ ' + escape(body['node_warning'])
+    else:
+        text += '\n⚠ ' + LEGACY_WARNING
     rows = [[('💾 Сохранить draft', 'prd:save')],
             [('💵 Цена', 'prd:edit:price'), ('Emoji', 'prd:edit:emoji')],
             [('Изменить RU', 'prd:edit:ru'), ('Изменить EN', 'prd:edit:en')],
@@ -318,6 +330,8 @@ def _preview_screen(flow):
             [('❌ Cancel', 'prd:discard')], [('🔙 Лоты', 'products')]]
     if body.get('status') == 'cancelled':
         rows = [[('🔙 Лоты', 'products')]]
+    if 'node_fields' in body:
+        rows.insert(0, [('📋 Все параметры', 'prd:text:node')])
     if flow.get('stored_id') and not flow.get('dirty') and body.get('status') != 'cancelled':
         rows.insert(0, [('📑 Создать похожий', 'prd:clone')])
     if flow.get('similar') and not flow.get('stored_id'):
@@ -337,17 +351,29 @@ def _local_action(flow, operation, value=0):
 
 
 async def _similar_screen(message, user_id, flow, templates, drafts):
+    _ui()._interaction_state.pop(user_id, None)
+    flow.pop('step', None)
+    flow.pop('node_state', None)
     body = flow['preview']
     template = await asyncio.to_thread(templates.get, body['template_id'])
     flow.pop('picker', None)
     flow.pop('similar_variants', None)
     flow['similar_token'] = uuid.uuid4().hex[:12]
     flow['edit_context'] = _edit_context(user_id, flow)
-    flow['similar_fields'] = [key for key in template['allowed_variables'] if key != 'game']
+    dynamic = 'node_fields' in body
+    flow['similar_fields'] = [key for key in template['allowed_variables'] if key != 'game'
+        and (not dynamic or key not in LEGACY_NODE_VARIABLES | set(template.get('node_bindings', {})))]
     rows = []
     variants = await asyncio.to_thread(drafts.variants.list, body['route_id'], limit=1)
     if variants:
         rows.append([('🎭 Variant / Edition', _local_action(flow, 'variant'))])
+    if dynamic:
+        selected = {row['html_name']: row for row in body['node_fields']}
+        flow['node_edit_fields'] = [f['html_name'] for f in body['node_schema']['fields'] if not f['disabled']]
+        for index, field in enumerate(f for f in body['node_schema']['fields'] if not f['disabled']):
+            value = selected.get(field['html_name'], {}).get('option_label', '—')
+            rows.append([((field['display_label'] + ': ' + value)[:60], _local_action(flow, 'node', index))])
+        rows.append([('🔄 Обновить параметры', _local_action(flow, 'node_refresh'))])
     for index, key in enumerate(flow['similar_fields']):
         value = str(body['variables'].get(key, '—'))
         rows.append([(f"{_TITLES.get(key, key)}: {value}"[:55], _local_action(flow, 'variable', index))])
@@ -406,8 +432,10 @@ async def _advance_variables(message, user_id, flow, templates, drafts):
             await message.answer('До 100 строк: Game | price или Game | variant | price\n'
                 'Дополнительно: | region=EU | emoji=⚔️\nСначала summary, затем явное сохранение.')
         else:
-            preview = await asyncio.to_thread(drafts.create_preview, flow['template_id'], flow['route_id'],
-                flow['variables'], flow.get('price'), variant_id=flow.get('variant_id'))
+            state = flow['node_state']
+            preview = await asyncio.to_thread(drafts.create_node_preview, flow['template_id'], flow['route_id'],
+                state['values'], variables=flow['variables'], price=flow.get('price'),
+                variant_id=flow.get('variant_id'), schema=state['schema'], input_values=state['explicit'])
             flow.update(preview=preview, dirty=True)
             _ui()._interaction_state.pop(user_id, None)
             text, markup = _preview_screen(flow)
@@ -512,10 +540,17 @@ async def _variable_model(user_id, flow, templates):
     used = set(re.findall(r'\{\{([a-z][a-z0-9_]*)\}\}', ' '.join(
         texts.values()))) | {'quantity'}
     fields = [key for key in template['allowed_variables'] if key != 'game' and key in used]
+    if flow.get('node_state'):
+        fields = [key for key in fields if key not in LEGACY_NODE_VARIABLES | set(template.get('node_bindings', {})) | {'product_name'}]
     return template, defaults, fields
 
 
 async def _wizard_prompt(message, user_id, flow, templates):
+    if flow['purpose'] == 'single' and flow.get('route_id'):
+        state = flow.get('node_state')
+        if not flow.get('node_ready') or not state or state.get('variant_id') != flow.get('variant_id'):
+            _, _, _, drafts = _kit(user_id)
+            return await node_ui.begin(message, user_id, flow, drafts)
     template, defaults, fields = await _variable_model(user_id, flow, templates)
     if flow['purpose'] == 'single':
         fields.append('price')
@@ -627,6 +662,9 @@ async def _products_callback(callback, action, user_id):
             flow = _active(user_id)
             if len(parts) != 3 or parts[2] != flow.get('search_token'):
                 raise ValueError('Поиск устарел.')
+        if command == 'nf':
+            flow = _active(user_id)
+            state = await node_ui.validate(user_id, flow, parts)
         if command in {'variantpick', 'variantpage'}:
             raise ValueError('Старая кнопка варианта; выберите игру заново.')
         if command == 'vp':
@@ -694,7 +732,8 @@ async def _products_callback(callback, action, user_id):
             flow = {'purpose': purpose, 'template_id': template_id, 'variables': {}, 'query': ''}
             _flows[user_id] = flow
             if purpose == 'bulk':
-                await _wizard_prompt(callback.message, user_id, flow, templates)
+                _pending(user_id, flow, 'massdrafts')
+                await callback.message.answer('До 100 строк: Game | price. Параметры FunPay потребуют отдельного resolution; готовые legacy batches сохраняются как прежде.')
             else:
                 await _route_list(callback, user_id, store)
         elif command in {'routepage', 'recent'}:
@@ -742,6 +781,8 @@ async def _products_callback(callback, action, user_id):
                     await _start_route_draft(callback, user_id, row, store, routes, templates)
             else:
                 raise ValueError('Действие устарело.')
+        elif command == 'nf':
+            await node_ui.handle(callback, user_id, flow, state, parts[3], parts[4], drafts)
         elif command == 'clone':
             flow = _active(user_id)
             if not flow.get('stored_id') or flow.get('dirty'):
@@ -750,15 +791,22 @@ async def _products_callback(callback, action, user_id):
             warnings = drafts.input_warnings(source) if source else []
             try:
                 preview = await asyncio.to_thread(drafts.clone_preview, flow['stored_id'], flow['stored_revision'])
+            except (NodeFormError, NodeSelectionError, NodeVariantConflictError):
+                raise
             except ValueError:
-                await callback.message.answer('Исходный draft или его конфигурация изменились. '
+                await callback.message.answer(STALE_WARNING + ' Исходный draft или его конфигурация изменились. '
                     'Откройте его заново либо выберите актуальный route через «Создать».',
                     reply_markup=_menu([[('➕ Создать / выбрать route', 'prd:choose:single:0')], [('Drafts', 'prd:drafts:0')]]))
                 return True
             flow = {'purpose': 'single', 'similar': True, 'preview': preview, 'dirty': True,
                     'template_id': preview['template_id'], 'route_id': preview['route_id'], 'clone_warnings': warnings}
             _flows[user_id] = flow
-            await _similar_screen(callback.message, user_id, flow, templates, drafts)
+            if 'node_fields' not in preview:
+                flow['clone_warnings'] = [LEGACY_WARNING, *warnings]
+                await callback.message.answer(LEGACY_WARNING)
+                await node_ui.begin(callback.message, user_id, flow, drafts, mode='similar')
+            else:
+                await _similar_screen(callback.message, user_id, flow, templates, drafts)
         elif command == 'pv':
             await _picker_callback(callback, user_id, flow, state, parts[3], parts[4], templates, drafts)
         elif command == 'sim':
@@ -782,6 +830,12 @@ async def _products_callback(callback, action, user_id):
                     await _variable_picker(callback.message, user_id, flow, template, field, current, 'similar')
                 else:
                     await _similar_text_prompt(callback.message, user_id, flow, templates, field)
+            elif operation in {'node', 'node_refresh'}:
+                index = int(value) if operation == 'node' else None
+                if index is not None and not 0 <= index < len(flow['node_edit_fields']):
+                    raise ValueError('Поле устарело.')
+                await node_ui.begin(callback.message, user_id, flow, drafts, mode='similar',
+                                    force=operation == 'node_refresh', field_index=index)
             elif operation == 'price':
                 await _similar_text_prompt(callback.message, user_id, flow, templates, 'price')
             elif operation == 'variant':
@@ -976,7 +1030,10 @@ async def _products_callback(callback, action, user_id):
             body = await asyncio.to_thread(store.get_draft, parts[2])
             if body is None:
                 raise ValueError('Черновик не найден.')
-            flow = {'preview': body, 'stored_id': body['id'], 'stored_revision': body['revision'], 'dirty': False}
+            original = body
+            if 'node_fields' in body:
+                body = await asyncio.to_thread(drafts.refresh_preview, body)
+            flow = {'preview': body, 'stored_id': original['id'], 'stored_revision': original['revision'], 'dirty': False}
             _flows[user_id] = flow
             await _show(callback, *_preview_screen(flow))
         elif command == 'edit':
@@ -988,12 +1045,21 @@ async def _products_callback(callback, action, user_id):
                        'ru': 'RU: первая строка — название, остальные — описание.',
                        'en': 'EN: first line — title, remaining lines — description.',
                        'variables': 'Variables, по одной строке platform=Steam, region=Global и т. д.:'}
+            if 'node_fields' in flow['preview']:
+                template = await asyncio.to_thread(templates.get, flow['preview']['template_id'])
+                content_fields = [key for key in template['allowed_variables']
+                    if key not in LEGACY_NODE_VARIABLES | set(template.get('node_bindings', {})) | {'game'}]
+                prompts['variables'] = ('Content variables, по одной строке key=value: '
+                    + ', '.join(content_fields) + '. Параметры FunPay меняются через «Параметры» похожего draft.')
             if field not in prompts:
                 raise ValueError('Неподдерживаемое поле.')
             flow['edit_field'] = field; _pending(user_id, flow, 'draftedit')
             await callback.message.answer(prompts[field] + '\n❌ Отмена — выйти без сохранения.')
         elif command == 'text':
             body = _active(user_id)['preview']['payload']; language = parts[2]
+            if language == 'node' and 'node_fields' in _active(user_id)['preview']:
+                await _plain_chunks(callback.message, '\n'.join(row['display_label'] + ': ' + row['option_label'] for row in _active(user_id)['preview']['node_fields']))
+                return True
             if language not in {'ru', 'en'}:
                 raise ValueError('Неподдерживаемый язык.')
             await _plain_chunks(callback.message, body[f'title_{language}'] + '\n\n' + body[f'description_{language}'])
@@ -1017,6 +1083,20 @@ async def _products_callback(callback, action, user_id):
             await _show(callback, *_home())
         else:
             raise ValueError('Действие устарело.')
+    except NodeSelectionError:
+        if user_id in _flows and _flows[user_id].get('node_state'):
+            await node_ui.error(callback.message, user_id, _flows[user_id], STALE_WARNING)
+        else:
+            await callback.message.answer(STALE_WARNING, reply_markup=_menu([
+                [('➕ Создать / выбрать параметры', 'prd:choose:single:0')], [('Drafts', 'prd:drafts:0')]]))
+    except NodeVariantConflictError:
+        await callback.message.answer(VARIANT_WARNING, reply_markup=_menu([
+            [('➕ Выбрать route / Variant заново', 'prd:choose:single:0')]]))
+    except NodeFormError:
+        if user_id in _flows and _flows[user_id].get('node_state'):
+            await node_ui.error(callback.message, user_id, _flows[user_id])
+        else:
+            await callback.message.answer('Не удалось получить актуальные параметры раздела FunPay.')
     except (ValueError, KeyError, IndexError, StateError, sqlite3.Error):
         if catalog_valid and _flows.get(user_id) is flow and flow.get('catalog_state'):
             await _catalog_error(callback, flow)
@@ -1032,6 +1112,10 @@ async def _save_product_draft(callback, user_id, flow, store, drafts):
         if not flow.get('dirty'):
             await callback.message.answer('Этот draft уже сохранён.')
             return
+        if 'node_fields' in flow['preview']:
+            reviewed = await asyncio.to_thread(drafts.rebuild, flow['preview'])
+            if reviewed != flow['preview']:
+                raise NodeSelectionError()
         row = await asyncio.to_thread(store.edit_draft, flow['stored_id'], flow['preview'], flow['stored_revision'])
     else:
         if not flow.get('batch_token'):
@@ -1085,7 +1169,9 @@ async def _products_input(message, user_id):
             raise ValueError('Контекст ввода устарел.')
         if not value.strip() or len(value) > 100000:
             raise ValueError('Пустой или слишком длинный ввод.')
-        if step in {'search', 'catalogsearch'}:
+        if step == 'nodefields':
+            await node_ui.text(message, user_id, flow, value, drafts)
+        elif step in {'search', 'catalogsearch'}:
             if len(value) > 200:
                 raise ValueError('Слишком длинный запрос.')
             flow['query' if step == 'search' else 'catalog_query'] = value.strip()
@@ -1182,6 +1268,9 @@ async def _products_input(message, user_id):
                 overrides['emoji'] = value
             elif field == 'variables':
                 variables = _mapping(value)
+                if ('node_fields' in flow['preview']
+                        and set(variables) & (LEGACY_NODE_VARIABLES | set(flow['preview'].get('node_bindings', {})))):
+                    raise ValueError('Используйте editor параметров FunPay.')
             else:
                 title, separator, description = value.partition('\n')
                 if not separator:
@@ -1197,6 +1286,15 @@ async def _products_input(message, user_id):
             await message.answer(text, reply_markup=markup, parse_mode='HTML')
         else:
             raise ValueError('Экран устарел.')
+    except NodeSelectionError:
+        await message.answer(STALE_WARNING)
+    except NodeVariantConflictError:
+        await message.answer(VARIANT_WARNING)
+    except NodeFormError:
+        if flow.get('node_state'):
+            await node_ui.error(message, user_id, flow)
+        else:
+            await message.answer('Не удалось получить актуальные параметры раздела FunPay.')
     except (ValueError, KeyError, TypeError, StateError, sqlite3.Error):
         await message.answer('Не сохранено. Проверьте формат, переменные, маршрут и обязательные RU/EN поля. Можно исправить ввод или выйти через ❌ Отмена.')
     return True

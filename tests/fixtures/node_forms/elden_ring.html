@@ -1,0 +1,21 @@
+<!-- Synthetic conceptual fixture. Category-specific keys are illustrative, not verified live names. -->
+<form class="form-offer-editor" action="/lots/offerSave" method="post">
+  <input type="hidden" name="node_id" value="986"><input type="hidden" name="offer_id" value="0">
+  <input type="hidden" name="csrf_token" value="SYNTHETIC_CSRF">
+  <div class="form-group"><label for="p">Платформа</label><select id="p" name="fields[platform]" required>
+    <option value="pc" selected>PC</option><option value="ps">PS</option><option value="xbox">Xbox</option>
+  </select></div>
+  <div class="form-group"><label for="e">Тип издания</label><select id="e" name="fields[edition]">
+    <option value="base" selected>Elden Ring</option><option value="shadow">Shadow of the Erdtree</option>
+  </select></div>
+  <div class="form-group"><label for="e2">Тип издания</label><select id="e2" name="fields[edition_extra]">
+    <option value="standard" selected>Standard Edition</option><option value="deluxe">Deluxe Edition</option>
+  </select></div>
+  <div class="form-group required"><label for="d">Способ получения</label><select id="d" name="fields[delivery]">
+    <option value="key" selected>Цифровой ключ</option><option value="gift">Подарок</option>
+  </select></div>
+  <div class="form-group"><label for="r">Регион</label><select id="r" name="fields[region]">
+    <option value="eu" selected>Европа</option><option value="us">США</option><option value="blocked" disabled>Недоступен</option>
+  </select></div>
+  <input name="price" value="0">
+</form>
