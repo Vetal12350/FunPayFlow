@@ -27,6 +27,20 @@ PRODUCT_TEST_FILES = (
 )
 
 
+CORE_TEST_FILES = (
+    "tests/test_autobump_resume.py",
+    "tests/test_autobump_startup.py",
+    "tests/test_autobump_schedule_integration.py",
+    "tests/test_transient_funpay_recovery.py",
+    "tests/test_runtime_core.py",
+    "tests/test_runtime_restart.py",
+    "tests/test_order_history.py",
+    "tests/test_sales_analytics.py",
+    "tests/test_historical_sales_import.py",
+    "tests/test_communication_automation.py",
+)
+
+
 AREAS = {
     "test_qa_user_journeys.py": "User journeys",
     "test_node_form.py": "Node schema / GET only",
@@ -38,6 +52,16 @@ AREAS = {
     "test_game_catalog.py": "Game catalog",
     "test_realtime_routes.py": "GameRoute resolver",
     "test_product_compatibility.py": "Legacy compatibility",
+    "test_autobump_resume.py": "Autobump persistence",
+    "test_autobump_startup.py": "Autobump startup",
+    "test_autobump_schedule_integration.py": "Bump schedule safety",
+    "test_transient_funpay_recovery.py": "Network recovery",
+    "test_runtime_core.py": "Runtime core",
+    "test_runtime_restart.py": "Runtime restart",
+    "test_order_history.py": "Order history",
+    "test_sales_analytics.py": "Sales analytics",
+    "test_historical_sales_import.py": "Historical import",
+    "test_communication_automation.py": "Communication automation",
 }
 
 
@@ -101,7 +125,7 @@ def report(path: Path, suite: str, exit_code: int) -> tuple[str, bool]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run offline FunPayFlow QA with concise Markdown results")
-    parser.add_argument("--suite", choices=("product", "full"), default="product")
+    parser.add_argument("--suite", choices=("product", "core", "full"), default="product")
     parser.add_argument("--report-dir", type=Path, default=Path(".qa-reports"))
     opts = parser.parse_args()
 
@@ -109,7 +133,8 @@ def main() -> int:
     report_dir = (repo / opts.report_dir).resolve()
     report_dir.mkdir(parents=True, exist_ok=True)
     junit = report_dir / "results.xml"
-    selected = PRODUCT_TEST_FILES if opts.suite == "product" else ("tests",)
+    selected = {"product": PRODUCT_TEST_FILES, "core": CORE_TEST_FILES,
+                "full": ("tests",)}[opts.suite]
     missing = [item for item in selected if not (repo / item).exists()]
     if missing:
         summary = "# FunPayFlow automated QA\n\n**FAIL** — required test files are missing: " + ", ".join(missing) + "\n"
