@@ -19,6 +19,31 @@ shape; their category-specific names/option IDs are explicitly **synthetic**.
 No production game/node names are hardcoded. Future deployment needs an owner
 smoke-test against live forms; unexpected markup fails closed.
 
+## Safe failure diagnosis
+
+`NodeFormError` keeps the same fixed user-facing message. Its internal `reason`
+and `diagnostic` distinguish HTTP/auth/redirect, final URL validation, account
+scope, app-data/user ID, editor/action/node context and SELECT/label/option
+validation. `NodeFormService.get()` emits one `NodeForm failure {JSON}` warning
+per failed call. The JSON is allowlisted: fixed reason and URL category, integer
+HTTP status, capped editor count and visible SELECT count when available. It
+never includes the URL itself, node/account IDs, field names/values, app-data,
+exception text, headers or HTML. Pure parser calls do not log.
+
+The production failure reported after `6d74ca8` has **not** yet been localized
+to a specific validation check. No parser acceptance rules were relaxed on a
+guess. In particular string/boolean user IDs, unsupported names/action URLs and
+ambiguous labels still fail closed, now with a distinct internal reason.
+
+There is no in-process diagnostic RPC in the running bot. Importing Account in
+an SSH Python process would create a second object/session and cannot reuse the
+live Account safely. Do not copy credentials, attach a debugger, or inject code.
+After separately authorized deployment/restart of diagnostics, the owner can
+open nodes 976 and 986 once through the normal Telegram create wizard. This uses
+the existing runtime Account/RLock and GET-only path. For each failure collect
+only the allowlisted JSON warning; do not save HTML or raw journal lines. Use
+the confirmed reason to choose the next minimal fix and regression fixture.
+
 Unlike a general form-copying implementation, this adapter retains only safe
 visible SELECT metadata. It does not retain every input or hidden/session
 field, does not persist HTML, and does not implement publication/ID guessing.
