@@ -702,12 +702,23 @@ async def _products_callback(callback, action, user_id):
                 raise ValueError('Предпросмотр устарел.')
             if command == 'edit':
                 flow.pop('preview_token', None)
+        elif command in {'confirm', 'cancel'}:
+            flow = _active(user_id)
+            if len(parts) != 3 or not flow.get('batch_token') or parts[2] != flow['batch_token']:
+                raise ValueError('Предпросмотр устарел.')
         elif command == 'variantsave':
             flow = _active(user_id)
             if len(parts) != 3 or parts[2] != flow.get('variant_token') or 'variant_pending' not in flow:
                 raise ValueError('Предпросмотр устарел.')
         elif user_id in _flows:
             _flows[user_id].pop('preview_token', None)
+        # Leaving a batch confirmation abandons its controls even when navigation
+        # reuses the same flow dict. Keep the token for repeated confirm/cancel only.
+        if command not in {'confirm', 'cancel'} and user_id in _flows:
+            flow = _flows[user_id]
+            if flow.get('kind') in {'routes', 'drafts'}:
+                flow.pop('batch_token', None)
+                flow.pop('kind', None)
         if command not in {'rt', 'find'} and user_id in _flows:
             _flows[user_id].pop('catalog_state', None)
             _flows[user_id].pop('search_token', None)
@@ -1067,8 +1078,6 @@ async def _products_callback(callback, action, user_id):
             await _save_product_draft(callback, user_id, _active(user_id), store, drafts)
         elif command in {'confirm', 'cancel'}:
             flow = _active(user_id)
-            if flow.get('batch_token') != parts[2]:
-                raise ValueError('Предпросмотр устарел.')
             result = await asyncio.to_thread(store.confirm_batch if command == 'confirm' else store.cancel_batch, parts[2])
             await callback.message.answer(f"Пакет: {result['status']}.\n"
                 f"Сохранено: {len(result['results'])}; ошибок: {len(result['errors'])}.\n"
