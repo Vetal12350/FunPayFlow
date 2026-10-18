@@ -16,7 +16,7 @@ def safe_error_text(cause=None):
     """Owner-visible allowlisted diagnostic, never raw server/exception text."""
     text = 'Не удалось получить актуальные параметры раздела FunPay.'
     if isinstance(cause, NodeFormError):
-        text += '\\nКод диагностики: ' + cause.diagnostic['reason']
+        text += '\nКод диагностики: ' + cause.diagnostic['reason']
     return text
 
 
