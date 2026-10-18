@@ -6,6 +6,7 @@ Does not print process command lines, environment variables, private paths or lo
 """
 from __future__ import annotations
 
+from contextlib import closing
 import json
 import os
 from pathlib import Path
@@ -30,7 +31,7 @@ def _execute(command: list[str], *, timeout: int = 5) -> str | None:
 
 
 def service_status(unit: str) -> str:
-    status = _execute(["systemctl", "is-active", unit])
+    status = _execute(["systemctl", "show", "--property=ActiveState", "--value", unit])
     return status if status in {"active", "inactive", "failed", "activating", "deactivating"} else "unknown"
 
 
@@ -73,7 +74,7 @@ def sqlite_integrity(data: Path) -> str:
         if db.stat().st_size > MAX_DB_FOR_QUICK_CHECK:
             return "skipped_large"
         uri = "file:" + quote(str(db), safe="/") + "?mode=ro"
-        with sqlite3.connect(uri, uri=True, timeout=3) as connection:
+        with closing(sqlite3.connect(uri, uri=True, timeout=3)) as connection:
             connection.execute("PRAGMA query_only=ON")
             result = connection.execute("PRAGMA quick_check").fetchone()
         return "ok" if result == ("ok",) else "failed"
