@@ -12,6 +12,14 @@ def _view():
     return telegram_products
 
 
+def safe_error_text(cause=None):
+    """Owner-visible allowlisted diagnostic, never raw server/exception text."""
+    text = 'Не удалось получить актуальные параметры раздела FunPay.'
+    if isinstance(cause, NodeFormError):
+        text += '\nКод диагностики: ' + cause.diagnostic['reason']
+    return text
+
+
 def action(state, operation, value=0):
     return f"prd:nf:{state['token']}:{operation}:{value}"
 
@@ -20,12 +28,12 @@ def _context(user_id, flow):
     return _view()._edit_context(user_id, flow)
 
 
-async def error(message, user_id, flow, text='Не удалось получить актуальные параметры раздела FunPay.'):
+async def error(message, user_id, flow, text=None, diagnostic=None):
     view = _view()
     state = flow['node_state']
     state.update(token=uuid.uuid4().hex[:12], phase='error')
     view._ui()._interaction_state.pop(user_id, None)
-    await message.answer(text,
+    await message.answer(safe_error_text(diagnostic) if text is None else text,
         reply_markup=view._menu([[('🔄 Обновить параметры', action(state, 'refresh'))],
                                  [('❌ Отмена', action(state, 'cancel'))]]))
 
@@ -60,9 +68,9 @@ async def begin(message, user_id, flow, drafts, *, mode='wizard', force=False, f
         if view._flows.get(user_id) is flow:
             await error(message, user_id, flow, STALE_WARNING)
         return False
-    except NodeFormError:
+    except NodeFormError as cause:
         if view._flows.get(user_id) is flow:
-            await error(message, user_id, flow)
+            await error(message, user_id, flow, diagnostic=cause)
         return False
 
 
