@@ -30,9 +30,9 @@ class WorkerError(Exception):
     """Fail safely without disclosing shell output, credentials or HTML."""
 
 
-def resolve_argv(argv: list[str]) -> list[str]:
+def resolve_argv(argv: list[str], *, platform_name: str | None = None) -> list[str]:
     """Use the Windows npm launcher (codex.cmd), not blocked codex.ps1."""
-    if os.name == "nt" and argv and argv[0] == "codex":
+    if (os.name if platform_name is None else platform_name) == "nt" and argv and argv[0] == "codex":
         launcher = shutil.which("codex.cmd")
         if launcher is None:
             raise WorkerError("codex.cmd unavailable on PATH")
