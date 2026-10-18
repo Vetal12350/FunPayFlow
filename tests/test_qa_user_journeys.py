@@ -4,7 +4,7 @@ import asyncio
 from copy import deepcopy
 
 from test_node_products import node, start, send, nf
-from test_telegram_products import message, preview_action
+from test_telegram_products import context, message, preview_action
 from funpayflow import telegram as ui, telegram_products as view
 
 
