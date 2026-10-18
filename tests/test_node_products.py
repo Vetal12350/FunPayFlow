@@ -153,6 +153,7 @@ def test_failed_fetch_and_refresh_never_generic_fallback(node):
         ctx.client.account.method.side_effect=TimeoutError('sensitive synthetic server text')
         cb=await send(nf('refresh'))
         assert 'Не удалось получить актуальные параметры' in str(cb.message.answer.call_args)
+        assert 'Код диагностики: REQUEST_FAILED' in str(cb.message.answer.call_args)
         assert 'sensitive' not in str(cb.message.answer.call_args)
         assert view._flows[1]['node_state']['phase']=='error'
         assert 1 not in ui._interaction_state
