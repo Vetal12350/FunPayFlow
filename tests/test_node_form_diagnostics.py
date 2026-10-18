@@ -147,3 +147,37 @@ def test_facts_and_reason_are_allowlisted_even_after_attribute_changes():
     error.reason = PRIVATE
     error.facts = {'payload':PRIVATE, 'http_status':403, 'url_category':'auth'}
     assert error.diagnostic == {'reason':'UNEXPECTED','http_status':403,'url_category':'auth'}
+
+
+@pytest.mark.parametrize('name,expected_shape', [
+    ('unrecognized_dropdown', 'plain'),
+    ('other[option]', 'other_namespace'),
+    ('fields[one][two][three][four][five]', 'fields_deep'),
+    ('fields[bad space]', 'fields_format'),
+    ('fields[request_type]', 'service_like'),
+    ('bad@field', 'other_format'),
+])
+def test_live_unsupported_name_format_is_classified_without_exposure(
+        service, logs, name, expected_shape):
+    # The rejected name and option label must not reach logs/UI/diagnostics.
+    html = form().replace('fields[x]', name).replace('value="a"', 'value="SYNTHETIC_PRIVATE_RESPONSE_VALUE"')
+    service.client.account.response.content = html.encode()
+    error = assert_failure(service, logs, 'FIELD_NAME_UNSUPPORTED')
+    from funpayflow.telegram_node_fields import safe_error_text
+    ui = safe_error_text(error)
+    assert error.diagnostic['unsupported_name_shape'] == expected_shape
+    assert 'Формат проблемного поля: ' + expected_shape in ui
+    combined = ui + logs[0] + repr(error.diagnostic)
+    assert name not in combined
+    assert PRIVATE not in combined
+
+
+def test_unsupported_field_diagnostic_shape_is_fixed_allowlisted():
+    bad = NodeFormError('FIELD_NAME_UNSUPPORTED', unsupported_name_shape='private-raw-value')
+    assert bad.diagnostic == {'reason': 'FIELD_NAME_UNSUPPORTED'}
+    good = NodeFormError('FIELD_NAME_UNSUPPORTED', unsupported_name_shape='other_namespace')
+    assert good.diagnostic == {
+        'reason': 'FIELD_NAME_UNSUPPORTED', 'unsupported_name_shape': 'other_namespace'
+    }
+    good.facts['unsupported_name_shape'] = 'SYNTHETIC_PRIVATE_RESPONSE_VALUE'
+    assert good.diagnostic == {'reason': 'FIELD_NAME_UNSUPPORTED'}

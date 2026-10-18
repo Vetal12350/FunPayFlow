@@ -37,6 +37,10 @@ LOGIN_PAGE ERROR_PAGE FORM_COUNT FORM_HIDDEN FORM_ACTION NODE_CONTEXT OFFER_CONT
 FIELD_NAME_UNSUPPORTED FIELD_DUPLICATE SELECT_MULTIPLE SELECT_NESTED SELECT_STRUCTURE LABEL_COUNT LABEL_TEXT
 TEXT_INVALID FIELD_ID OPTION_TEXT OPTION_VALUE OPTION_STRUCTURE OPTION_VALUE_OR_LABEL OPTIONS_COUNT SELECTED_COUNT SELECT_SIZE FIELDS_COUNT EMPTY_EDITOR'''.split())
 _URL_CATEGORIES = frozenset({'missing', 'invalid', 'external', 'auth', 'other', 'editor'})
+# Fixed categories only: never persist, log or echo the actual HTML name.
+_UNSUPPORTED_NAME_SHAPES = frozenset({
+    'service_like', 'fields_deep', 'fields_format', 'plain', 'other_namespace', 'other_format'
+})
 
 
 def _safe_facts(facts):
@@ -51,6 +55,9 @@ def _safe_facts(facts):
     category = facts.get('url_category')
     if type(category) is str and category in _URL_CATEGORIES:
         clean['url_category'] = category
+    shape = facts.get('unsupported_name_shape')
+    if type(shape) is str and shape in _UNSUPPORTED_NAME_SHAPES:
+        clean['unsupported_name_shape'] = shape
     return clean
 
 
@@ -126,6 +133,24 @@ def _field_name(name):
             and not any(part.casefold() in _SERVICE_KEYS for part in parts))
 
 
+def _unsupported_name_shape(name):
+    """Classify a rejected select name without retaining any response text."""
+    if not isinstance(name, str):
+        return 'other_format'
+    if _SERVICE.search(name) or any(
+            part.casefold() in _SERVICE_KEYS for part in re.findall(r'\[([^\]]+)\]', name)):
+        return 'service_like'
+    if name.startswith('fields'):
+        if name.startswith('fields[') and name.count('[') > 4:
+            return 'fields_deep'
+        return 'fields_format'
+    if re.fullmatch(r'[A-Za-z0-9_.:-]{1,64}', name):
+        return 'plain'
+    if re.fullmatch(r'[A-Za-z0-9_.:-]{1,64}(?:\[[A-Za-z0-9_.:-]{1,64}\]){1,4}', name):
+        return 'other_namespace'
+    return 'other_format'
+
+
 def _parse_impl(html, node_id, account_id, facts):
     if not _positive(node_id) or not isinstance(html, str) or not 0 < len(html) <= _MAX_HTML:
         raise NodeFormError("PARSER_INPUT")
@@ -193,6 +218,7 @@ def _parse_impl(html, node_id, account_id, facts):
                     or (_NAME.fullmatch(name) and parts[0] in _STANDARD)) or name in {
                     "price", "amount", "auto_delivery", "active", "deactivate_after_sale", "query"}:
                 continue
+            facts['unsupported_name_shape'] = _unsupported_name_shape(name)
             raise NodeFormError("FIELD_NAME_UNSUPPORTED")
         if name in names:
             raise NodeFormError('FIELD_DUPLICATE')
