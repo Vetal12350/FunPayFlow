@@ -30,6 +30,12 @@ HTTP status, capped editor count and visible SELECT count when available. It
 never includes the URL itself, node/account IDs, field names/values, app-data,
 exception text, headers or HTML. Pure parser calls do not log.
 
+The owner-only Telegram create wizard also displays just the allowlisted `reason`
+(e.g. `FORM_COUNT` or `HTTP_AUTH`) under the same generic failure message.
+No HTML, IDs, option values, network exception text or private log lines are
+exposed. This does not itself fix an incompatible live form; it provides a
+safe actionable reason after the diagnostics build is deployed.
+
 The production failure reported after `6d74ca8` has **not** yet been localized
 to a specific validation check. No parser acceptance rules were relaxed on a
 guess. In particular string/boolean user IDs, unsupported names/action URLs and
