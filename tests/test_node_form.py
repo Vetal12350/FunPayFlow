@@ -169,6 +169,51 @@ def test_get_only_contract_no_save_post_or_other_requests(service):
                                               {"raise_not_200": True})]
 
 
+@pytest.mark.parametrize("name,node_id,count", [("cyberpunk", 976, 2), ("elden_ring", 986, 5)])
+@pytest.mark.parametrize("locale", ["ru", "en", "uk"])
+def test_reported_nodes_committed_examples_through_scoped_get(service, name, node_id, count, locale):
+    """Conceptual fixtures reproduce no failure; they do not prove live compatibility."""
+    html = fixture(name)
+    if "<body>" not in html:
+        html = "<body>" + html + "</body>"
+    html = html.replace('<body>', '<body data-app-data=\'{"userId":10}\'>')
+    service.locale = locale
+    response = service.client.account.response
+    response.content = html.encode("utf-8")
+    prefix = "" if locale == "ru" else f"/{locale}"
+    response.url = f"https://funpay.com{prefix}/lots/offerEdit?node={node_id}"
+
+    schema = service.get(node_id)
+
+    assert schema["node_id"] == node_id and len(schema["fields"]) == count
+    assert schema["fields"] == parse_node_form(fixture(name), node_id)["fields"]
+    assert service.client.account.calls == [
+        (("get", f"lots/offerEdit?node={node_id}", {"accept-language": locale}, {}),
+         {"raise_not_200": True})]
+    assert "SYNTHETIC" not in json.dumps(schema)
+
+
+@pytest.mark.parametrize("node_id", [976, 986])
+def test_namespaced_repeated_select_labels_keep_full_identity(node_id):
+    """Synthetic namespace variants, not a claim about either live node's names."""
+    html = ('<form class="form-offer-editor" action="/lots/offerSave">'
+            f'<input type="hidden" name="node_id" value="{node_id}">'
+            '<div class="form-group"><label for="base">Тип издания</label>'
+            '<select id="base" name="fields[game][edition]">'
+            '<option value="base" selected>Base</option></select></div>'
+            '<div class="form-group"><label for="extra">Тип издания</label>'
+            '<select id="extra" name="fields[extra][edition]">'
+            '<option value="deluxe" selected>Deluxe</option></select></div></form>')
+
+    fields = parse_node_form(html, node_id)["fields"]
+
+    assert [field["identity"] for field in fields] == [
+        "fields[game][edition]", "fields[extra][edition]"]
+    assert [field["html_name"] for field in fields] == [field["identity"] for field in fields]
+    assert [field["display_label"] for field in fields] == ["Тип издания", "Тип издания (2)"]
+    assert [field["value"] for field in fields] == ["base", "deluxe"]
+
+
 def test_lazy_cache_ttl_force_generation_and_detached_schema(service):
     assert not service.client.account.calls
     first = service.get(976)

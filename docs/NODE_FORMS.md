@@ -54,6 +54,35 @@ Unlike a general form-copying implementation, this adapter retains only safe
 visible SELECT metadata. It does not retain every input or hidden/session
 field, does not persist HTML, and does not implement publication/ID guessing.
 
+## Offline audit: nodes 976 and 986 (2026-10-18)
+
+Reviewed source baseline `f7e2d324713c295cc027c0140b06d6ec43578839`,
+`node_form.py`, `telegram_node_fields.py`, and the committed synthetic examples
+and parser/diagnostic/draft tests. No cause of the reported production failure
+was reproduced from this evidence; parser acceptance rules remain unchanged.
+The existing reason codes and owner-safe error display were not duplicated.
+
+Added deterministic coverage in `tests/test_node_form.py`: both committed
+examples pass through the fake Account GET path with matching integer app-data
+user scope for ru/en/uk, including localized final editor URLs. Separate
+synthetic forms for both node IDs preserve independent full technical names
+`fields[game][edition]` and `fields[extra][edition]` despite equal labels.
+These namespace variants are illustrative, not observed live field names.
+The parser, diagnostics and owner error suites passed **134 tests** normally;
+including node-product integration, **182 tests** passed using the existing
+virtualenv. Windows sandbox denied access to
+directories created with mode 0700; the successful test process substituted
+mode 0777 for `os.mkdir` and used temporary directories under pytest's ignored
+cache. No repository or application permission logic was changed.
+
+Remaining unknowns are the actual failure reason, response status/final URL
+category, embedded user-ID type/scope, and live editor/action/label/SELECT
+structure. The conceptual fixtures cannot establish live compatibility for
+either category. No live requests, real Account/session construction, POST or
+deployment were performed. Further diagnosis needs the existing allowlisted
+reason from a separately authorized normal runtime wizard attempt; do not
+infer a parser relaxation or request raw HTML/credentials from this audit.
+
 ## Safe schema and cache
 
 Schema: `node_id`, ordered `fields`, `fetched_at`, SHA-256 `fingerprint`, and
