@@ -54,6 +54,57 @@ class ScheduleIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(ui.bot_settings['autobump_schedule'], normalize_schedule())
         self.assertFalse(ui.bot_settings['auto_bump'])
 
+    def test_saved_0700_0400_window_across_midnight_and_restart(self):
+        policy = normalize_schedule({'enabled': True, 'start': '07:00', 'stop': '04:00'})
+        ui.bot_settings['auto_bump'] = False
+        ui.save_autobump_schedule(policy)
+        ui.bot_settings['autobump_schedule'] = normalize_schedule()
+        ui.load_settings()
+        self.assertEqual(ui.bot_settings['autobump_schedule'], policy)
+        for day, hour, minute, second, expected in (
+                (16, 20, 59, 59, True),   # 23:59:59 MSK
+                (16, 21, 0, 0, True),     # local midnight
+                (17, 0, 59, 59, True),    # 03:59:59 MSK
+                (17, 1, 0, 0, False),     # stop is exclusive
+                (17, 3, 59, 59, False),
+                (17, 4, 0, 0, True)):     # start is inclusive
+            instant = datetime(2026, 10, day, hour, minute, second, tzinfo=timezone.utc)
+            with self.subTest(instant=instant), patch.object(
+                    ui, 'allows_now', side_effect=lambda value: allows_now(value, instant)):
+                self.assertEqual(ui.autobump_schedule_allows_now(), expected)
+                self.assertFalse(ui.bot_settings['auto_bump'])
+        self.assertEqual(ui.bot_settings['autobump_schedule'], policy)
+
+    async def test_overnight_close_after_claim_releases_before_dispatch(self):
+        fixture = resume_checks.ResumeTests(methodName='runTest')
+        fixture.path = Path(self.folder.name) / 'overnight.sqlite3'
+        fixture.store = ReviewReceiptStore(fixture.path)
+        fixture.store.initialize()
+        fixture.store.autobump_cycle([1])
+        before = fixture.rows()
+        client, sent = fixture.client([1])
+        ui.save_autobump_schedule(normalize_schedule({
+            'enabled': True, 'start': '07:00', 'stop': '04:00'}))
+        clock = [datetime(2026, 10, 17, 0, 59, 59, tzinfo=timezone.utc)]
+        original = fixture.store.claim_autobump_target
+
+        def claim(*args):
+            claimed = original(*args)
+            self.assertTrue(claimed)
+            clock[0] = datetime(2026, 10, 17, 1, tzinfo=timezone.utc)
+            return claimed
+
+        with patch.object(ui, 'allows_now', side_effect=lambda value: allows_now(value, clock[0])), \
+                patch.object(fixture.store, 'claim_autobump_target', side_effect=claim), \
+                patch('funpayflow.funpay.asyncio.sleep', new=AsyncMock()):
+            result = await client.bump_lots(1, is_cancelled=lambda: not ui.autobump_schedule_allows_now())
+        self.assertEqual(result[2], 0)
+        self.assertEqual(sent, [])
+        fixture.store = ReviewReceiptStore(fixture.path)
+        fixture.store.initialize()
+        fixture.store.recover_autobump_progress()
+        self.assertEqual(fixture.rows(), before)
+
     def test_failed_save_rolls_back_without_version_change(self):
         ui.save_settings(required=True)
         original_json = Path(ui.SETTINGS_FILE).read_bytes()

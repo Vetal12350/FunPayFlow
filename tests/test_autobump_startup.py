@@ -2,13 +2,15 @@
 import log_isolation
 
 import ast
+import asyncio
 import copy
 import json
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from funpayflow import telegram as ui
 from funpayflow.state import ReviewReceiptStore
@@ -103,6 +105,32 @@ class AutobumpStartupTests(unittest.TestCase):
         self.assertEqual(supervisor.count("asyncio.create_task(auto_bump_loop(bot, client)"), 1)
         loop = ast.unparse(functions["auto_bump_loop"])
         self.assertIn("get_autobump_state()", loop)
+
+    def test_missing_configuration_exits_before_constructing_runtime(self):
+        tree = ast.parse(Path('src/funpayflow/main.py').read_text(encoding='utf-8'))
+        nodes = [next(node for node in tree.body if getattr(node, 'name', None) == name)
+                 for name in ('_require_env', 'main')]
+        for missing in ('FUNPAY_GOLDEN_KEY', 'BOT_TOKEN', 'ADMIN_ID', 'FUNPAY_USER_ID'):
+            with self.subTest(missing=missing):
+                forbidden = Mock(side_effect=AssertionError('Runtime construction forbidden'))
+                path = Path(self.tmp.name) / 'never-created.sqlite3'
+                namespace = {
+                    'Path': Path, 'SETTINGS_FILE': ui.SETTINGS_FILE, 'DEFAULT_DB_PATH': path,
+                    'begin_runtime_cycle': lambda: None,
+                    'is_fresh_install': lambda *args: False,
+                    'configure_module_runtime': lambda **kwargs: None,
+                    # An isolated synthetic environment; never inspect real credentials.
+                    'os': SimpleNamespace(getenv=lambda name: None if name == missing else '1'),
+                    'sys': sys, 'logger': SimpleNamespace(error=lambda *_: None),
+                    'FunPayClient': forbidden, 'Bot': forbidden,
+                    'ReviewReceiptStore': forbidden, '_supervise_tasks': forbidden,
+                }
+                exec(compile(ast.Module(body=nodes, type_ignores=[]), '<startup>', 'exec'), namespace)
+                with self.assertRaises(SystemExit) as raised:
+                    asyncio.run(namespace['main']())
+                self.assertEqual(raised.exception.code, 1)
+                forbidden.assert_not_called()
+                self.assertFalse(path.exists())
 
 
 if __name__ == "__main__":

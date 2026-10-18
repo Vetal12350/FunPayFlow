@@ -9,6 +9,7 @@ import threading
 import sys
 import unittest
 from contextlib import closing
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -83,6 +84,113 @@ class ResumeTests(unittest.IsolatedAsyncioTestCase):
             db.row_factory = sqlite3.Row
             return {row['game_id']: dict(row) for row in db.execute(
                 'SELECT * FROM autobump_progress')}
+
+    async def test_sqlite_snapshot_abort_rolls_back_before_retry(self):
+        with closing(sqlite3.connect(self.path)) as db, db:
+            db.execute("CREATE TRIGGER abort_snapshot BEFORE INSERT ON autobump_progress "
+                       "WHEN NEW.game_id = 2 BEGIN SELECT RAISE(ABORT, 'synthetic'); END")
+        client, sent = self.client([1, 2])
+        with self.assertRaises(StateError):
+            await client.bump_lots(1)
+        self.assertEqual(sent, [])
+        self.store = ReviewReceiptStore(self.path)
+        self.store.initialize()
+        self.assertEqual(self.rows(), {})  # no partially committed snapshot
+        with closing(sqlite3.connect(self.path)) as db, db:
+            db.execute('DROP TRIGGER abort_snapshot')
+        client.review_state = self.store
+        await client.bump_lots(1)
+        self.assertEqual(sent, [1, 2])
+
+    async def test_sqlite_claim_abort_blocks_dispatch_and_survives_reopen(self):
+        self.store.autobump_cycle([1])
+        before = self.rows()
+        with closing(sqlite3.connect(self.path)) as db, db:
+            db.execute("CREATE TRIGGER abort_claim BEFORE UPDATE ON autobump_progress "
+                       "WHEN NEW.state = 'claimed' BEGIN SELECT RAISE(ABORT, 'synthetic'); END")
+        client, sent = self.client([1])
+        with self.assertRaises(StateError):
+            await client.bump_lots(1)
+        self.assertEqual(sent, [])
+        self.store = ReviewReceiptStore(self.path)
+        self.store.initialize()
+        self.store.recover_autobump_progress()
+        self.assertEqual(self.rows(), before)
+
+    async def test_competing_store_claims_and_stale_attempts_are_fenced(self):
+        barrier = threading.Barrier(2)
+
+        def worker(attempt):
+            store = ReviewReceiptStore(self.path)
+            cycle = store.autobump_cycle([1])
+            barrier.wait(timeout=2)
+            return cycle[0]['cycle_id'], attempt, store.claim_autobump_target(
+                cycle[0]['cycle_id'], 1, attempt)
+
+        # SQLite-only workers: no additional Account, Runner or HTTP client.
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            futures = [executor.submit(worker, attempt) for attempt in ('a', 'b')]
+            results = [future.result(timeout=3) for future in futures]
+        self.assertEqual(len({cycle for cycle, _, _ in results}), 1)
+        self.assertEqual(sum(won for _, _, won in results), 1)
+        cycle_id, old_attempt, _ = next(result for result in results if result[2])
+        self.now.return_value = 20000  # a claim is not a stealable TTL lease
+        reopened = ReviewReceiptStore(self.path)
+        self.assertFalse(reopened.claim_autobump_target(cycle_id, 1, 'steal'))
+        reopened.recover_autobump_progress()
+        self.assertEqual(self.rows()[1]['eligible_at'], 27200)
+        reopened.complete_autobump_cycle(cycle_id)
+        self.now.return_value = 27200
+        new_cycle = reopened.autobump_cycle([1])[0]['cycle_id']
+        self.assertTrue(reopened.claim_autobump_target(new_cycle, 1, 'new'))
+        before = self.rows()
+        reopened.release_autobump_claim(1, old_attempt)
+        with self.assertRaises(StateError):
+            reopened.finish_autobump_target(1, old_attempt, 'success', 1)
+        self.assertFalse(reopened.claim_autobump_target(cycle_id, 1, 'stale'))
+        self.assertEqual(self.rows(), before)
+        reopened.finish_autobump_target(1, 'new', 'success', 7200)
+        self.assertEqual(self.rows()[1]['eligible_at'], 34400)
+
+    async def test_121_saved_successes_survive_interrupted_next_target(self):
+        cycle_id = self.store.autobump_cycle(list(range(1, 124)))[0]['cycle_id']
+        for game_id in range(1, 122):
+            attempt = f'saved-{game_id}'
+            self.assertTrue(self.store.claim_autobump_target(cycle_id, game_id, attempt))
+            self.store.finish_autobump_target(game_id, attempt, 'success', 7200)
+        saved = self.rows()
+        self.assertTrue(self.store.claim_autobump_target(cycle_id, 122, 'interrupted'))
+        self.now.return_value = 11000
+        self.store = ReviewReceiptStore(self.path)
+        self.store.initialize()
+        self.store.recover_autobump_progress()
+        client, sent = self.client(list(range(123, 0, -1)))
+        await client.bump_lots(1)
+        self.assertEqual(sent, [123])
+        rows = self.rows()
+        for game_id in range(1, 122):
+            self.assertEqual(rows[game_id], {**saved[game_id], 'cycle_id': None, 'position': None})
+        self.assertEqual(rows[122]['state'], 'ambiguous')
+        self.assertEqual(rows[122]['eligible_at'], 18200)
+        self.assertTrue(all(row['cycle_id'] is None for row in rows.values()))
+
+    async def test_unknown_repeated_recovery_preserves_deadline_until_exact_boundary(self):
+        client, sent = self.client([1], {1: requests.exceptions.ReadTimeout('synthetic')})
+        with self.assertRaises(_AmbiguousRaiseOutcome):
+            await client.bump_lots(1)
+        self.assertEqual(sent, [1])
+        for instant in (11000, 17199):
+            self.now.return_value = instant
+            self.store = ReviewReceiptStore(self.path)
+            self.store.initialize()
+            self.store.recover_autobump_progress()
+            resumed, sent = self.client([1])
+            await resumed.bump_lots(1)
+            self.assertEqual(sent, [])
+            self.assertEqual(self.rows()[1]['eligible_at'], 17200)
+        self.now.return_value = 17200
+        await resumed.bump_lots(1)
+        self.assertEqual(sent, [1])
 
     async def test_partial_cycle_restart_reorder_unknown_and_safe_window(self):
         client, sent = self.client([1, 2, 3, 4], {3: requests.exceptions.ReadTimeout('synthetic')})
@@ -253,6 +361,48 @@ class LoopPolicyTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.settings = copy.deepcopy(ui.bot_settings)
         self.addCleanup(lambda: (ui.bot_settings.clear(), ui.bot_settings.update(self.settings)))
+
+    async def test_outer_and_late_safety_gates_preserve_user_preference(self):
+        for blocker in ('safe_mode', 'manual_off', 'restart', 'backoff'):
+            for initially_blocked in (True, False):
+                with self.subTest(blocker=blocker, initially_blocked=initially_blocked):
+                    blocked = [initially_blocked]
+                    ui.bot_settings['auto_bump'] = True
+                    preference = copy.deepcopy(ui.bot_settings)
+
+                    def active(name):
+                        return blocked[0] and blocker == name
+
+                    def state():
+                        return (not active('manual_off'), 1)
+
+                    async def bump(*args, is_cancelled):
+                        self.assertFalse(is_cancelled())
+                        blocked[0] = True
+                        self.assertTrue(is_cancelled())
+                        return False, '', 60
+
+                    async def sleep(_):
+                        raise asyncio.CancelledError
+
+                    client = SimpleNamespace(
+                        bump_lots=AsyncMock(side_effect=bump), runner_stop_requested=lambda: False,
+                        get_runner_health=lambda: {'state': 'backoff' if active('backoff') else 'healthy'})
+                    namespace = {
+                        'Bot': object, 'FunPayClient': object,
+                        'asyncio': SimpleNamespace(sleep=sleep),
+                        '_require_env': lambda _: '1', 'bot_settings': ui.bot_settings,
+                        'get_autobump_state': state,
+                        'is_safe_mode_enabled': lambda: active('safe_mode'),
+                        'restart_requested': lambda: active('restart'),
+                        'module_enabled': lambda _: False,
+                        'logger': SimpleNamespace(bump=lambda *_: None),
+                    }
+                    with patch.object(ui, 'autobump_schedule_allows_now', return_value=True):
+                        with self.assertRaises(asyncio.CancelledError):
+                            await main_function('auto_bump_loop', namespace)(None, client)
+                    self.assertEqual(client.bump_lots.await_count, 0 if initially_blocked else 1)
+                    self.assertEqual(ui.bot_settings, preference)
 
     async def test_unknown_keeps_on_and_uses_pause_without_technical_notice(self):
         ui.bot_settings['auto_bump'] = True
