@@ -30,10 +30,20 @@ class WorkerError(Exception):
     """Fail safely without disclosing shell output, credentials or HTML."""
 
 
+def resolve_argv(argv: list[str], *, platform_name: str | None = None) -> list[str]:
+    """Use the Windows npm launcher (codex.cmd), not blocked codex.ps1."""
+    if (os.name if platform_name is None else platform_name) == "nt" and argv and argv[0] == "codex":
+        launcher = shutil.which("codex.cmd")
+        if launcher is None:
+            raise WorkerError("codex.cmd unavailable on PATH")
+        return [launcher, *argv[1:]]
+    return argv
+
+
 def run(argv: list[str], *, cwd: Path | None = None, timeout: int = 90,
         env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
     try:
-        result = subprocess.run(argv, cwd=cwd, timeout=timeout, env=env,
+        result = subprocess.run(resolve_argv(argv), cwd=cwd, timeout=timeout, env=env,
                                 text=True, encoding="utf-8", errors="replace",
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                 shell=False, check=False)
@@ -233,7 +243,7 @@ def execute_task(task: dict, root: Path) -> str:
                "--ask-for-approval", "never",
                "--output-last-message", str(message_file), "-"]
     try:
-        result = subprocess.run(command, cwd=checkout, input=prompt_for(task),
+        result = subprocess.run(resolve_argv(command), cwd=checkout, input=prompt_for(task),
                                 text=True, encoding="utf-8", errors="replace",
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                 timeout=1200, env=codex_environment(),

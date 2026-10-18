@@ -104,3 +104,22 @@ def test_state_survives_process_restart(tmp_path):
     path.write_text("invalid", encoding="utf-8")
     with pytest.raises(worker.WorkerError):
         worker.state_read(path)
+
+
+def test_windows_uses_codex_cmd_not_powershell_script(monkeypatch):
+    monkeypatch.setattr(worker.shutil, "which", lambda name: "C:/npm/codex.cmd" if name == "codex.cmd" else None)
+    assert worker.resolve_argv(["codex", "--version"], platform_name="nt") == [
+        "C:/npm/codex.cmd", "--version"
+    ]
+    assert worker.resolve_argv(["gh", "auth", "status"], platform_name="nt") == [
+        "gh", "auth", "status"
+    ]
+    assert worker.resolve_argv(["codex", "--version"], platform_name="posix") == [
+        "codex", "--version"
+    ]
+
+
+def test_windows_missing_codex_cmd_gives_safe_error(monkeypatch):
+    monkeypatch.setattr(worker.shutil, "which", lambda name: None)
+    with pytest.raises(worker.WorkerError, match="codex.cmd unavailable"):
+        worker.resolve_argv(["codex", "exec"], platform_name="nt")
