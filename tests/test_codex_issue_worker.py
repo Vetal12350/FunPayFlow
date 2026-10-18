@@ -123,3 +123,10 @@ def test_windows_missing_codex_cmd_gives_safe_error(monkeypatch):
     monkeypatch.setattr(worker.shutil, "which", lambda name: None)
     with pytest.raises(worker.WorkerError, match="codex.cmd unavailable"):
         worker.resolve_argv(["codex", "exec"], platform_name="nt")
+
+
+def test_codex_exec_approval_flag_is_before_subcommand(tmp_path):
+    command = worker.codex_exec_command(tmp_path / "last-message.txt")
+    assert command[:4] == ["codex", "--ask-for-approval", "never", "exec"]
+    assert command[4:6] == ["--sandbox", "workspace-write"]
+    assert command[-1] == "-"
