@@ -6,9 +6,11 @@ import re
 import sqlite3
 import tempfile
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from datetime import datetime
 from pathlib import Path
+from threading import Barrier
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -114,6 +116,68 @@ class OrderHistoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(card["listed_price"])
         self.assertEqual(card["observed_statuses"], {})
         self.assertEqual(old.get_order_statistics(300)["all_time"]["orders"], 1)
+
+    def test_order_write_interrupted_before_commit_is_invisible_and_replayable(self):
+        observer = ReviewReceiptStore(self.path, self.store.legacy_stats_path)
+        checks = []
+
+        class InterruptedCommit(sqlite3.Connection):
+            def __exit__(connection, exc_type, exc, traceback):
+                if exc_type is not None:
+                    return super().__exit__(exc_type, exc, traceback)
+                # Both writes reached SQLite, but another connection sees neither.
+                checks.append(connection.execute(
+                    "SELECT COUNT(*) FROM order_status_observations").fetchone()[0])
+                checks.append(observer.get_order_history("AA000001"))
+                checks.append(observer.get_sales_overview("all", 400)["orders"])
+                # Leave the transaction open: the store must close and roll it back.
+                raise sqlite3.OperationalError("synthetic interruption before commit")
+
+        with patch.object(self.store, "_connect", side_effect=lambda: sqlite3.connect(
+                self.path, factory=InterruptedCommit)):
+            with self.assertRaises(StateError):
+                self.store.record_order_observation("AA000001", "CLOSED", 200,
+                                                    listed_price=12, confirmed_currency="USD")
+        self.assertEqual(checks, [1, None, 0])
+        reopened = ReviewReceiptStore(self.path, self.store.legacy_stats_path)
+        reopened.initialize()
+        self.assertIsNone(reopened.get_order_history("AA000001"))
+        with closing(sqlite3.connect(self.path)) as db:
+            self.assertEqual(db.execute(
+                "SELECT COUNT(*) FROM order_status_observations").fetchone()[0], 0)
+        self.assertTrue(reopened.record_order_observation(
+            "AA000001", "CLOSED", 200, listed_price=12, confirmed_currency="USD"))
+        self.assertFalse(observer.record_order_observation("AA000001", "CLOSED", 200))
+        self.assertEqual(observer.get_sales_overview("all", 400)["usd_turnover"], "12")
+
+    def test_duplicate_sqlite_workers_and_stale_status_replay_after_reopen(self):
+        start = Barrier(2)
+
+        def write_duplicate():
+            worker = ReviewReceiptStore(self.path, self.store.legacy_stats_path)
+            start.wait(timeout=10)
+            return worker.record_order_observation(
+                "AA000001", "CLOSED", 200, listed_price=12, confirmed_currency="USD")
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = [pool.submit(write_duplicate) for _ in range(2)]
+            self.assertEqual(sorted(result.result(timeout=15) for result in results),
+                             [False, True])
+        reopened = ReviewReceiptStore(self.path, self.store.legacy_stats_path)
+        reopened.initialize()
+        reopened.record_order_observation("AA000001", "REFUNDED", 300)
+        for status, at in (("PAID", 100), ("CLOSED", 200), ("REFUNDED", 300)):
+            self.assertFalse(reopened.record_order_observation("AA000001", status, at))
+        card = self.store.get_order_history("AA000001")
+        self.assertEqual((card["current_status"], card["closed_at_utc"], card["last_seen_at"]),
+                         ("REFUNDED", 200, 300))
+        self.assertEqual(card["observed_statuses"], {"PAID": 100, "CLOSED": 200, "REFUNDED": 300})
+        overview = self.store.get_sales_overview("all", 400)
+        self.assertEqual((overview["orders"], overview["refunds"],
+                          overview["terminal_orders"], overview["usd_turnover"]), (0, 1, 1, "0"))
+        with closing(sqlite3.connect(self.path)) as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM orders").fetchone()[0], 1)
+            self.assertEqual(db.execute("PRAGMA quick_check").fetchone(), ("ok",))
 
     def test_quantity_is_not_inferred_from_library_default(self):
         adapter = load_event_adapters()["_order_history_fields"]

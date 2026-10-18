@@ -411,6 +411,79 @@ class HistoricalImportTests(unittest.TestCase):
         with closing(sqlite3.connect(self.root / caught.exception.backup_name)) as backup:
             self.assertEqual(backup.execute("SELECT COUNT(*) FROM orders").fetchone()[0], 0)
 
+    def test_interrupted_batch_rolls_back_and_restart_skips_committed_duplicates(self):
+        self.store.initialize()
+        rows = [make_row(f"AA{i:06d}") for i in range(1, 5)]
+        make_zip(self.zip, rows + rows)
+        original = sales_import._classify_row
+
+        def interrupt(connection, row):
+            if row["order_id"] == "AA000004":
+                # The preceding row in this batch was written but is not committed.
+                self.assertEqual(connection.execute(
+                    "SELECT COUNT(*) FROM orders").fetchone()[0], 3)
+                raise sqlite3.OperationalError("synthetic interruption inside batch")
+            return original(connection, row)
+
+        with patch.object(sales_import, "BATCH_SIZE", 2), patch.object(
+                sales_import, "_classify_row", side_effect=interrupt):
+            with self.assertRaises(SalesImportError):
+                import_zip(self.zip, self.db)
+        reopened = ReviewReceiptStore(self.db, self.root / "missing.json")
+        reopened.initialize()
+        self.assertEqual(self.db_rows("orders"), 2)
+        self.assertEqual(self.db_rows("order_status_observations"), 4)
+        self.assertEqual(self.db_rows("review_observations"), 2)
+        self.assertIsNone(reopened.get_order_history("AA000003"))
+        with patch.object(sales_import, "BATCH_SIZE", 2):
+            retry = import_zip(self.zip, self.db)
+            again = import_zip(self.zip, self.db)
+        self.assertEqual((retry["predicted_inserts"], retry["predicted_updates"],
+                          retry["unchanged"], retry["duplicates"]), (2, 0, 2, 4))
+        self.assertEqual((again["predicted_inserts"], again["predicted_updates"],
+                          again["unchanged"], again["duplicates"]), (0, 0, 4, 4))
+        self.assertEqual(self.db_rows("orders"), 4)
+        self.assertEqual(self.db_rows("order_status_observations"), 8)
+        self.assertEqual(self.db_rows("review_observations"), 4)
+        self.assertEqual(reopened.get_sales_overview("all", REPORT_AT)["usd_turnover"], "41.00")
+        with closing(sqlite3.connect(self.db)) as connection:
+            self.assertEqual(connection.execute("PRAGMA quick_check").fetchone(), ("ok",))
+
+    def test_sparse_refunds_and_missing_currency_stay_unknown_across_reimport(self):
+        rows = [make_row("AA000001", amount="0.10", rating=""),
+                make_row("AA000002", status="refunded", amount="999", rating=""),
+                make_row("AA000003", status="partially_refunded", amount="999", rating=""),
+                make_row("AA000004", currency="", rating=""),
+                make_row("AA000005", rating="")]
+        rows[1]["closed_at"] = "2026-09-24T21:35:00Z"
+        rows[1]["refunded_at"] = ""
+        rows[2]["partially_refunded_at"] = ""
+        for key in ("created_at", "paid_at", "closed_at", "refunded_at", "partially_refunded_at"):
+            rows[4][key] = ""
+        make_zip(self.zip, rows)
+        first = import_zip(self.zip, self.db)
+        self.assertEqual((first["parse_errors"], first["predicted_inserts"]), (2, 3))
+        reopened = ReviewReceiptStore(self.db, self.root / "missing.json")
+        reopened.initialize()
+        again = import_zip(self.zip, self.db)
+        self.assertEqual((again["parse_errors"], again["predicted_updates"], again["unchanged"]),
+                         (2, 0, 3))
+        self.assertIsNone(reopened.get_order_history("AA000004"))
+        self.assertIsNone(reopened.get_order_history("AA000005"))
+        for order_id, field in (("AA000002", "refunded_at_utc"),
+                                ("AA000003", "partially_refunded_at_utc")):
+            self.assertIsNone(reopened.get_order_history(order_id)[field])
+        all_time = reopened.get_sales_overview("all", REPORT_AT)
+        self.assertEqual((all_time["orders"], all_time["refunds"], all_time["partial_refunds"],
+                          all_time["terminal_orders"], all_time["usd_turnover"]),
+                         (1, 1, 1, 2, "0.10"))
+        # Missing refund dates must not be replaced by the import or payment date.
+        period = reopened.get_sales_overview("30d", REPORT_AT)
+        self.assertEqual((period["orders"], period["refunds"], period["partial_refunds"],
+                          period["usd_turnover"]), (1, 0, 0, "0.10"))
+        self.assertEqual(reopened.get_sales_turnover_by_currency("all", REPORT_AT),
+                         {"USD": "0.10"})
+
 
 if __name__ == "__main__":
     unittest.main()
