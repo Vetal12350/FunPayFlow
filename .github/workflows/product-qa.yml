@@ -16,6 +16,7 @@ on:
         type: choice
         options:
           - product
+          - core
           - full
 
 permissions:
@@ -23,6 +24,7 @@ permissions:
 
 jobs:
   product-qa:
+    if: github.event_name == 'pull_request' || inputs.suite != 'core'
     name: Owner journeys and regression QA
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -40,6 +42,33 @@ jobs:
       - name: Run offline owner-journey QA
         run: uv run --no-sync python scripts/qa_smoke.py --suite "$QA_SUITE"
       - name: Publish owner-readable QA summary
+        if: always()
+        shell: bash
+        run: |
+          if test -f .qa-reports/summary.md; then
+            cat .qa-reports/summary.md >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo 'QA report unavailable: see preceding job logs.' >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  core-qa:
+    if: github.event_name == 'pull_request' || inputs.suite == 'core'
+    name: Runtime and order reliability QA
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      PYTHONUTF8: '1'
+      PYTHONIOENCODING: utf-8
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          python-version: '3.13'
+      - name: Sync locked development environment
+        run: uv sync --locked --dev
+      - name: Run offline core QA
+        run: uv run --no-sync python scripts/qa_smoke.py --suite core
+      - name: Publish reliability QA summary
         if: always()
         shell: bash
         run: |
