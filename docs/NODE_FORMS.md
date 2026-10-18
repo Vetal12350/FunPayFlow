@@ -36,6 +36,27 @@ No HTML, IDs, option values, network exception text or private log lines are
 exposed. This does not itself fix an incompatible live form; it provides a
 safe actionable reason after the diagnostics build is deployed.
 
+## Live FIELD_NAME_UNSUPPORTED follow-up (2026-10-18)
+
+An authenticated owner wizard after staging deployment of `42a33c7` returned
+`FIELD_NAME_UNSUPPORTED`. This confirms the parser rejected one visible
+select's technical name; it **does not** identify the name or prove that it is
+safe to accept or ignore. Neither a transport/auth failure nor a successful
+schema parse was observed in that UI attempt.
+
+The next minimal diagnostic adds one fixed, allowlisted
+`unsupported_name_shape` to this failure (also visible to the owner, without
+the original field name): `plain`, `other_namespace`, `fields_deep`,
+`fields_format`, `service_like` or `other_format`. No raw HTML, field names,
+option values, IDs, account data or exception text are emitted, persisted or
+displayed. This does not change accepted field names or weaken rejection gates.
+Synthetic regression tests cover every category and sanitizer behavior.
+
+The follow-up requires a separately approved code rollout and exactly one
+owner action in the normal Telegram wizard to observe the category; the live
+FunPay issue remains **unfixed** until the underlying supported input structure
+is confirmed and re-tested.
+
 The production failure reported after `6d74ca8` has **not** yet been localized
 to a specific validation check. No parser acceptance rules were relaxed on a
 guess. In particular string/boolean user IDs, unsupported names/action URLs and
