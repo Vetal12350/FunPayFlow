@@ -225,6 +225,13 @@ def stage_and_pr(checkout: Path, issue: int) -> str:
               "--title", title, "--body", body, timeout=90)
 
 
+def codex_exec_command(message_file: Path) -> list[str]:
+    """Approval must precede the exec subcommand (Codex CLI parser rule)."""
+    return ["codex", "--ask-for-approval", "never",
+            "exec", "--sandbox", "workspace-write",
+            "--output-last-message", str(message_file), "-"]
+
+
 def execute_task(task: dict, root: Path) -> str:
     issue = task["number"]
     checkout = root / "jobs" / f"issue-{issue}"
@@ -239,9 +246,7 @@ def execute_task(task: dict, root: Path) -> str:
     run(["uv", "sync", "--locked", "--dev"], cwd=checkout, timeout=600)
     message_file = root / "reports" / f"issue-{issue}.txt"
     message_file.parent.mkdir(parents=True, exist_ok=True)
-    command = ["codex", "exec", "--sandbox", "workspace-write",
-               "--ask-for-approval", "never",
-               "--output-last-message", str(message_file), "-"]
+    command = codex_exec_command(message_file)
     try:
         result = subprocess.run(resolve_argv(command), cwd=checkout, input=prompt_for(task),
                                 text=True, encoding="utf-8", errors="replace",
