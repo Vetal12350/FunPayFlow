@@ -50,6 +50,14 @@ the existing runtime Account/RLock and GET-only path. For each failure collect
 only the allowlisted JSON warning; do not save HTML or raw journal lines. Use
 the confirmed reason to choose the next minimal fix and regression fixture.
 
+For diagnosis without owner Telegram clicks, see the
+[in-process design and offline feasibility tests](NODE_FORM_IN_PROCESS_DIAGNOSIS.md).
+That review selected the task's design-only safety fallback: the supported client
+cannot suppress redirects per call, and shared-lock HTTP can delay the runtime.
+No opt-in hook has been enabled or implemented; the rollout contract and remaining
+acceptance tests are documented there. Do not treat this as a command to run a
+second process or as evidence of a live result.
+
 Unlike a general form-copying implementation, this adapter retains only safe
 visible SELECT metadata. It does not retain every input or hidden/session
 field, does not persist HTML, and does not implement publication/ID guessing.

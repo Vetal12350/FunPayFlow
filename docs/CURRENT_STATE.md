@@ -2,6 +2,8 @@
 
 Обновлено: **2026-10-18**. Перед новой задачей перепроверь Git; документ не заменяет текущий HEAD/status.
 
+- In-process NodeForm diagnosis без Telegram clicks: выбран предусмотренный задачей design-only fallback. Установленный Account.method не поддерживает per-call redirect control; HTTP под общим RLock может задержать polling/shutdown, transport timeout не ограничивает весь run. Runtime-hook/opt-in не добавлен, диагностика остаётся выключенной. [Дизайн, блокеры, offline evidence и acceptance/rollout plan](NODE_FORM_IN_PROCESS_DIAGNOSIS.md); live причина и результат не установлены.
+
 - Source baseline текущего пакета NodeForm diagnostics: `6d74ca83cf54e246cda4f02c4861a022677623ed` (GET-only dynamic Node Fields). Ветка разработки: `codex/node-form-diagnostics`. Актуальные HEAD/status определять через Git.
 - Stable release: `v1.0.0` (публикация зафиксирована владельцем и RELEASE_CHECKLIST; локальный tag указывает на `b288ef2`). Package metadata по-прежнему `1.0.0`. HEAD содержит post-release изменения: это не доказательство наличия нового кода в опубликованном ZIP. Tag/assets v1.0.0 не пересоздавать.
 - Реализовано: src-layout package/install flow; Telegram modules/setup, orders/statistics/multi-currency analytics и official sales import; review persistence; transient polling TLS/network recovery; persistent autobump claim/progress/cooldown и resume; сохранение ручного OFF; подавление runtime Telegram noise и persistent critical-category dedup.
