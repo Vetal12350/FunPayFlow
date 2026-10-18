@@ -24,6 +24,7 @@ read-only live smoke через существующую авторизован�
 ```bash
 uv sync --locked --dev
 uv run --no-sync python scripts/qa_smoke.py --suite product
+uv run --no-sync python scripts/qa_smoke.py --suite core
 uv run --no-sync python scripts/qa_smoke.py --suite full
 ```
 
@@ -32,9 +33,16 @@ uv run --no-sync python scripts/qa_smoke.py --suite full
 если там могут оказаться приватные данные). Команда завершается с ошибкой,
 если pytest упал, превысил лимит времени, не выдал тесты или отсутствуют файлы.
 
-Workflow **Product QA** автоматически запускается для релевантных Pull Request.
+В режиме **core** дополнительно проверяются независимые критичные контракты:
+autobump resume/startup/schedule, polling/network recovery, runtime restart,
+order history, sales analytics, historical import и communication automation.
+Каждая подсистема получает отдельную строку отчёта PASS/FAIL/SKIP.
+При ошибке теста job завершается FAIL; нулевой набор тестов тоже FAIL.
+
+Workflow **Product QA** автоматически запускает обе независимые QA job
+(product user journeys и core reliability) для релевантных Pull Request.
 Также его можно запустить вручную через **GitHub → Actions → Product QA →
-Run workflow** и выбрать `product` или `full`. В workflow только
+Run workflow** и выбрать `product`, `core` или `full`. В workflow только
 `contents: read`, без секретов; отчёт выводится в GitHub Actions Summary.
 Существующий CI не меняется.
 
