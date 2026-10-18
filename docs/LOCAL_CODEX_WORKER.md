@@ -31,7 +31,7 @@ py -3.13 "%LOCALAPPDATA%\FunPayFlowCodexWorker\source\scripts\codex_issue_worker
 Для ручного запуска выполните в **PowerShell**:
 
 ```powershell
-& "$env:LOCALAPPDATA\FunPayFlowCodexWorker\source\scripts\start_codex_worker.ps1"
+powershell -NoProfile -ExecutionPolicy Bypass -File "$env:LOCALAPPDATA\FunPayFlowCodexWorker\source\scripts\start_codex_worker.ps1"
 ```
 
 Launcher обновляет свой source checkout через `git pull --ff-only`
