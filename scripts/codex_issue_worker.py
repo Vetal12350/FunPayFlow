@@ -207,8 +207,9 @@ def stage_and_pr(checkout: Path, issue: int) -> str:
     title = f"Codex task #{issue}: offline implementation"
     body = (f"Closes #{issue}\n\n"
             "Implemented by local Codex CLI on an isolated source checkout. "
-            "Full offline pytest, compile and packaging checks passed locally. "
-            "GitHub CI and human/ChatGPT review are still required.\n\n"
+            "Codex may run tests inside its sandbox. "
+            "Full pytest, compile and packaging run in credential-free GitHub CI, "
+            "not on the owner's Windows host. Human/ChatGPT review is required.\n\n"
             "No real FunPay, VPS or production actions were performed.")
     return gh("pr", "create", "--head", branch, "--base", "main",
               "--title", title, "--body", body, timeout=90)
@@ -241,15 +242,9 @@ def execute_task(task: dict, root: Path) -> str:
         raise WorkerError("Codex unavailable or timed out") from None
     if result.returncode:
         raise WorkerError("Codex failed; no changes pushed")
-    # Assert allowable patch before running potentially generated test code.
+    # Never execute agent-modified source outside the Codex sandbox on the owner's PC.
+    # Full pytest/packaging smoke run only in the existing credential-free GitHub CI.
     changed_paths(checkout)
-    for args, seconds in (
-        (["uv", "run", "--no-sync", "pytest", "-q", "tests"], 900),
-        (["uv", "run", "--no-sync", "python", "-m", "compileall", "-q",
-          "src/funpayflow", "tests", "scripts"], 90),
-        (["uv", "run", "--no-sync", "python", "tests/packaging_smoke.py"], 300),
-    ):
-        run(args, cwd=checkout, timeout=seconds)
     return stage_and_pr(checkout, issue)
 
 
