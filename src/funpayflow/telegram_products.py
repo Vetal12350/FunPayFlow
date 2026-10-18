@@ -1092,11 +1092,11 @@ async def _products_callback(callback, action, user_id):
     except NodeVariantConflictError:
         await callback.message.answer(VARIANT_WARNING, reply_markup=_menu([
             [('➕ Выбрать route / Variant заново', 'prd:choose:single:0')]]))
-    except NodeFormError:
+    except NodeFormError as cause:
         if user_id in _flows and _flows[user_id].get('node_state'):
-            await node_ui.error(callback.message, user_id, _flows[user_id])
+            await node_ui.error(callback.message, user_id, _flows[user_id], diagnostic=cause)
         else:
-            await callback.message.answer('Не удалось получить актуальные параметры раздела FunPay.')
+            await callback.message.answer(node_ui.safe_error_text(cause))
     except (ValueError, KeyError, IndexError, StateError, sqlite3.Error):
         if catalog_valid and _flows.get(user_id) is flow and flow.get('catalog_state'):
             await _catalog_error(callback, flow)
@@ -1290,11 +1290,11 @@ async def _products_input(message, user_id):
         await message.answer(STALE_WARNING)
     except NodeVariantConflictError:
         await message.answer(VARIANT_WARNING)
-    except NodeFormError:
+    except NodeFormError as cause:
         if flow.get('node_state'):
-            await node_ui.error(message, user_id, flow)
+            await node_ui.error(message, user_id, flow, diagnostic=cause)
         else:
-            await message.answer('Не удалось получить актуальные параметры раздела FunPay.')
+            await message.answer(node_ui.safe_error_text(cause))
     except (ValueError, KeyError, TypeError, StateError, sqlite3.Error):
         await message.answer('Не сохранено. Проверьте формат, переменные, маршрут и обязательные RU/EN поля. Можно исправить ввод или выйти через ❌ Отмена.')
     return True
