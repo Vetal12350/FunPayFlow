@@ -239,8 +239,10 @@ def execute_task(task: dict, root: Path) -> str:
     run(["uv", "sync", "--locked", "--dev"], cwd=checkout, timeout=600)
     message_file = root / "reports" / f"issue-{issue}.txt"
     message_file.parent.mkdir(parents=True, exist_ok=True)
-    command = ["codex", "exec", "--sandbox", "workspace-write",
-               "--ask-for-approval", "never",
+    # Approval is a top-level Codex option, not an exec subcommand option.
+    # codex exec --ask-for-approval never is rejected by current Codex CLI.
+    command = ["codex", "--ask-for-approval", "never",
+               "exec", "--sandbox", "workspace-write",
                "--output-last-message", str(message_file), "-"]
     try:
         result = subprocess.run(resolve_argv(command), cwd=checkout, input=prompt_for(task),
