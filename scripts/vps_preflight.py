@@ -12,7 +12,6 @@ import os
 from pathlib import Path
 import sqlite3
 import subprocess
-from urllib.parse import quote
 
 CODE_DIR = Path("/root/FunPayFlow-next")
 DATA_DIR = Path("/root/FunPayFlow-data")
@@ -73,7 +72,7 @@ def sqlite_integrity(data: Path) -> str:
     try:
         if db.stat().st_size > MAX_DB_FOR_QUICK_CHECK:
             return "skipped_large"
-        uri = "file:" + quote(str(db), safe="/") + "?mode=ro"
+        uri = db.resolve().as_uri() + "?mode=ro"
         with closing(sqlite3.connect(uri, uri=True, timeout=3)) as connection:
             connection.execute("PRAGMA query_only=ON")
             result = connection.execute("PRAGMA quick_check").fetchone()
@@ -88,7 +87,7 @@ def inspect(code: Path = CODE_DIR, data: Path = DATA_DIR, proc: Path = PROC) -> 
     try:
         disk = os.statvfs(str(code if code.exists() else Path("/")))
         disk_available = "at_least_512_mb" if disk.f_bavail * disk.f_frsize >= 512 * 1024 * 1024 else "under_512_mb"
-    except OSError:
+    except (OSError, AttributeError):
         pass
     return {
         "report": "funpayflow_vps_preflight_v1",
