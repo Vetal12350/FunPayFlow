@@ -81,7 +81,12 @@ def sqlite_integrity(data: Path) -> str:
         return "unknown"
 
 
-def inspect(code: Path = CODE_DIR, data: Path = DATA_DIR, proc: Path = PROC) -> dict[str, object]:
+def inspect(code: Path | None = None, data: Path | None = None,
+            proc: Path | None = None) -> dict[str, object]:
+    # Resolve defaults at call time so offline tests never touch /root.
+    code = CODE_DIR if code is None else code
+    data = DATA_DIR if data is None else data
+    proc = PROC if proc is None else proc
     current, worktree = git_state(code)
     disk_available = "unknown"
     try:
