@@ -150,7 +150,7 @@ def test_facts_and_reason_are_allowlisted_even_after_attribute_changes():
 
 
 @pytest.mark.parametrize('name,expected_shape', [
-    ('unrecognized_dropdown', 'plain'),
+    ('user_identifier', 'plain'),
     ('other[option]', 'other_namespace'),
     ('fields[one][two][three][four][five]', 'fields_deep'),
     ('fields[bad space]', 'fields_format'),
