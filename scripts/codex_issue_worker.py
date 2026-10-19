@@ -297,6 +297,31 @@ def safe_path(path: str) -> bool:
     return True
 
 
+def ignore_known_pytest_scratch(checkout: Path) -> None:
+    """Keep ONLY tests/.offline-tmp out of git status in this isolated checkout.
+
+    This is a local .git/info/exclude rule, NOT a relaxation of safe_path() or
+    changed_paths(). Generated scratch must never be committed or pushed.
+    """
+    metadata = checkout / ".git"
+    info = metadata / "info"
+    exclude = info / "exclude"
+    if (not metadata.is_dir() or metadata.is_symlink() or
+            not info.is_dir() or info.is_symlink() or
+            not exclude.is_file() or exclude.is_symlink()):
+        raise WorkerError("Isolated checkout Git metadata unavailable")
+    try:
+        old = exclude.read_text(encoding="utf-8")
+        if len(old) > 32768:
+            raise WorkerError("Isolated checkout exclusions invalid")
+        rule = "/tests/.offline-tmp/"
+        if rule not in old.splitlines():
+            with exclude.open("a", encoding="utf-8", newline="\n") as stream:
+                stream.write(("" if not old or old.endswith("\n") else "\n") + rule + "\n")
+    except (OSError, UnicodeError):
+        raise WorkerError("Unable to configure isolated test scratch") from None
+
+
 def changed_paths(checkout: Path) -> list[str]:
     raw = run(["git", "status", "--porcelain=v1", "-z", "--untracked-files=all"],
               cwd=checkout).stdout
@@ -437,6 +462,9 @@ def execute_task(task: dict, root: Path, status: LiveStatus | None = None) -> st
         status.publish("clone", issue)
     run(["git", "clone", "--depth", "1", "--branch", "main", REMOTE,
          str(checkout)], timeout=180)
+    # Scoped local Git ignore for offline test output, set before Codex can edit.
+    # Never suppress unrelated untracked files from the security gate.
+    ignore_known_pytest_scratch(checkout)
     branch = f"codex/issue-{issue}"
     git(checkout, "checkout", "-b", branch)
     # Only the runner performs package sync, before untrusted generated changes.

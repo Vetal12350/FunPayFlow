@@ -368,3 +368,36 @@ def test_os_lock_is_released_on_child_crash(tmp_path):
         if child.poll() is None:
             child.kill()
             child.communicate(timeout=10)
+
+
+def test_known_pytest_scratch_ignored_only_in_local_checkout(tmp_path):
+    """Real offline Git status integration: ignore only the exact scratch tree."""
+    repo = tmp_path / "checkout"
+    repo.mkdir()
+    result = worker.subprocess.run(["git", "init", "-q", str(repo)],
+                                   stdout=worker.subprocess.PIPE,
+                                   stderr=worker.subprocess.PIPE,
+                                   timeout=15, check=False)
+    assert result.returncode == 0
+    worker.ignore_known_pytest_scratch(repo)
+    worker.ignore_known_pytest_scratch(repo)
+    exclude = (repo / ".git" / "info" / "exclude").read_text(encoding="utf-8")
+    assert exclude.splitlines().count("/tests/.offline-tmp/") == 1
+
+    scratch = repo / "tests" / ".offline-tmp" / "case"
+    scratch.mkdir(parents=True)
+    (scratch / "live_status.json").write_text("synthetic")
+    legitimate = repo / "tests" / "test_allowed.py"
+    legitimate.write_text("# test")
+    assert worker.changed_paths(repo) == ["tests/test_allowed.py"]
+
+    disallowed = repo / "outside-repo-policy.txt"
+    disallowed.write_text("synthetic")
+    with pytest.raises(worker.WorkerError, match="unauthorized file"):
+        worker.changed_paths(repo)
+    assert not worker.safe_path("tests/.offline-tmp/case/live_status.json")
+
+
+def test_known_pytest_scratch_refuses_untrusted_git_metadata(tmp_path):
+    with pytest.raises(worker.WorkerError, match="metadata unavailable"):
+        worker.ignore_known_pytest_scratch(tmp_path)
