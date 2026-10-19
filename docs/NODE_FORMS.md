@@ -196,6 +196,40 @@ The live failure remains unresolved pending that evidence. No `CURRENT_STATE`
 entry is needed for this bounded test/documentation audit; runtime behavior and
 deployment state have not changed.
 
+## Plain-name SELECT parser compatibility fix (2026-10-19)
+
+**Observed live:** after deployment of `842eaeeb`, the existing owner wizard
+reported `FIELD_NAME_UNSUPPORTED` with allowlisted
+`unsupported_name_shape=plain`. The actual technical name remains unknown,
+so an exact-name hypothesis is not established.
+
+**Implementation change:** the read-only parser now supports bounded ASCII
+plain-named visible SELECT controls as *draft category candidates* (e.g.
+`edition`, `region`), rather than immediately rejecting every control
+outside `fields[...]`. This follows the independent select collection in the
+pinned public Cardinal/Sigma references without copying hidden input/session
+values. Controls retain their **original technical name** and all ordinary
+label, option, duplicate, required, disabled and count validations; they are
+only metadata for a local draft and cannot publish a lot.
+
+A narrow fixed exclusion covers known plain service controls, including
+`currency`, `price`, `amount`, `auto_delivery`, `active`, and documented
+activation/locale controls. Standard `fields[summary]`/`fields[desc]` controls
+and existing explicit service keys are still excluded. Service-like plain names
+(`auth`, `csrf`, `token`, `password`, `account`, etc.), malformed names,
+and any invalid `fields[...]` namespaces remain fail-closed. These exclusions
+are conservative and may require a separate review for unusual legitimate
+category names; never accept private controls solely to suppress a diagnostic.
+
+Offline regression tests cover a mixed `fields[edition]` + `currency` form,
+a required plain `edition` field, several optional plain fields, duplicate or
+multiple selects, and non-public service names. Both actual node-specific
+forms and the exact rejected live name are still **unverified**. The new
+behavior must be deployed under existing VPS backup/rollback controls and
+smoke-tested using the owner's existing Account GET-only wizard for nodes
+976 and 986. If a new safe diagnostic appears, **do not guess another fix**;
+keep the lot unpublished and inspect the new allowlisted reason.
+
 ## Safe schema and cache
 
 Schema: `node_id`, ordered `fields`, `fetched_at`, SHA-256 `fingerprint`, and

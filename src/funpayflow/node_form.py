@@ -30,6 +30,19 @@ _SERVICE_KEYS = {'csrf', 'csrf_token', 'session', 'session_id', 'session_token',
                  'request_token', 'form_created_at', 'offer_id', 'node_id', 'password', 'secret',
                  'token', 'access_token', 'refresh_token', 'api_key', 'cookies', 'cookie', 'authorization'}
 _NAME = re.compile(r"fields(?:\[[A-Za-z0-9_.:-]{1,64}\]){1,4}\Z")
+# A visible category select may also use a simple HTML name (reference editors
+# first collect all selects). Accept only bounded, non-sensitive names, never
+# request/account/service keys or malformed fields[...] namespaces.
+_PLAIN_NAME = re.compile(r"[A-Za-z][A-Za-z0-9_.:-]{0,63}\Z")
+_PLAIN_SERVICE = frozenset({
+    "price", "amount", "auto_delivery", "active", "deactivate_after_sale",
+    "query", "currency", "secrets", "images", "offer", "node", "language", "lang",
+    "locale",
+})
+_SENSITIVE_PLAIN = re.compile(
+    r"account|auth|captcha|cookie|credential|csrf|email|hash|nonce|password|"
+    r"phone|private|request|secret|seller|session|signature|token|user_id|api_key", re.I
+)
 _REASONS = frozenset('''UNEXPECTED PARSER_UNEXPECTED REQUEST_INVALID ACCOUNT_SCOPE ACCOUNT_UNINITIALIZED
 HTTP_AUTH HTTP_STATUS HTTP_REDIRECT REQUEST_TRANSPORT REQUEST_FAILED URL_INVALID URL_HOST URL_PATH URL_NODE URL_OFFER URL_AUTH
 CONTENT_TYPE CONTENT_SIZE CONTENT_ENCODING PARSER_INPUT APP_DATA_JSON APP_DATA_SHAPE APP_USER_TYPE APP_USER_INVALID APP_USER_SCOPE
@@ -212,14 +225,20 @@ def _parse_impl(html, node_id, account_id, facts):
         if not name:
             raise NodeFormError("FIELD_NAME_MISSING")
         if not _field_name(name):
-            # Standard content and service controls are intentionally excluded.
+            # Safe plain category names are supported in addition to fields[...].
+            # Known controls stay excluded; unexpected private/service-like names
+            # fail closed rather than being copied into persisted draft metadata.
             parts = re.findall(r'\[([^\]]+)\]', name) or [name]
             if (any(part.casefold() in _SERVICE_KEYS for part in parts)
-                    or (_NAME.fullmatch(name) and parts[0] in _STANDARD)) or name in {
-                    "price", "amount", "auto_delivery", "active", "deactivate_after_sale", "query"}:
+                    or (_NAME.fullmatch(name) and parts[0] in _STANDARD)
+                    or (type(name) is str and name.casefold() in _PLAIN_SERVICE)):
                 continue
-            facts['unsupported_name_shape'] = _unsupported_name_shape(name)
-            raise NodeFormError("FIELD_NAME_UNSUPPORTED")
+            plain_category = (type(name) is str and _PLAIN_NAME.fullmatch(name)
+                              and not name.casefold().startswith("fields")
+                              and not _SENSITIVE_PLAIN.search(name))
+            if not plain_category:
+                facts['unsupported_name_shape'] = _unsupported_name_shape(name)
+                raise NodeFormError("FIELD_NAME_UNSUPPORTED")
         if name in names:
             raise NodeFormError('FIELD_DUPLICATE')
         if control.has_attr('multiple'):

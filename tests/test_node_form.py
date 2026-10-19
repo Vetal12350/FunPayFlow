@@ -44,7 +44,7 @@ def _reference_select_projection(html):
 
 
 @pytest.mark.parametrize("extra_first", [False, True])
-def test_reference_mixed_select_divergence_is_get_only_and_uncached(service, monkeypatch, extra_first):
+def test_reference_mixed_select_can_extract_category_without_plain_currency(service, monkeypatch, extra_first):
     category = ('<div class="form-group required"><label for="edition">Edition *</label>'
                 '<select id="edition" name="fields[edition]" required>'
                 '<option value="standard" selected>Standard</option>'
@@ -57,38 +57,78 @@ def test_reference_mixed_select_divergence_is_get_only_and_uncached(service, mon
     selected, categories = _reference_select_projection(html)
     assert selected == {"fields[edition]": "standard", "currency": "rub"}
     assert categories == {"fields[edition]": [("standard", "Standard"), ("deluxe", "Deluxe")]}
-    # The category itself is supported; adding the unrelated visible select
-    # causes rejection regardless of DOM order. No live name is implied.
-    baseline = parse_node_form(editor + category + '</form>', 976)
-    assert baseline['fields'][0]['required'] is True
-    assert baseline['fields'][0]['html_name'] == 'fields[edition]'
-    service.get(976)  # A failed refresh must also invalidate an existing schema.
-    service.client.account.calls.clear()
     service.client.account.response.content = html.encode()
     logs = []
     monkeypatch.setattr('funpayflow.node_form.logger.warning', logs.append)
-    with pytest.raises(NodeFormError) as caught:
-        service.get(976, force=True)
-    expected = dict(reason='FIELD_NAME_UNSUPPORTED', unsupported_name_shape='plain',
-                    http_status=200, url_category='editor', form_count=1, visible_select_count=2)
-    assert caught.value.diagnostic == expected
-    assert logs == ['NodeForm failure ' + json.dumps(expected, sort_keys=True)]
-    assert not service.client._node_form_cache
+    result = service.get(976, force=True)
+    assert logs == []
+    assert [f['html_name'] for f in result['fields']] == ['fields[edition]']
+    assert result['fields'][0]['required'] is True
+    assert result['fields'][0]['value'] == 'standard'
     assert service.client.account.calls == [
         (("get", "lots/offerEdit?node=976", {"accept-language": "ru"}, {}), {"raise_not_200": True})]
 
 
-def test_prefix_only_policy_can_silently_omit_a_required_category():
-    # Counterexample to assuming every non-fields name is a service control.
-    # Both this name and currency classify as plain; neither was observed live.
-    html = form('<select name="edition" required><option value="deluxe" selected>Deluxe</option></select>',
-                label="Edition *").replace('</form>', '<input name="price"></form>')
+def test_plain_required_category_is_retained_not_silently_omitted():
+    # Real failure shape was 'plain', not a known exact technical name.
+    html = form('<select name="edition" required><option value="deluxe" selected>Deluxe</option>'
+                '<option value="standard">Standard</option></select>', label="Edition *")
     selected, categories = _reference_select_projection(html)
     assert selected == {'edition': 'deluxe'} and categories == {}
+    schema = parse_node_form(html, 976)
+    assert len(schema['fields']) == 1
+    field = schema['fields'][0]
+    assert field['html_name'] == 'edition'
+    assert field['required'] is True
+    assert field['value'] == 'deluxe'
+    assert [x['value'] for x in field['options']] == ['deluxe', 'standard']
+
+
+@pytest.mark.parametrize('name', ['category_type', 'edition', 'game-mode', 'region.us'])
+def test_plain_named_optional_fields_preserve_identity(name):
+    schema = parse_node_form(form(
+        f'<select name="{name}"><option value="eu" selected>Europe</option>'
+        '<option value="us">USA</option></select>'), 976)
+    assert schema['fields'][0]['html_name'] == name
+    assert schema['fields'][0]['options'][1]['value'] == 'us'
+
+
+@pytest.mark.parametrize('name', [
+    'account_type', 'authorization_code', 'seller_token', 'user_identifier',
+    'fields', 'fieldsx', 'bad@field',
+])
+def test_plain_names_that_are_sensitive_or_malformed_still_fail_closed(name):
     with pytest.raises(NodeFormError) as caught:
-        parse_node_form(html, 976)
+        parse_node_form(form(
+            f'<select name="{name}"><option value="x" selected>Private</option></select>'), 976)
     assert caught.value.reason == 'FIELD_NAME_UNSUPPORTED'
-    assert caught.value.diagnostic['unsupported_name_shape'] == 'plain'
+    assert name not in str(caught.value)
+
+
+@pytest.mark.parametrize('name', ['api_key', 'form_created_at', 'csrf_token'])
+def test_explicit_service_keys_are_excluded_not_saved(name):
+    html = ('<form class="form-offer-editor"><input name="node_id" value="976">'
+            '<div class="form-group"><label>Edition</label>'
+            '<select name="fields[edition]"><option value="a" selected>A</option></select></div>'
+            '<div class="form-group"><label>Service</label>'
+            f'<select name="{name}"><option value="SYNTHETIC_PRIVATE">Secret</option></select></div>'
+            '</form>')
+    schema = parse_node_form(html, 976)
+    assert [field['html_name'] for field in schema['fields']] == ['fields[edition]']
+    assert 'SYNTHETIC_PRIVATE' not in repr(schema)
+
+
+def test_plain_field_duplicate_and_multiple_still_rejected():
+    html = form('<select name="edition"><option value="a" selected>A</option></select>')
+    duplicate = html.replace('</form>',
+        '<div class="form-group"><label>Edition 2</label>'
+        '<select name="edition"><option value="b">B</option></select></div></form>')
+    with pytest.raises(NodeFormError) as caught:
+        parse_node_form(duplicate, 976)
+    assert caught.value.reason == 'FIELD_DUPLICATE'
+    with pytest.raises(NodeFormError) as caught:
+        parse_node_form(html.replace('name="edition"', 'name="edition" multiple'), 976)
+    assert caught.value.reason == 'SELECT_MULTIPLE'
 
 
 @pytest.mark.parametrize('name,shape', [
