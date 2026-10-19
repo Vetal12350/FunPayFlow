@@ -175,6 +175,9 @@ def test_worker_step_order_uses_only_observed_phases(tmp_path, monkeypatch):
     calls = []
     monkeypatch.setattr(worker, "run", lambda argv, **kw: calls.append(argv) or SimpleNamespace(stdout=""))
     monkeypatch.setattr(worker, "git", lambda *args, **kwargs: "")
+    # This test mocks git clone, so it has no .git/info/exclude metadata.
+    # The exclusion itself is exercised by the separate real-offline-Git test.
+    monkeypatch.setattr(worker, "ignore_known_pytest_scratch", lambda checkout: None)
     monkeypatch.setattr(worker, "run_codex", lambda *args: calls.append("codex"))
     monkeypatch.setattr(worker, "changed_paths", lambda *args: ["tests/test_new.py"])
     monkeypatch.setattr(worker, "stage_and_pr", lambda *args: "https://github.com/Vetal12350/FunPayFlow/pull/88")
