@@ -112,6 +112,90 @@ deployment were performed. Further diagnosis needs the existing allowlisted
 reason from a separately authorized normal runtime wizard attempt; do not
 infer a parser relaxation or request raw HTML/credentials from this audit.
 
+## Sigma/Cardinal comparison and safe reproduction (2026-10-19)
+
+Audited checkout: `bf0216e04087c7c3564351ded17f4b35c8231ab6`.
+The production parser is **unchanged** by this audit. The reported failure on
+`42a33c7` establishes `FIELD_NAME_UNSUPPORTED`; the precise live name and shape
+remain **UNVERIFIED**. PR #57 shape diagnostics are present in this checkout;
+their deployment status is reported by the owner, not independently checked.
+
+The relevant references are the pinned [Sigma `get_create_lot_fields`
+loop](https://github.com/qorexdevs/FunPaySigma/blob/eabb45f6488c7a843f5a3f1959fe6124d7038b71/FunPayAPI/account.py#L1855-L1928)
+and [Cardinal `get_lot_fields`
+loop](https://github.com/sidor0912/FunPayCardinal/blob/c09dd13be25072bb3d5cdbba33d1e0d70e477710/FunPayAPI/account.py#L1765-L1810).
+Reference access limitation: Cardinal's raw source was readable; Sigma's GitHub
+view was truncated before the target method and raw retrieval failed. The
+Sigma-specific comparison therefore uses the task's explicitly confirmed loop
+behavior, not a claim to have executed or independently inspected that full
+method. Tests model only select projection, never either Account lifecycle.
+
+| Behavior | Sigma (confirmed loop supplied in task) | Cardinal (readable pinned source) | Current FunPayFlow |
+| --- | --- | --- | --- |
+| Visible select named `currency` | Stored in form dict; no category metadata | Selected value stored in result dict | Rejected unless a specific standard/service exception applies; `currency` has none |
+| `fields[edition]` | Stored in form dict and category metadata | Selected value stored in result dict | Validated category schema with label/options/constraints |
+| Category name boundary | Metadata only for `name.startswith('fields[')` | No separate category schema in the select dict loop | `_NAME`: 1–4 nonempty bracket segments, each 1–64 ASCII characters from letters/digits/`_.:-`; standard/service checks also apply |
+| Duplicate select name | Prefix selection alone provides no duplicate guarantee | Dict comprehension overwrites earlier value | `FIELD_DUPLICATE` |
+| Duplicate option value | Prefix selection alone provides no option guarantee | Select dict only reads the selected value | `OPTION_VALUE_OR_LABEL` |
+
+**CONFIRMED mechanism:** classification happens at different stages. Sigma's
+reported loop collects selects first and filters category metadata afterwards.
+FunPayFlow runs `_field_name` for each visible select, then either explicitly
+excludes a known control or rejects the whole form. `_SERVICE` substring matches
+reject ambiguous names; exact `_SERVICE_KEYS` bracket components can instead
+exclude known service controls. Thus even a form with valid category metadata
+can fail because another visible select has an unsupported name. This explains
+a reproducible failure mechanism, not the precise live trigger.
+
+`test_reference_mixed_select_divergence_is_get_only_and_uncached` constructs a
+synthetic editor with required `fields[edition]` (Standard/Deluxe) and `currency`
+(RUB/USD), both with explicit selected options and labeled form-groups. The
+reference-style projection returns both selected values and category metadata
+only for edition. FunPayFlow accepts edition alone, but rejects the mixed form
+in either DOM order with `FIELD_NAME_UNSUPPORTED` / `plain`. Through the existing
+fake Account it issues only the expected GET, emits only allowlisted facts and
+invalidates the old cache on failed refresh. No reference Account is instantiated
+and no real HTML, requests, credentials or POST are involved in these tests.
+
+### Policy decision and next steps
+
+A prefix-only skip policy cannot be proved safe from this evidence. A synthetic
+required select named `edition` would be silently omitted by that policy despite
+being meaningful category input. It has the same `plain` diagnostic as `currency`;
+HTML `required` alone cannot establish service versus category semantics. Nor
+does `fields[` prove safety: malformed/deep names and `fields[token_type]` pass
+that prefix test. Regression tests preserve their rejection and the independent
+duplicate-field/option checks. Copying the general reference form dict would
+also retain input/session data that this adapter deliberately excludes.
+
+Any future policy must preserve supported category fields and reject unsupported
+or suspicious category shapes, retain duplicate and option validation, and keep
+authentication, CSRF/token/session, price/amount and service controls out of the
+schema, fingerprint and cache. Arbitrary plain-name skipping or relaxing the
+regex/depth/service rules does not meet that requirement. Even an exact
+`currency` exception is premature: it is illustrative, not observed live.
+
+1. After a **separately authorized** diagnostic rollout, use the normal owner
+   wizard once and record only the existing allowlisted reason/shape/counts.
+   This audit neither deploys nor requests access to production or private data.
+2. Use that shape to narrow research: `plain`/`other_namespace` suggests the
+   mixed-control boundary; `fields_format`/`fields_deep` suggests category name
+   grammar; `service_like` requires reviewing the exclusion ambiguity. None
+   proves a particular field name or authorizes an acceptance change.
+3. Establish the control's category/service role from public source evidence or
+   a separately approved privacy-preserving structural diagnosis. Do not request
+   private HTML, raw field names/values, logs, cookies or credentials. If shape
+   alone is insufficient, retain fail-closed behavior and specify the missing
+   evidence rather than guessing a whitelist.
+4. Add a synthetic regression for the established structure before changing the
+   parser. Re-run parser, diagnostics, owner UI and node-product integration
+   tests offline. The trusted worker handles PR/Windows-Linux CI and Product/Core
+   QA; neither CI completion nor live compatibility is claimed by this audit.
+
+The live failure remains unresolved pending that evidence. No `CURRENT_STATE`
+entry is needed for this bounded test/documentation audit; runtime behavior and
+deployment state have not changed.
+
 ## Safe schema and cache
 
 Schema: `node_id`, ordered `fields`, `fetched_at`, SHA-256 `fingerprint`, and

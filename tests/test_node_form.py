@@ -6,6 +6,7 @@ import threading
 from types import SimpleNamespace
 
 import pytest
+from bs4 import BeautifulSoup
 from requests.exceptions import Timeout
 
 from funpayflow.node_form import NodeFormError, NodeFormService, parse_node_form
@@ -21,6 +22,106 @@ def fixture(name="cyberpunk"):
 def form(control='<select name="fields[x]"><option value="a">A</option></select>', label="Поле"):
     return ('<form class="form-offer-editor"><input type="hidden" name="node_id" value="976">'
             f'<div class="form-group"><label>{label}</label>{control}</div></form>')
+
+
+def _reference_select_projection(html):
+    """Model only the reported Sigma select loop and Cardinal select dict.
+
+    Synthetic, selected options and visible form-groups only. This is not an
+    execution of either Account implementation or a safe schema policy.
+    """
+    editor = BeautifulSoup(html, "html.parser").find("form", class_="form-offer-editor")
+    selected, categories = {}, {}
+    for control in editor.find_all("select"):
+        if "hidden" in control.find_parent(class_="form-group").get("class", []):
+            continue
+        name = control["name"]
+        selected[name] = control.find("option", selected=True)["value"]
+        if name.startswith("fields["):
+            categories[name] = [(option["value"], option.text)
+                                for option in control.find_all("option")]
+    return selected, categories
+
+
+@pytest.mark.parametrize("extra_first", [False, True])
+def test_reference_mixed_select_divergence_is_get_only_and_uncached(service, monkeypatch, extra_first):
+    category = ('<div class="form-group required"><label for="edition">Edition *</label>'
+                '<select id="edition" name="fields[edition]" required>'
+                '<option value="standard" selected>Standard</option>'
+                '<option value="deluxe">Deluxe</option></select></div>')
+    currency = ('<div class="form-group"><label for="currency">Currency</label>'
+                '<select id="currency" name="currency"><option value="rub" selected>RUB</option>'
+                '<option value="usd">USD</option></select></div>')
+    editor = '<form class="form-offer-editor"><input name="node_id" value="976" type="hidden">'
+    html = editor + (currency + category if extra_first else category + currency) + '</form>'
+    selected, categories = _reference_select_projection(html)
+    assert selected == {"fields[edition]": "standard", "currency": "rub"}
+    assert categories == {"fields[edition]": [("standard", "Standard"), ("deluxe", "Deluxe")]}
+    # The category itself is supported; adding the unrelated visible select
+    # causes rejection regardless of DOM order. No live name is implied.
+    baseline = parse_node_form(editor + category + '</form>', 976)
+    assert baseline['fields'][0]['required'] is True
+    assert baseline['fields'][0]['html_name'] == 'fields[edition]'
+    service.get(976)  # A failed refresh must also invalidate an existing schema.
+    service.client.account.calls.clear()
+    service.client.account.response.content = html.encode()
+    logs = []
+    monkeypatch.setattr('funpayflow.node_form.logger.warning', logs.append)
+    with pytest.raises(NodeFormError) as caught:
+        service.get(976, force=True)
+    expected = dict(reason='FIELD_NAME_UNSUPPORTED', unsupported_name_shape='plain',
+                    http_status=200, url_category='editor', form_count=1, visible_select_count=2)
+    assert caught.value.diagnostic == expected
+    assert logs == ['NodeForm failure ' + json.dumps(expected, sort_keys=True)]
+    assert not service.client._node_form_cache
+    assert service.client.account.calls == [
+        (("get", "lots/offerEdit?node=976", {"accept-language": "ru"}, {}), {"raise_not_200": True})]
+
+
+def test_prefix_only_policy_can_silently_omit_a_required_category():
+    # Counterexample to assuming every non-fields name is a service control.
+    # Both this name and currency classify as plain; neither was observed live.
+    html = form('<select name="edition" required><option value="deluxe" selected>Deluxe</option></select>',
+                label="Edition *").replace('</form>', '<input name="price"></form>')
+    selected, categories = _reference_select_projection(html)
+    assert selected == {'edition': 'deluxe'} and categories == {}
+    with pytest.raises(NodeFormError) as caught:
+        parse_node_form(html, 976)
+    assert caught.value.reason == 'FIELD_NAME_UNSUPPORTED'
+    assert caught.value.diagnostic['unsupported_name_shape'] == 'plain'
+
+
+@pytest.mark.parametrize('name,shape', [
+    ('fields[]', 'fields_format'),
+    ('fields[edition]suffix', 'fields_format'),
+    ('fields[a][b][c][d][edition]', 'fields_deep'),
+    ('fields[token_type]', 'service_like'),
+])
+def test_reference_prefix_is_not_category_validation(name, shape):
+    html = form(f'<select name="{name}" required><option value="a" selected>A</option></select>')
+    assert name in _reference_select_projection(html)[1]
+    with pytest.raises(NodeFormError) as caught:
+        parse_node_form(html, 976)
+    assert caught.value.reason == 'FIELD_NAME_UNSUPPORTED'
+    assert caught.value.diagnostic['unsupported_name_shape'] == shape
+
+
+@pytest.mark.parametrize('duplicate_field', [False, True])
+def test_reference_dicts_do_not_replace_duplicate_validation(duplicate_field):
+    control = '<select name="fields[edition]"><option value="a" selected>A</option>'
+    if duplicate_field:
+        html = form(control + '</select>').replace('</form>',
+            '<div class="form-group"><label>Other edition</label>'
+            '<select name="fields[edition]"><option value="b" selected>B</option></select></div></form>')
+        assert _reference_select_projection(html)[0] == {'fields[edition]': 'b'}
+        reason = 'FIELD_DUPLICATE'
+    else:
+        html = form(control + '<option value="a">Other A</option></select>')
+        assert len(_reference_select_projection(html)[1]['fields[edition]']) == 2
+        reason = 'OPTION_VALUE_OR_LABEL'
+    with pytest.raises(NodeFormError) as caught:
+        parse_node_form(html, 976)
+    assert caught.value.reason == reason
 
 
 class Account:
