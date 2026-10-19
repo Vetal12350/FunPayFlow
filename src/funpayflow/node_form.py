@@ -146,6 +146,29 @@ def _field_name(name):
             and not any(part.casefold() in _SERVICE_KEYS for part in parts))
 
 
+def is_safe_plain_field_name(name):
+    """Whether a plain SELECT name is a retained category candidate."""
+    return bool(isinstance(name, str) and _PLAIN_NAME.fullmatch(name)
+                and not name.casefold().startswith('fields')
+                and name.casefold() not in _PLAIN_SERVICE | _SERVICE_KEYS
+                and not _SENSITIVE_PLAIN.search(name))
+
+
+def is_safe_node_binding_name(name):
+    """Accept category identities only; schema presence is checked separately.
+
+    Bracket names retain their grammar and service checks, with the same
+    sensitive/service exclusions as plain bindings applied to each component.
+    """
+    if is_safe_plain_field_name(name):
+        return True
+    if not _field_name(name):
+        return False
+    parts = re.findall(r'\[([^\]]+)\]', name)
+    return not (_SENSITIVE_PLAIN.search(name)
+                or any(part.casefold() in _PLAIN_SERVICE for part in parts))
+
+
 def _unsupported_name_shape(name):
     """Classify a rejected select name without retaining any response text."""
     if not isinstance(name, str):
@@ -233,10 +256,7 @@ def _parse_impl(html, node_id, account_id, facts):
                     or (_NAME.fullmatch(name) and parts[0] in _STANDARD)
                     or (type(name) is str and name.casefold() in _PLAIN_SERVICE)):
                 continue
-            plain_category = (type(name) is str and _PLAIN_NAME.fullmatch(name)
-                              and not name.casefold().startswith("fields")
-                              and not _SENSITIVE_PLAIN.search(name))
-            if not plain_category:
+            if not is_safe_plain_field_name(name):
                 facts['unsupported_name_shape'] = _unsupported_name_shape(name)
                 raise NodeFormError("FIELD_NAME_UNSUPPORTED")
         if name in names:

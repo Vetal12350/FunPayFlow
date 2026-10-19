@@ -273,6 +273,28 @@ placeholders show `—` with a warning instead of fabricated defaults; configure
 bindings or content text before using the draft elsewhere. This is a local
 draft, not a publish-ready offer.
 
+Bindings are owner-explicit, case-sensitive technical field names, supporting
+both safe plain names (e.g. `platform`, `edition`) and `fields[...]` names.
+For a schema that actually contains plain `platform` and `edition`, the manual
+mapping is `"node_bindings": {"platform": "platform", "edition": "edition"}`.
+These names are examples, not claims about any particular live form. Every
+bound technical field must exist in the current parsed schema; a wrong name
+or a binding to an absent field is rejected by `node_setup`. A genuinely absent
+`region` remains unbound and renders `—` with the warning.
+
+Never auto-derive platform/edition/region from display labels or generic template
+defaults. Even matching labels do not establish a binding. Mapping remains manual
+through JSON; a Telegram field-selection and owner-confirmation workflow is
+deferred to a separate phase. Service/sensitive names and malformed names cannot
+be bound, including price, amount, currency, account, token, session and CSRF
+controls; bracket syntax does not bypass these exclusions.
+
+The owner reports that the GET-only NodeForm wizard for node 986 succeeds after
+PR #65 / `5e605a90`. This checkout change aligns binding validation with safe
+plain names; template rendering still requires the owner's explicit mapping.
+No live form was inspected here, no region field is asserted, and no lot was
+published or live behavior independently verified.
+
 Variant `node_values` maps technical field identities to technical option values.
 The current schema validates presets, including verified alternate nodes of
 the same game. Legacy Variant variable defaults require explicit binding and
