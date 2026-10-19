@@ -255,6 +255,28 @@ def test_safe_links_only():
         assert not cc.safe_link(value)
 
 
+@pytest.mark.parametrize("value, expected", [
+    ("https://github.com/Vetal12350/FunPayFlow/issues/42", True),
+    ("http://github.com/Vetal12350/FunPayFlow/issues/42", False),
+    ("https://github.com.evil.test/Vetal12350/FunPayFlow/issues/42", False),
+    ("https://user@github.com/Vetal12350/FunPayFlow/issues/42", False),
+    ("https://github.com/Vetal12350/OtherRepo/issues/42", False),
+    ("https://github.com/Vetal12350/FunPayFlow/issues/42?token=x", False),
+    ("https://github.com/Vetal12350/FunPayFlow/issues/42#comment", False),
+    ("https://github.com/Vetal12350/FunPayFlow/issues/%2e%2e/42", False),
+    ("https://github.com/Vetal12350/FunPayFlow/issues/42/", False),
+    ("https://github.com/Vetal12350/FunPayFlow/issues/4 2", False),
+    ("https://github.com/Vetal12350/FunPayFlow/issues/4\t2", False),
+    ("https://github.com/Vetal12350/FunPayFlow/issues/4\n2", False),
+    ("https://github.com/Vetal12350/FunPayFlow/issues/42\n", False),
+    ("https://github.com/Vetal12350/FunPayFlow/issues/0", False),
+    ("https://github.com/Vetal12350/FunPayFlow/issues/-1", False),
+    ("https://github.com/Vetal12350/FunPayFlow/issues/01", False),
+])
+def test_safe_issue_links_strict_allowlist(value, expected):
+    assert cc.safe_link(value) is expected
+
+
 def test_stage_comes_only_from_observed_checks():
     assert cc.stage({"phase": "codex_running"}) == "Codex running"
     assert cc.stage({"phase": "pr_created"}) == "PR created"
