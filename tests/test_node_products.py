@@ -11,6 +11,7 @@ from funpayflow.node_form import NodeFormService, NodeFormError
 from funpayflow.node_products import (NodeDraftService, selected_fields, STALE_WARNING,
                                      NodeSelectionError, NodeVariantConflictError, VARIANT_WARNING)
 from funpayflow.product_variants import VariantService
+from funpayflow.product_templates import ProductValidationError, validate_node_bindings
 
 
 @pytest.fixture(params=['cyberpunk','elden_ring'])
@@ -54,6 +55,125 @@ def make(ctx,values=None,**kwargs):
 
 def save(ctx,body):
     return ctx.nd.confirm(ctx.nd.stage([body])['token'])['results'][0]
+
+
+@pytest.fixture
+def plain_node(node):
+    ctx = node
+    # Conceptual form, not captured live HTML. Deliberately no region field and
+    # no semantic display labels: only the owner's technical mapping can bind.
+    ctx.html = (f'<form class="form-offer-editor"><input name="node_id" value="{ctx.node_id}">'
+                '<div class="form-group"><label>Choice A</label><select name="platform" required>'
+                '<option value="pc" selected>PC</option><option value="ps">PlayStation</option></select></div>'
+                '<div class="form-group"><label>Choice B</label><select name="edition">'
+                '<option value="standard" selected>Standard Edition</option>'
+                '<option value="deluxe">Deluxe Edition</option></select></div></form>')
+    template = ctx.templates.get(ctx.template['id'])
+    template['node_bindings'] = {'platform': 'platform', 'edition': 'edition'}
+    ctx.template = ctx.templates.save(template, template['id'], template['revision'])
+    return ctx
+
+
+@pytest.mark.parametrize('name', [
+    'platform', 'edition', 'category_type', 'game-mode', 'region.us', 'a:b', 'A' * 64,
+    'fields[platform]', 'fields[game][edition]', 'fields[a][b][c][d]',
+])
+def test_explicit_binding_accepts_safe_technical_grammar(name):
+    assert validate_node_bindings({'platform': name}, ['platform']) == {'platform': name}
+
+
+@pytest.mark.parametrize('name', [
+    '', None, 1, 'A' * 65, '1platform', 'bad@field', ' platform', 'platform\n',
+    'fields', 'fieldsx', 'other[edition]', 'fields[]', 'fields[edition]suffix',
+    'fields[a][b][c][d][e]', 'fields[' + 'a' * 65 + ']',
+    'price', 'amount', 'currency', 'active', 'auto_delivery', 'locale',
+    'account_type', 'authorization', 'secret', 'csrf_token', 'session_id',
+    'seller_token', 'password', 'cookies', 'api_key', 'node_id', 'offer_id',
+    'fields[summary]', 'fields[desc][en]', 'fields[token_type]', 'fields[session_id]',
+    'fields[request]', 'fields[node_id]', 'fields[secret]', 'fields[account_type]',
+    'fields[cookies]', 'fields[price]', 'fields[amount]', 'fields[currency]',
+    'fields[game][price]',
+])
+def test_binding_rejects_malformed_standard_and_service_names(name):
+    with pytest.raises(ProductValidationError, match='node_bindings:'):
+        validate_node_bindings({'platform': name}, ['platform'])
+
+
+def test_plain_binding_renders_option_labels_and_safe_lifecycle(plain_node):
+    ctx = plain_node
+    body = make(ctx)
+    assert body['variables']['platform'] == 'PC'
+    assert body['variables']['edition'] == 'Standard Edition'
+    assert body['variables']['region'] == '—'
+    assert 'node_bindings' in body['node_warning']
+    for language in ('ru', 'en'):
+        for field in ('title_', 'description_'):
+            text = body['payload'][field + language]
+            assert 'PC' in text and 'Standard Edition' in text and '—' in text
+            assert 'Global' not in text and 'Steam' not in text
+    text, _ = view._preview_screen({'preview': body})
+    assert 'PC' in text and 'Standard Edition' in text
+    assert ctx.store.list_drafts() == []
+    assert ctx.nd.rebuild(body) == body
+    source = save(ctx, body)
+    assert ctx.nd.refresh_preview(source)['node_fields'] == source['node_fields']
+    clone = ctx.nd.clone_preview(source['id'], source['revision'])
+    changed = ctx.nd.create_node_preview(ctx.template['id'], ctx.route['id'],
+                                        {'platform': 'ps', 'edition': 'deluxe'}, price='25')
+    assert changed['variables']['platform'] == 'PlayStation'
+    assert changed['variables']['edition'] == 'Deluxe Edition'
+    assert clone['node_bindings'] == {'platform': 'platform', 'edition': 'edition'}
+    saved_clone = save(ctx, clone)
+    assert saved_clone['id'] != source['id']
+    assert ctx.store.get_draft(source['id']) == source
+    assert all(c.args[0] == 'get' for c in ctx.client.account.method.call_args_list)
+    ctx.client.account.save_lot.assert_not_called()
+
+
+def test_plain_names_without_bindings_stay_neutral(plain_node):
+    ctx = plain_node
+    template = ctx.templates.get(ctx.template['id'])
+    template.pop('node_bindings')
+    ctx.templates.save(template, template['id'], template['revision'])
+    body = make(ctx)
+    assert all(body['variables'][key] == '—' for key in ('platform', 'edition', 'region'))
+    assert [row['option_label'] for row in body['node_fields']] == ['PC', 'Standard Edition']
+    assert 'node_bindings' in body['node_warning']
+    for language in ('ru', 'en'):
+        for field in ('title_', 'description_'):
+            text = body['payload'][field + language]
+            assert '—' in text
+            assert all(value not in text for value in ('PC', 'Steam', 'Global', 'Standard'))
+
+
+@pytest.mark.parametrize('name', ['Platform', 'fields[platform]', 'region'])
+def test_plain_binding_requires_exact_field_present_in_schema(plain_node, name):
+    ctx = plain_node
+    template = ctx.templates.get(ctx.template['id'])
+    template['node_bindings']['platform'] = name
+    ctx.templates.save(template, template['id'], template['revision'])
+    with pytest.raises(NodeSelectionError):
+        ctx.nd.node_setup(ctx.template['id'], ctx.route['id'])
+    assert ctx.store.list_drafts() == []
+
+
+def test_plain_binding_content_and_variant_conflicts(plain_node):
+    ctx = plain_node
+    with pytest.raises(NodeVariantConflictError):
+        make(ctx, variables={'platform': 'Steam'})
+    with pytest.raises(NodeVariantConflictError):
+        make(ctx, overrides={'variables': {'edition': 'Deluxe Edition'}})
+    variant = VariantService(ctx.store, ctx.routes).save({
+        'template_id': ctx.template['id'], 'route_id': ctx.route['id'],
+        'display_name': 'Incompatible', 'overrides': {'variables': {'edition': 'Missing Edition'}}})
+    with pytest.raises(NodeVariantConflictError):
+        ctx.nd.node_setup(ctx.template['id'], ctx.route['id'], variant['id'])
+    variant['overrides']['variables']['edition'] = 'Deluxe Edition'
+    variant = VariantService(ctx.store, ctx.routes).save(variant, variant['id'], variant['revision'])
+    *_, values = ctx.nd.node_setup(ctx.template['id'], ctx.route['id'], variant['id'])
+    assert values['edition'] == 'deluxe'
+    assert make(ctx, values, variant_id=variant['id'])['variables']['edition'] == 'Deluxe Edition'
+    assert ctx.store.list_drafts() == []
 
 
 def test_dynamic_draft_roundtrip_no_hidden_and_identity(node):

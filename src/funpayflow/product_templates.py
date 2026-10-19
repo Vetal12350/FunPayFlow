@@ -4,6 +4,8 @@ from copy import deepcopy
 from dataclasses import dataclass
 import re
 
+from .node_form import is_safe_node_binding_name
+
 
 GAME_KEY = "GAME_KEY"
 VARIABLES = ("game", "platform", "region", "edition", "product_name", "quantity")
@@ -132,10 +134,8 @@ def validate_node_bindings(bindings, allowed):
     if not isinstance(bindings, dict) or set(bindings) - set(allowed) or set(bindings) & {'game', 'quantity', 'product_name'}:
         raise ProductValidationError('node_bindings: invalid variable')
     for name in bindings.values():
-        if not isinstance(name, str) or not re.fullmatch(r'fields(?:\[[A-Za-z0-9_.:-]{1,64}\]){1,4}', name):
+        if not is_safe_node_binding_name(name):
             raise ProductValidationError('node_bindings: technical select name required')
-        if any(part in name.casefold() for part in ('csrf', 'token', 'password', 'cookie', 'session', 'offer_id')):
-            raise ProductValidationError('node_bindings: service field forbidden')
     return deepcopy(bindings)
 
 
