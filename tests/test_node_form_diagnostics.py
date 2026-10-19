@@ -53,7 +53,7 @@ def assert_failure(service, logs, reason):
     (form().replace('</form>', '<input name="offer_id" value="1"></form>'), 'OFFER_CONTEXT'),
     (form().replace('class="form-group"', 'class="other"'), 'SELECT_GROUP'),
     (form().replace(' name="fields[x]"', ''), 'FIELD_NAME_MISSING'),
-    (form().replace('fields[x]', 'unsupported'), 'FIELD_NAME_UNSUPPORTED'),
+    (form().replace('fields[x]', 'user_identifier'), 'FIELD_NAME_UNSUPPORTED'),
     (form().replace('</div>', '</div><div class="form-group"><label>X</label><select name="fields[x]"><option>A</option></select></div>'), 'FIELD_DUPLICATE'),
     (form().replace('<select ', '<select multiple '), 'SELECT_MULTIPLE'),
     (form().replace('<label>Поле</label>', ''), 'LABEL_COUNT'),
