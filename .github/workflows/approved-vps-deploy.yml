@@ -1,9 +1,13 @@
 name: Approved VPS deployment
 
-# Deliberately manual: one explicit owner action per production update.
-# Never deploy on push, pull_request, or on a Codex issue.
+# After successful CI for a push to main, request the Environment approval.
+# NEVER exposes SSH secrets on pull_request or a Codex issue.
+# No job runs until FUNPAY_DEPLOY_ARMED is intentionally enabled.
 on:
-  workflow_dispatch:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
 
 permissions:
   contents: read
@@ -16,27 +20,18 @@ concurrency:
 jobs:
   verify:
     name: Verify reviewed main and repeat offline tests
+    if: >-
+      ${{ vars.FUNPAY_DEPLOY_ARMED == 'true' &&
+          github.repository == 'Vetal12350/FunPayFlow' &&
+          github.event.workflow_run.event == 'push' &&
+          github.event.workflow_run.conclusion == 'success' &&
+          github.event.workflow_run.head_repository.full_name == 'Vetal12350/FunPayFlow' &&
+          github.event.workflow_run.head_branch == 'main' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     outputs:
       sha: ${{ steps.pin.outputs.sha }}
     steps:
-      - name: Fail closed until owner configures GitHub Environment and dedicated key
-        env:
-          ARMED: ${{ vars.FUNPAY_DEPLOY_ARMED }}
-        run: |
-          set -euo pipefail
-          if [ "$GITHUB_REPOSITORY" != "Vetal12350/FunPayFlow" ] ||
-             [ "$GITHUB_REF" != "refs/heads/main" ] ||
-             [ "$GITHUB_ACTOR" != "Vetal12350" ]; then
-            echo "BLOCKED: only the owner may deploy current main"
-            exit 1
-          fi
-          if [ "$ARMED" != "true" ]; then
-            echo "BLOCKED: deploy is disabled until separate environment approval and restricted SSH bootstrap"
-            exit 1
-          fi
-
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
@@ -45,7 +40,7 @@ jobs:
         id: pin
         env:
           GH_TOKEN: ${{ github.token }}
-          EXPECTED_SHA: ${{ github.sha }}
+          EXPECTED_SHA: ${{ github.event.workflow_run.head_sha }}
         run: |
           set -euo pipefail
           sha="$(git rev-parse HEAD)"
