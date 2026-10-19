@@ -266,8 +266,9 @@ Game/product name defaults to the verified GameRoute. An absent Region select
 does not produce a generic Region prompt.
 
 Optional ProductTemplate `node_bindings` maps content-variable names to verified
-technical select names. Configure it through the existing full JSON editor;
-there is no label-only or guessed semantic binding. Bound placeholders render
+technical select names. Configure it with the owner-only «🔗 Связать поля»
+button in a current dynamic draft preview (the full JSON editor also remains
+available). There is no label-only or guessed semantic binding. Bound placeholders render
 the selected option's current label. Unbound legacy platform/region/edition
 placeholders show `—` with a warning instead of fabricated defaults; configure
 bindings or content text before using the draft elsewhere. This is a local
@@ -283,9 +284,8 @@ or a binding to an absent field is rejected by `node_setup`. A genuinely absent
 `region` remains unbound and renders `—` with the warning.
 
 Never auto-derive platform/edition/region from display labels or generic template
-defaults. Even matching labels do not establish a binding. Mapping remains manual
-through JSON; a Telegram field-selection and owner-confirmation workflow is
-deferred to a separate phase. Service/sensitive names and malformed names cannot
+defaults. Even matching labels do not establish a binding. The Telegram picker
+requires an explicit source selection and owner confirmation. Service/sensitive names and malformed names cannot
 be bound, including price, amount, currency, account, token, session and CSRF
 controls; bracket syntax does not bypass these exclusions.
 
@@ -327,6 +327,45 @@ checks run before input cleanup. Refresh/Back/Cancel invalidate old controls;
 completing a similar edit also clears text input. New mass rows report
 `needs_resolution`; no hidden bulk GET/confirmation loop or fake generic drafts.
 Already staged legacy batches retain their existing confirmation behavior.
+
+## Owner-confirmed binding picker
+
+From a dynamic draft preview, choose **🔗 Связать поля**, then a content variable,
+then its actual labeled SELECT source. Sources show their exact technical names
+and selected option labels; callbacks carry only a short token, operation and
+index. Equal labels retain separate schema indices and disambiguated display
+labels. Only enabled safe fields with an existing nonempty selected option are
+offered. All template `allowed_variables` except `game`, `quantity` and
+`product_name` are eligible, including custom content variables.
+
+The summary shows e.g. `platform → Платформа: PC` only after that source is
+selected. Unbound `region` shows `Не связано · —`; the UI never infers whether
+any label means region or fabricates Global. If the form has no suitable field,
+leave it unbound or remove the unavailable placeholder using the template editor.
+**Не связывать / очистить** stages removal; **Отмена** discards all staged edits
+and retains the original preview and persisted mappings.
+
+Opening the picker forces a fresh schema GET through the existing scoped
+NodeFormService and Account RLock. Every action validates session/account,
+template revision, verified route, Variant and schema generation. Navigation,
+refresh, changed selections or another template edit invalidate old callbacks.
+The confirmation preflights the proposed mapping through `node_setup` and the
+existing renderer, preserving explicit content/Variant conflicts. A final context
+check and TemplateService revision compare-and-swap prevent silent overwrites.
+The existing template record is updated only on confirmation; no new schema or
+Account is created. Changes affect this shared ProductTemplate, as the UI states.
+
+After confirmation, RU/EN preview uses the chosen current option labels and keeps
+node selections, explicit content edits, quantity, price and input provenance.
+The draft itself still needs its separate **Сохранить draft** action. Existing
+saved drafts remain unchanged until explicitly saved. A stale preview must be
+reopened/resolved before binding; this picker does not repair missing fields or
+incompatible Variants. Publication and FunPay modifying requests remain absent.
+Offline synthetic UI/service regressions cover confirmation, clear/cancel,
+owner-only access, stale route/account/generation/token, same-label sources,
+unavailable selections, custom variables, neutral absent region, escaped preview
+and concurrent template writes. Live deployment and Windows/Linux CI are separate
+trusted-worker steps; these tests do not establish live schema compatibility.
 
 ## Standard controls confirmed for future research
 

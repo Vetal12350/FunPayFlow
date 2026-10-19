@@ -2,7 +2,7 @@
 from copy import deepcopy
 from .node_form import NodeFormService
 from .product_drafts import DraftService
-from .product_templates import ProductValidationError
+from .product_templates import ProductValidationError, validate_node_bindings
 
 
 LEGACY_NODE_VARIABLES = frozenset({'platform', 'region', 'edition'})
@@ -48,8 +48,8 @@ def selected_fields(schema, values):
 
 
 class NodeDraftService(DraftService):
-    def node_setup(self, template_id, route_id, variant_id=None, force=False):
-        template = self.templates.get(template_id)
+    def node_setup(self, template_id, route_id, variant_id=None, force=False, *, _template=None):
+        template = self.templates.get(template_id) if _template is None else _template
         parent = self._route(route_id, template_id)
         variant = self.variants.get(variant_id) if variant_id else None
         route = self.variants.resolve_route(variant, parent, template) if variant else parent
@@ -79,8 +79,8 @@ class NodeDraftService(DraftService):
         return template, route, variant, schema, defaults
 
     def create_node_preview(self, template_id, route_id, values, *, variables=None, price=None,
-                            overrides=None, variant_id=None, schema=None, input_values=None):
-        template, route, variant, current, defaults = self.node_setup(template_id, route_id, variant_id)
+                            overrides=None, variant_id=None, schema=None, input_values=None, _template=None):
+        template, route, variant, current, defaults = self.node_setup(template_id, route_id, variant_id, _template=_template)
         if schema is not None and (schema['node_id'] != current['node_id'] or schema['fingerprint'] != current['fingerprint']):
             raise NodeSelectionError()
         # Caller provides all reviewed selections; defaults are not silently merged at Save.
@@ -130,7 +130,17 @@ class NodeDraftService(DraftService):
             result['node_warning'] += ' Явный выбор параметра отличается от preset Variant; проверьте конфликт.'
         return result
 
-    def rebuild(self, preview, *, price=None, overrides=None, variables=None):
+    def preview_bindings(self, preview, bindings):
+        """Validate/render proposed bindings without writing a template or draft."""
+        template = self.templates.get(preview['template_id'])
+        template['node_bindings'] = validate_node_bindings(bindings, template['allowed_variables'])
+        result = self.rebuild(preview, _template=template)
+        for key in ('id', 'revision', 'created_at', 'updated_at', 'status'):
+            if key in preview:
+                result[key] = preview[key]
+        return result
+
+    def rebuild(self, preview, *, price=None, overrides=None, variables=None, _template=None):
         if 'node_fields' not in preview:
             return super().rebuild(preview, price=price, overrides=overrides, variables=variables)
         merged = {**preview.get('overrides', {}), **(overrides or {})}
@@ -144,7 +154,7 @@ class NodeDraftService(DraftService):
             variables={**self.variable_input(preview), **(variables or {})},
             price=preview['payload']['price'] if price is None else price, overrides=merged,
             variant_id=preview.get('variant_id'), schema=preview['node_schema'],
-            input_values=preview.get('node_input_values', {}))
+            input_values=preview.get('node_input_values', {}), _template=_template)
         # fetched_at is informational; identical safe structure is the same reviewed schema.
         result['node_schema'] = deepcopy(preview['node_schema'])
         return result
