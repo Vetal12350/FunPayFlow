@@ -95,7 +95,7 @@ def test_plain_named_optional_fields_preserve_identity(name):
 
 @pytest.mark.parametrize('name', [
     'account_type', 'authorization_code', 'seller_token', 'user_identifier',
-    'api_key', 'form_created_at', 'fields', 'fieldsx', 'bad@field',
+    'fields', 'fieldsx', 'bad@field',
 ])
 def test_plain_names_that_are_sensitive_or_malformed_still_fail_closed(name):
     with pytest.raises(NodeFormError) as caught:
@@ -103,6 +103,19 @@ def test_plain_names_that_are_sensitive_or_malformed_still_fail_closed(name):
             f'<select name="{name}"><option value="x" selected>Private</option></select>'), 976)
     assert caught.value.reason == 'FIELD_NAME_UNSUPPORTED'
     assert name not in str(caught.value)
+
+
+@pytest.mark.parametrize('name', ['api_key', 'form_created_at', 'csrf_token'])
+def test_explicit_service_keys_are_excluded_not_saved(name):
+    html = ('<form class="form-offer-editor"><input name="node_id" value="976">'
+            '<div class="form-group"><label>Edition</label>'
+            '<select name="fields[edition]"><option value="a" selected>A</option></select></div>'
+            '<div class="form-group"><label>Service</label>'
+            f'<select name="{name}"><option value="SYNTHETIC_PRIVATE">Secret</option></select></div>'
+            '</form>')
+    schema = parse_node_form(html, 976)
+    assert [field['html_name'] for field in schema['fields']] == ['fields[edition]']
+    assert 'SYNTHETIC_PRIVATE' not in repr(schema)
 
 
 def test_plain_field_duplicate_and_multiple_still_rejected():
