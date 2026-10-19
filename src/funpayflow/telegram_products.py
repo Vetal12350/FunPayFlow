@@ -332,11 +332,13 @@ def _preview_screen(flow):
         rows = [[('🔙 Лоты', 'products')]]
     if 'node_fields' in body:
         rows.insert(0, [('📋 Все параметры', 'prd:text:node')])
+        if body.get('status') != 'cancelled':
+            rows.insert(0, [('🔗 Связать поля', 'prd:bindings')])
     if flow.get('stored_id') and not flow.get('dirty') and body.get('status') != 'cancelled':
         rows.insert(0, [('📑 Создать похожий', 'prd:clone')])
     if flow.get('similar') and not flow.get('stored_id'):
         rows.insert(0, [('📝 Параметры', _local_action(flow, 'menu'))])
-    rows = [[(label, action + ':' + token if action.startswith('prd:') and action.split(':')[1] in {'save', 'edit', 'text', 'discard', 'clone'}
+    rows = [[(label, action + ':' + token if action.startswith('prd:') and action.split(':')[1] in {'save', 'edit', 'text', 'discard', 'clone', 'bindings'}
               else action) for label, action in row] for row in rows]
     return text, _menu(rows)
 
@@ -651,6 +653,15 @@ async def _products_callback(callback, action, user_id):
         await asyncio.to_thread(templates.ensure_builtin)
         parts = action.split(':')
         command = parts[1] if len(parts) > 1 else 'home'
+        if command == 'nb':
+            await node_ui.bindings_callback(callback, user_id, _active(user_id), parts, drafts, templates)
+            return True
+        if command == 'bindings':
+            flow = _active(user_id)
+            if len(parts) != 3 or parts[2] != flow.get('preview_token'):
+                raise ValueError('Предпросмотр устарел.')
+            await node_ui.begin_bindings(callback, user_id, flow, drafts)
+            return True
         if command == 'rt':
             flow = _active(user_id); state = flow.get('catalog_state')
             if (len(parts) != 5 or not state or parts[2] != state['token']
@@ -730,6 +741,8 @@ async def _products_callback(callback, action, user_id):
             _flows[user_id].pop('variant_picker', None)
         if command != 'pv':
             ui._interaction_state.pop(user_id, None)
+        if user_id in _flows:
+            _flows[user_id].pop('binding_state', None)
         if command == 'home':
             discard_session(user_id)
             await _show(callback, *_home())

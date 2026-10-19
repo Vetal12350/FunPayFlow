@@ -1,10 +1,127 @@
 """Token/index UI for real visible node selects. No FunPay mutation actions."""
 import asyncio
+from copy import deepcopy
 from html import escape
 import uuid
 
-from .node_form import NodeFormError, NodeFormService
+from .node_form import NodeFormError, NodeFormService, is_safe_node_binding_name
 from .node_products import LEGACY_NODE_VARIABLES, STALE_WARNING, NodeSelectionError, selected_fields
+
+
+def binding_action(state, operation, index=0):
+    return f"prd:nb:{state['token']}:{operation}:{index}"
+
+
+async def begin_bindings(callback, user_id, flow, drafts):
+    """Owner callback entry only; fresh GET through the shared Account service."""
+    view = _view(); body = flow['preview']
+    if 'node_fields' not in body or body.get('status') == 'cancelled':
+        raise ValueError('Недоступный draft.')
+    template, route, variant, schema, _ = await asyncio.to_thread(
+        drafts.node_setup, body['template_id'], body['route_id'], body.get('variant_id'), True)
+    if (view._flows.get(user_id) is not flow or schema['fingerprint'] != body['node_schema']['fingerprint']
+            or template['revision'] != body['template_revision']
+            or drafts._route(body['route_id'], body['template_id']) != body['route_snapshot']
+            or (variant or {}) != body.get('variant_snapshot', {})):
+        raise ValueError('Draft изменился; обновите preview.')
+    flow['binding_state'] = dict(token=uuid.uuid4().hex[:12], context=_context(user_id, flow),
+        body=deepcopy(body), template=template, route=route, variant=variant, schema=schema,
+        variables=[key for key in template['allowed_variables'] if key not in {'game', 'quantity', 'product_name'}],
+        bindings=dict(template.get('node_bindings', {})), field=None)
+    flow.pop('preview_token', None)
+    view._ui()._interaction_state.pop(user_id, None)
+    await show_bindings(callback.message, flow)
+
+
+async def show_bindings(message, flow):
+    view = _view(); state = flow['binding_state']
+    state['token'] = uuid.uuid4().hex[:12]
+    selected = {row['html_name']: row for row in state['body']['node_fields']}
+    fields = {f['html_name']: f for f in state['schema']['fields']}
+    lines = ['🔗 Связать поля · общий ProductTemplate',
+             'Выберите переменную, затем конкретный источник. Сохранение только после подтверждения.']
+    for variable in state['variables']:
+        name = state['bindings'].get(variable)
+        row = selected.get(name)
+        lines.append(variable + ' → ' + (fields[name]['display_label'] + ': ' + row['option_label']
+                     if name in fields and row else 'Не связано · —'))
+    lines.append('Если поля региона нет, оставьте region без связи. Удалите недоступный placeholder из template; Global не подставляется.')
+    rows = []
+    if state['field'] is None:
+        rows = [[(key, binding_action(state, 'variable', i))] for i, key in enumerate(state['variables'])]
+        rows.append([('✅ Подтвердить привязки', binding_action(state, 'confirm'))])
+    else:
+        variable = state['variables'][state['field']]
+        lines.append('Источник для ' + variable + ':')
+        # Schema order is stable for this token/generation. Equal labels keep separate indices.
+        for i, field in enumerate(state['schema']['fields']):
+            name = field['html_name']; row = selected.get(name)
+            if (not field['disabled'] and is_safe_node_binding_name(name) and row and row['value']):
+                lines.append(f"{i + 1}. {field['display_label']} [{name}]: {row['option_label']}")
+                rows.append([(f"{i + 1}. {field['display_label']}"[:60], binding_action(state, 'source', i))])
+        rows += [[('Не связывать / очистить', binding_action(state, 'clear'))],
+                 [('⬅️ Назад', binding_action(state, 'back'))]]
+    rows.append([('❌ Отмена', binding_action(state, 'cancel'))])
+    await view._plain_chunks(message, '\n'.join(lines))
+    await message.answer('Выберите действие:', reply_markup=view._menu(rows))
+
+
+async def bindings_callback(callback, user_id, flow, parts, drafts, templates):
+    view = _view(); state = flow.get('binding_state')
+    if (len(parts) != 5 or not state or parts[2] != state['token']
+            or state['context'] != _context(user_id, flow) or flow.get('preview') != state['body']):
+        raise ValueError('Экран привязок устарел.')
+    operation, index = parts[3], int(parts[4])
+    if operation == 'cancel':
+        flow.pop('binding_state')
+        await view._show(callback, *view._preview_screen(flow))
+        return
+    body = state['body']
+    template, route, variant, schema, _ = await asyncio.to_thread(
+        drafts.node_setup, body['template_id'], body['route_id'], body.get('variant_id'))
+    if (view._flows.get(user_id) is not flow or template != state['template'] or route != state['route']
+            or variant != state['variant'] or schema['generation'] != state['schema']['generation']):
+        raise ValueError('Template/route/параметры изменились; откройте preview заново.')
+    if operation == 'variable' and state['field'] is None and 0 <= index < len(state['variables']):
+        state['field'] = index
+    elif operation == 'back':
+        state['field'] = None
+    elif operation in {'source', 'clear'} and state['field'] is not None:
+        variable = state['variables'][state['field']]
+        if operation == 'clear':
+            state['bindings'].pop(variable, None)
+        else:
+            if not 0 <= index < len(schema['fields']):
+                raise ValueError('Недоступное поле.')
+            field = schema['fields'][index]; name = field['html_name']
+            rows = {row['html_name']: row for row in selected_fields(schema,
+                {row['html_name']: row['value'] for row in body['node_fields']})}
+            if field['disabled'] or not is_safe_node_binding_name(name) or name not in rows or not rows[name]['value']:
+                raise ValueError('Поле не выбрано или недоступно.')
+            state['bindings'][variable] = name
+        state['field'] = None
+    elif operation == 'confirm' and state['field'] is None:
+        # Preflight with the actual renderer, including Variant/content conflicts.
+        reviewed = await asyncio.to_thread(drafts.preview_bindings, body, state['bindings'])
+        latest, latest_route, latest_variant, latest_schema, _ = await asyncio.to_thread(
+            drafts.node_setup, body['template_id'], body['route_id'], body.get('variant_id'))
+        if (view._flows.get(user_id) is not flow or state['context'] != _context(user_id, flow)
+                or latest != template or latest_route != route or latest_variant != variant
+                or latest_schema['generation'] != schema['generation']):
+            raise ValueError('Контекст изменился во время проверки.')
+        candidate = deepcopy(template); candidate['node_bindings'] = dict(state['bindings'])
+        saved = await asyncio.to_thread(templates.save, candidate, template['id'], template['revision'])
+        reviewed.update(template_snapshot=saved, template_revision=saved['revision'])
+        flow.update(preview=reviewed, dirty=True)
+        flow.pop('binding_state')
+        flow.pop('node_state', None)
+        flow.pop('preview_token', None)
+        await callback.message.answer('✅ Привязки ProductTemplate сохранены. Draft обновлён в preview; сохраните его отдельно.')
+        await view._show(callback, *view._preview_screen(flow))
+        return
+    else:
+        raise ValueError('Экран привязок устарел.')
+    await show_bindings(callback.message, flow)
 
 
 def _view():

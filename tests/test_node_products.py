@@ -146,6 +146,226 @@ def test_plain_names_without_bindings_stay_neutral(plain_node):
             assert all(value not in text for value in ('PC', 'Steam', 'Global', 'Standard'))
 
 
+async def binding_screen(ctx, *, unbound=True):
+    if unbound:
+        template = ctx.templates.get(ctx.template['id'])
+        template['node_bindings'] = {}
+        ctx.templates.save(template, template['id'], template['revision'])
+    body = make(ctx)
+    view._flows[1] = {'preview': body, 'template_id': body['template_id'], 'route_id': body['route_id']}
+    view._preview_screen(view._flows[1])
+    outdated_save = preview_action('prd:save')
+    cb = await send(preview_action('prd:bindings'))
+    assert 'binding_state' in view._flows[1]
+    state = view._flows[1]['binding_state']
+    await send(outdated_save)
+    assert view._flows[1].get('binding_state') is state
+    return cb, deepcopy(body)
+
+
+def nb(op, index=0):
+    return fields_ui.binding_action(view._flows[1]['binding_state'], op, index)
+
+
+def test_binding_wizard_explicit_confirm_and_safe_preview(plain_node, monkeypatch):
+    async def run():
+        ctx = plain_node
+        from unittest.mock import Mock
+        import FunPayAPI
+        account = Mock(side_effect=AssertionError('No second Account'))
+        monkeypatch.setattr(FunPayAPI, 'Account', account)
+        cb, body = await binding_screen(ctx)
+        old = ctx.templates.get(ctx.template['id'])
+        for key, source in [('platform', 0), ('edition', 1)]:
+            state = view._flows[1]['binding_state']
+            await send(nb('variable', state['variables'].index(key)))
+            # Every source callback carries only token/operation/index.
+            data = nb('source', source)
+            assert len(data.encode()) <= 64 and data.split(':')[-1].isdigit()
+            assert all(value not in data for value in ('platform', 'edition', 'PC', 'standard', 'fields['))
+            await send(data)
+            assert ctx.templates.get(old['id']) == old
+        cb = await send(nb('back'))
+        text = '\n'.join(call.args[0] for call in cb.message.answer.call_args_list)
+        assert 'platform → Choice A: PC' in text
+        assert 'edition → Choice B: Standard Edition' in text
+        assert 'region → Не связано' in text
+        replay = nb('confirm')
+        await send(replay)
+        saved = ctx.templates.get(old['id'])
+        assert saved['revision'] == old['revision'] + 1
+        assert saved['node_bindings'] == {'platform': 'platform', 'edition': 'edition'}
+        reopened = type(ctx.templates)(type(ctx.store)(ctx.receipt, 1, 42)).get(old['id'])
+        assert reopened == saved
+        updated = view._flows[1]['preview']
+        for lang in ('ru', 'en'):
+            for field in ('title_', 'description_'):
+                rendered = updated['payload'][field + lang]
+                assert 'PC' in rendered and 'Standard Edition' in rendered and '—' in rendered
+                assert 'Global' not in rendered
+        assert updated['node_fields'] == body['node_fields']
+        assert updated['payload']['amount'] == body['payload']['amount']
+        assert updated['payload']['price'] == body['payload']['price']
+        await send(replay)
+        assert ctx.templates.get(old['id']) == saved
+        assert ctx.store.list_drafts() == []
+        assert all(c.args[0] == 'get' for c in ctx.client.account.method.call_args_list)
+        ctx.client.account.save_lot.assert_not_called()
+        account.assert_not_called()
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize('confirm', [False, True])
+def test_binding_clear_or_cancel_retains_draft(plain_node, confirm):
+    async def run():
+        ctx = plain_node
+        _, body = await binding_screen(ctx, unbound=False)
+        old = ctx.templates.get(ctx.template['id'])
+        state = view._flows[1]['binding_state']
+        await send(nb('variable', state['variables'].index('platform')))
+        await send(nb('clear'))
+        assert ctx.templates.get(old['id']) == old
+        await send(nb('confirm' if confirm else 'cancel'))
+        saved = ctx.templates.get(old['id'])
+        if confirm:
+            assert saved['node_bindings'] == {'edition': 'edition'}
+            assert view._flows[1]['preview']['variables']['platform'] == '—'
+        else:
+            assert saved == old
+            assert view._flows[1]['preview'] == body
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize('change', ['template', 'route', 'generation', 'account', 'flow', 'token', 'owner'])
+def test_binding_rejects_outdated_context(plain_node, change):
+    async def run():
+        ctx = plain_node
+        await binding_screen(ctx)
+        old = ctx.templates.get(ctx.template['id'])
+        action = nb('confirm')
+        if change == 'template':
+            edited = dict(old, display_name='Changed elsewhere')
+            ctx.templates.save(edited, old['id'], old['revision'])
+        elif change == 'route':
+            route = ctx.store.get_route(ctx.route['id'])
+            ctx.store.save_route(dict(route, overrides={'emoji': 'X'}), expected_revision=route['revision'])
+        elif change == 'generation':
+            NodeFormService(ctx.client, ctx.store).get(ctx.node_id, force=True)
+        elif change == 'account':
+            ctx.client.account = deepcopy(ctx.client.account)
+        elif change == 'flow':
+            view._flows[1]['preview']['route_id'] = 'wrong-route'
+        elif change == 'token':
+            action = action.replace(view._flows[1]['binding_state']['token'], 'oldtoken')
+        cb = callback(action)
+        if change == 'owner':
+            cb.from_user.id = 2
+        await ui.callback_handler(cb)
+        assert ctx.templates.get(old['id'])['node_bindings'] == {}
+        assert ctx.templates.get(old['id'])['revision'] == old['revision'] + (change == 'template')
+        assert ctx.store.list_drafts() == []
+    asyncio.run(run())
+
+
+def test_binding_conflict_does_not_write(plain_node):
+    async def run():
+        ctx = plain_node
+        await binding_screen(ctx)
+        flow = view._flows[1]
+        # Custom explicit content must not be discarded to make a binding fit.
+        flow['preview']['input_variables']['platform'] = 'Custom'
+        flow['binding_state']['body'] = deepcopy(flow['preview'])
+        state = flow['binding_state']
+        await send(nb('variable', state['variables'].index('platform')))
+        await send(nb('source', 0))
+        await send(nb('confirm'))
+        assert ctx.templates.get(ctx.template['id'])['node_bindings'] == {}
+        assert flow['preview']['input_variables']['platform'] == 'Custom'
+    asyncio.run(run())
+
+
+def test_binding_same_labels_custom_variable_and_unavailable_sources(plain_node):
+    async def run():
+        ctx = plain_node
+        ctx.html = ctx.html.replace('Choice A', '&lt;b&gt;Choice&lt;/b&gt;').replace('Choice B', '&lt;b&gt;Choice&lt;/b&gt;')
+        ctx.html = ctx.html.replace('</form>', '<div class="form-group"><label>Optional</label>'
+            '<select name="optional"><option value="" selected>Choose</option></select></div>'
+            '<div class="form-group"><label>Disabled</label><select name="disabled_choice" disabled>'
+            '<option value="x" selected>X</option></select></div></form>')
+        template = ctx.templates.get(ctx.template['id'])
+        template['allowed_variables'].append('custom')
+        ctx.templates.save(template, template['id'], template['revision'])
+        await binding_screen(ctx)
+        state = view._flows[1]['binding_state']
+        assert not set(state['variables']) & {'game', 'quantity', 'product_name'}
+        await send(nb('variable', state['variables'].index('custom')))
+        stale = nb('source', 0)
+        for index in (2, 3, 100, -1):
+            await send(nb('source', index))
+            assert 'custom' not in state['bindings']
+        cb = await send(nb('source', 1))
+        text = '\n'.join(call.args[0] for call in cb.message.answer.call_args_list)
+        assert 'custom → <b>Choice</b> (2): Standard Edition' in text
+        assert all(call.kwargs.get('parse_mode') is None for call in cb.message.answer.call_args_list)
+        await send(stale)
+        assert state['bindings']['custom'] == 'edition'
+        await send(nb('confirm'))
+        assert ctx.templates.get(template['id'])['node_bindings'] == {'custom': 'edition'}
+        text, _ = view._preview_screen(view._flows[1])
+        assert '&lt;b&gt;Choice&lt;/b&gt;' in text
+    asyncio.run(run())
+
+
+def test_binding_compare_and_swap_race(plain_node, monkeypatch):
+    async def run():
+        ctx = plain_node
+        await binding_screen(ctx)
+        state = view._flows[1]['binding_state']
+        await send(nb('variable', state['variables'].index('platform')))
+        await send(nb('source', 0))
+        from funpayflow.product_templates import TemplateService
+        original = TemplateService.save
+        winner = []
+        def racing_save(service, body, template_id=None, expected_revision=None):
+            current = service.get(template_id)
+            winner.append(original(service, dict(current, display_name='Concurrent winner'), template_id, current['revision']))
+            return original(service, body, template_id, expected_revision)
+        monkeypatch.setattr(TemplateService, 'save', racing_save)
+        old_preview = deepcopy(view._flows[1]['preview'])
+        await send(nb('confirm'))
+        assert ctx.templates.get(ctx.template['id']) == winner[0]
+        assert winner[0]['node_bindings'] == {}
+        assert view._flows[1]['preview'] == old_preview
+    asyncio.run(run())
+
+
+def test_binding_variant_conflict_and_navigation(plain_node):
+    async def run():
+        ctx = plain_node
+        variant = VariantService(ctx.store, ctx.routes).save({
+            'template_id': ctx.template['id'], 'route_id': ctx.route['id'],
+            'display_name': 'PC preset', 'overrides': {'variables': {'platform': 'PC'}}})
+        body = make(ctx, variant_id=variant['id'])
+        flow = {'preview': body, 'template_id': body['template_id'], 'route_id': body['route_id']}
+        view._flows[1] = flow
+        view._preview_screen(flow)
+        await send(preview_action('prd:bindings'))
+        state = flow['binding_state']
+        await send(nb('variable', state['variables'].index('platform')))
+        await send(nb('source', 1))  # Edition cannot satisfy the explicit PC preset.
+        old = ctx.templates.get(ctx.template['id'])
+        cb = await send(nb('confirm'))
+        assert VARIANT_WARNING in cb.message.answer.call_args.args[0]
+        assert ctx.templates.get(old['id']) == old
+        assert flow['preview'] == body
+        outdated = nb('confirm')
+        await send('products')
+        await send(outdated)
+        assert ctx.templates.get(old['id']) == old
+        assert ctx.store.list_drafts() == []
+    asyncio.run(run())
+
+
 @pytest.mark.parametrize('name', ['Platform', 'fields[platform]', 'region'])
 def test_plain_binding_requires_exact_field_present_in_schema(plain_node, name):
     ctx = plain_node
