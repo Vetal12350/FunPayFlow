@@ -14,6 +14,9 @@ import shutil
 import subprocess
 import sys
 import time
+import threading
+import tempfile
+from contextlib import contextmanager
 
 REPO = "Vetal12350/FunPayFlow"
 OWNER = "Vetal12350"
@@ -74,6 +77,198 @@ def home() -> Path:
     return Path(root) / "FunPayFlowCodexWorker" if root else Path.home() / ".funpayflow-codex-worker"
 
 
+# Public, bounded telemetry protocol; never put task text or subprocess output here.
+PHASES = frozenset({"waiting", "claimed", "clone", "dependencies", "codex_running",
+                    "branch_pr", "pr_created", "blocked", "unavailable", "stopped"})
+STATUS_VERSION = 1
+WINDOWS = os.name == "nt"
+
+
+def pr_url(value: object) -> str:
+    if isinstance(value, str) and re.fullmatch(
+            r"https://github\.com/Vetal12350/FunPayFlow/pull/[1-9][0-9]*", value):
+        return value
+    return ""
+
+
+@contextmanager
+def instance_lock(root: Path):
+    """Kernel-held lock, automatically released on crash. A PID file is not a lock."""
+    root.mkdir(parents=True, exist_ok=True)
+    handle = (root / "worker.lock").open("a+b")
+    locked = False
+    try:
+        handle.seek(0, 2)
+        if not handle.tell():
+            handle.write(b"0")
+            handle.flush()
+        handle.seek(0)
+        try:
+            if os.name == "nt":
+                import msvcrt
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            locked = True
+        except OSError:
+            raise WorkerError("Worker already active or lock unavailable") from None
+        yield
+    finally:
+        if locked:
+            handle.seek(0)
+            if os.name == "nt":
+                import msvcrt
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        handle.close()
+
+
+def other_workers() -> bool:
+    """Legacy workers do not hold our lock. Unknown process inventory fails closed.
+
+    Only a count leaves PowerShell, never command lines or environment contents.
+    Exclude the py.exe parent launcher used by the existing start script.
+    """
+    if not WINDOWS:
+        raise WorkerError("Windows process inventory required")
+    script = (
+        "$ErrorActionPreference='Stop'; "
+        f"$selfId={os.getpid()}; $parentId={os.getppid()}; "
+        "$pythonProcesses=@(Get-CimInstance Win32_Process -ErrorAction Stop | Where-Object { "
+        "$_.Name -match '^(pythonw?|pyw?)([0-9.]*)?\\.exe$' }); "
+        "if (@($pythonProcesses | Where-Object { -not $_.CommandLine }).Count) { "
+        "throw 'Process inventory unavailable' }; "
+        "$items=@($pythonProcesses | Where-Object { "
+        "$_.CommandLine -match 'codex_issue_worker\\.py' -and "
+        "$_.ProcessId -ne $selfId -and "
+        "-not ($_.ProcessId -eq $parentId -and $_.Name -eq 'py.exe') }); "
+        "[Console]::Write($items.Count)"
+    )
+    value = run(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],
+                timeout=15).stdout.strip()
+    if not value.isdecimal():
+        raise WorkerError("Process inventory unavailable")
+    return int(value) != 0
+
+
+class LiveStatus:
+    def __init__(self, root: Path):
+        self.path = root / "live_status.json"
+        self.guard = threading.Lock()
+        self.stop = threading.Event()
+        self.data = {"version": STATUS_VERSION, "phase": "waiting", "issue": None,
+                     "timestamp": time.time(), "phase_started": time.time(),
+                     "jobs": {}, "events": []}
+        # Retain only validated public metadata across worker restarts.
+        try:
+            if self.path.exists():
+                with self.path.open("rb") as stream:
+                    raw = stream.read(65537)
+                if len(raw) > 65536:
+                    raise ValueError
+                old = json.loads(raw)
+            else:
+                old = {}
+            for key, job in list(old.get("jobs", {}).items())[-100:]:
+                if (re.fullmatch(r"[1-9][0-9]{0,14}", key) and isinstance(job, dict) and
+                        job.get("phase") in PHASES and pr_url(job.get("pr_url", ""))):
+                    self.data["jobs"][key] = {"phase": job["phase"],
+                                              "pr_url": pr_url(job["pr_url"])}
+                elif (re.fullmatch(r"[1-9][0-9]{0,14}", key) and isinstance(job, dict)
+                      and job.get("phase") in PHASES - {"waiting", "stopped", "unavailable"}):
+                    # A previous claimed job cannot be resumed (processed-state safety).
+                    self.data["jobs"][key] = {"phase": "blocked", "failure": "task_failed"}
+        except (OSError, ValueError, WorkerError, AttributeError, TypeError):
+            pass
+        self.thread = threading.Thread(target=self._heartbeat, daemon=True)
+
+    def publish(self, phase=None, issue=None, url=""):
+        with self.guard:
+            now = time.time()
+            if phase is not None:
+                if phase not in PHASES or (issue is not None and (type(issue) is not int or issue <= 0)):
+                    raise WorkerError("Invalid telemetry metadata")
+                self.data.update(phase=phase, issue=issue, timestamp=now, phase_started=now)
+                event = {"phase": phase, "issue": issue, "timestamp": now}
+                self.data["events"] = (self.data["events"] + [event])[-30:]
+                if issue is not None:
+                    job = {"phase": phase}
+                    previous_url = self.data["jobs"].get(str(issue), {}).get("pr_url")
+                    if pr_url(previous_url):
+                        job["pr_url"] = previous_url
+                    if pr_url(url):
+                        job["pr_url"] = pr_url(url)
+                    if phase == "blocked":
+                        job["failure"] = "task_failed"
+                    self.data["jobs"][str(issue)] = job
+                    self.data["jobs"] = dict(list(self.data["jobs"].items())[-100:])
+            self.data["heartbeat"] = now
+            state_write(self.path, self.data)
+
+    def _heartbeat(self):
+        while not self.stop.wait(5):
+            try:
+                self.publish()
+            except OSError:
+                # A failed writer ceases heartbeats; observers show stale, never healthy.
+                return
+
+    def __enter__(self):
+        self.publish("waiting")
+        self.thread.start()
+        return self
+
+    def __exit__(self, *args):
+        self.stop.set()
+        self.thread.join(timeout=6)
+        self.publish("stopped")
+
+
+def run_codex(command: list[str], checkout: Path, task: dict) -> None:
+    # File-backed stdin avoids Windows communicate() blocking on a full stdin pipe
+    # before its timeout takes effect. TemporaryFile deletes input on close; neither
+    # input nor output is sent to telemetry. stdout/stderr cannot fill a pipe.
+    try:
+        with tempfile.TemporaryFile(mode="w+", encoding="utf-8", errors="replace",
+                                    dir=checkout) as task_input:
+            task_input.write(prompt_for(task))
+            task_input.seek(0)
+            child = subprocess.Popen(resolve_argv(command), cwd=checkout,
+                                     stdin=task_input, stdout=subprocess.DEVNULL,
+                                     stderr=subprocess.DEVNULL,
+                                     env=codex_environment(), shell=False,
+                                     start_new_session=(os.name != "nt"))
+            try:
+                child.wait(timeout=1200)
+            except (subprocess.TimeoutExpired, KeyboardInterrupt) as interrupted:
+                if os.name == "nt":
+                    # Only the child we just created, including npm/Codex descendants.
+                    try:
+                        subprocess.run(["taskkill.exe", "/PID", str(child.pid), "/T", "/F"],
+                                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                       timeout=10, shell=False, check=False)
+                    except (OSError, subprocess.TimeoutExpired):
+                        pass
+                else:
+                    import signal
+                    try:
+                        os.killpg(child.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                child.kill()
+                child.wait(timeout=10)
+                if isinstance(interrupted, KeyboardInterrupt):
+                    raise
+                raise WorkerError("Codex unavailable or timed out") from None
+            if child.returncode:
+                raise WorkerError("Codex failed; no changes pushed")
+    except (OSError, subprocess.TimeoutExpired):
+        raise WorkerError("Codex unavailable or timed out") from None
+
+
 def is_trusted_task(task: dict) -> bool:
     author = task.get("author")
     labels = task.get("labels")
@@ -100,6 +295,31 @@ def safe_path(path: str) -> bool:
            for part in components):
         return False
     return True
+
+
+def ignore_known_pytest_scratch(checkout: Path) -> None:
+    """Keep ONLY tests/.offline-tmp out of git status in this isolated checkout.
+
+    This is a local .git/info/exclude rule, NOT a relaxation of safe_path() or
+    changed_paths(). Generated scratch must never be committed or pushed.
+    """
+    metadata = checkout / ".git"
+    info = metadata / "info"
+    exclude = info / "exclude"
+    if (not metadata.is_dir() or metadata.is_symlink() or
+            not info.is_dir() or info.is_symlink() or
+            not exclude.is_file() or exclude.is_symlink()):
+        raise WorkerError("Isolated checkout Git metadata unavailable")
+    try:
+        old = exclude.read_text(encoding="utf-8")
+        if len(old) > 32768:
+            raise WorkerError("Isolated checkout exclusions invalid")
+        rule = "/tests/.offline-tmp/"
+        if rule not in old.splitlines():
+            with exclude.open("a", encoding="utf-8", newline="\n") as stream:
+                stream.write(("" if not old or old.endswith("\n") else "\n") + rule + "\n")
+    except (OSError, UnicodeError):
+        raise WorkerError("Unable to configure isolated test scratch") from None
 
 
 def changed_paths(checkout: Path) -> list[str]:
@@ -232,42 +452,46 @@ def codex_exec_command(message_file: Path) -> list[str]:
             "--output-last-message", str(message_file), "-"]
 
 
-def execute_task(task: dict, root: Path) -> str:
+def execute_task(task: dict, root: Path, status: LiveStatus | None = None) -> str:
     issue = task["number"]
     checkout = root / "jobs" / f"issue-{issue}"
     if checkout.exists():
         raise WorkerError("Job directory already exists; refusing to overwrite")
     checkout.parent.mkdir(parents=True, exist_ok=True)
+    if status:
+        status.publish("clone", issue)
     run(["git", "clone", "--depth", "1", "--branch", "main", REMOTE,
          str(checkout)], timeout=180)
+    # Scoped local Git ignore for offline test output, set before Codex can edit.
+    # Never suppress unrelated untracked files from the security gate.
+    ignore_known_pytest_scratch(checkout)
     branch = f"codex/issue-{issue}"
     git(checkout, "checkout", "-b", branch)
     # Only the runner performs package sync, before untrusted generated changes.
+    if status:
+        status.publish("dependencies", issue)
     run(["uv", "sync", "--locked", "--dev"], cwd=checkout, timeout=600)
     message_file = root / "reports" / f"issue-{issue}.txt"
     message_file.parent.mkdir(parents=True, exist_ok=True)
     command = codex_exec_command(message_file)
-    try:
-        result = subprocess.run(resolve_argv(command), cwd=checkout, input=prompt_for(task),
-                                text=True, encoding="utf-8", errors="replace",
-                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                timeout=1200, env=codex_environment(),
-                                shell=False, check=False)
-    except (OSError, subprocess.TimeoutExpired):
-        raise WorkerError("Codex unavailable or timed out") from None
-    if result.returncode:
-        raise WorkerError("Codex failed; no changes pushed")
+    if status:
+        status.publish("codex_running", issue)
+    run_codex(command, checkout, task)
     # Never execute agent-modified source outside the Codex sandbox on the owner's PC.
     # Full pytest/packaging smoke run only in the existing credential-free GitHub CI.
     changed_paths(checkout)
+    if status:
+        status.publish("branch_pr", issue)
     return stage_and_pr(checkout, issue)
 
 
-def process_once(root: Path) -> bool:
+def process_once(root: Path, status: LiveStatus | None = None) -> bool:
     state_file = root / "state.json"
     state = state_read(state_file)
     tasks = eligible_tasks(state)
     if not tasks:
+        if status:
+            status.publish("waiting")
         print("No new authorized Codex tasks.")
         return False
     task = tasks[0]
@@ -278,9 +502,13 @@ def process_once(root: Path) -> bool:
     state_write(state_file, state)
     print(f"Running issue #{number} in a separate source checkout.", flush=True)
     try:
-        url = execute_task(task, root)
+        if status:
+            status.publish("claimed", number)
+        url = execute_task(task, root, status)
         state[key] = {"status": "pr_created", "url": url}
         state_write(state_file, state)
+        if status:
+            status.publish("pr_created", number, url)
         gh("issue", "comment", key, "--body",
            "Local Codex completed its offline work. PR: " + url)
         gh("issue", "close", key, "--reason", "completed")
@@ -288,6 +516,8 @@ def process_once(root: Path) -> bool:
     except WorkerError as exc:
         state[key] = {"status": "blocked", "reason": str(exc)}
         state_write(state_file, state)
+        if status:
+            status.publish("blocked", number)
         print(f"Issue #{number}: blocked: {exc}", flush=True)
         try:
             gh("issue", "comment", key, "--body",
@@ -316,17 +546,22 @@ def main() -> int:
             return 0
         root = home()
         root.mkdir(parents=True, exist_ok=True)
-        ensure_label()
-        while True:
-            try:
-                process_once(root)
-            except WorkerError as error:
-                print(f"Worker paused: {error}", file=sys.stderr, flush=True)
-                if args.once:
-                    return 1
-            if not args.watch:
-                break
-            time.sleep(args.interval)
+        with instance_lock(root):
+            if other_workers():
+                raise WorkerError("Existing worker detected; refusing duplicate")
+            with LiveStatus(root) as status:
+                ensure_label()
+                while True:
+                    try:
+                        process_once(root, status)
+                    except WorkerError as error:
+                        status.publish("unavailable")
+                        print(f"Worker paused: {error}", file=sys.stderr, flush=True)
+                        if args.once:
+                            return 1
+                    if not args.watch:
+                        break
+                    time.sleep(args.interval)
     except WorkerError as error:
         print(f"Setup failed: {error}", file=sys.stderr)
         return 1
