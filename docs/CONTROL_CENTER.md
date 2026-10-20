@@ -1,4 +1,4 @@
-# Windows Control Center · UX 2.0, phase 1
+# Windows Control Center 3.0 · optional CustomTkinter UI
 
 The primary workflow is **ChatGPT → GitHub Issue → existing local Codex Worker →
 Windows monitor**. Tell ChatGPT the requested source change. Its separately authorized
@@ -12,15 +12,37 @@ It cannot see ChatGPT thinking, tools, or edits before the issue reaches GitHub.
 Prerequisites: Windows desktop, Python 3.13 with Tkinter, and the existing Git/gh/Codex/uv
 worker installation described in [LOCAL_CODEX_WORKER.md](LOCAL_CODEX_WORKER.md).
 Use existing local authentication; no API key or bot token is requested by this app.
-After the source change has been reviewed and installed through the owner's normal
-source update process, double-click `scripts/start_control_center.bat`.
-This source implementation does not update an installation or start anything during tests.
+The existing installed Tkinter interface stays in place until the owner explicitly
+upgrades through the normal reviewed source update process. This checkout does not
+update that installation. Do not copy a new launcher over it before approval.
 
-Phase 1 provides a Russian dashboard with a compact health strip, a current/recent task
-card, separate Windows CI, Linux CI, Product QA and Core QA indicators, and a scrollable
-history of at most 100 tasks. Select a row to inspect its checks and click **Открыть GitHub**.
-An empty dashboard explains that tasks originate in ChatGPT. The UI uses stdlib Tk/ttk,
-11 pt text, a neutral light palette and a restrained accent; no theme/font assets are installed.
+After approval, from the reviewed source checkout run the optional setup explicitly:
+
+```powershell
+powershell -NoProfile -File .\scripts\setup_control_center_ui.ps1
+```
+
+This is the only install step. It creates an isolated Python 3.13 venv at
+`%LOCALAPPDATA%\FunPayFlowCodexWorker\control-center-venv` and installs
+[CustomTkinter 6.0.0](https://pypi.org/project/customtkinter/6.0.0/) from official PyPI.
+It needs network access but no administrator rights, global install, repository dependency
+change or execution-policy bypass. If local policy blocks scripts, use the owner's normal
+approved script process. Setup does not launch the GUI, Worker or bot.
+
+Double-click `scripts/start_control_center.bat`. It runs only that venv's
+`Scripts\python.exe`; if missing, it prints the explicit setup command and stops.
+It never installs anything automatically. Missing/wrong CustomTkinter fails before
+worker state access or polling. Neither setup nor a real GUI was run during Codex tests.
+
+The Russian dashboard uses genuine CTk rounded cards, blue buttons, four separate
+Windows CI, Linux CI, Product QA and Core QA indicators, and selectable, scrollable
+history capped at 100 tasks. Click a task (or use Up/Down keys) to inspect its full
+status, observed phase timeline and event indicator; click **Открыть GitHub** for its
+validated link. Long history summaries are shortened; the selected card shows full text.
+Choose **Системная / Светлая / Тёмная** in the header. Appearance follows CTk themes,
+with no acrylic/glass blur claim, extra fonts, icons or media assets. The detail card
+scrolls independently on smaller screens. No phase percentage is inferred.
+An empty dashboard explains that tasks originate in ChatGPT.
 Heartbeat age and the last phase are separate. Only the freshly observed current task
 is described as executing; historical task phases explicitly say execution is unconfirmed.
 A merged/closed PR takes precedence over the worker's historical phase.
@@ -70,7 +92,7 @@ A fresh heartbeat proves a recent observation, not that the worker cannot subseq
 The job's last observed phase remains visible after a crash; it is not proof of continued work.
 Missing/incompatible status means unknown, never proof that an external worker is dead.
 
-Phase 1 deliberately displays **Codex работает**, with heartbeat and freshly observed phase elapsed time.
+The monitor deliberately displays **Codex работает**, with heartbeat and freshly observed phase elapsed time.
 It does not parse JSONL, infer editing/test activity, expose reasoning or raw logs, or show
 percentages. Codex stdout/stderr go to the null device; its existing last-message report
 stays outside the GUI. Prompt stdin uses an automatically deleted temporary file
@@ -149,15 +171,22 @@ DISABLED. No workflow configuration is changed by this feature.
 
 ## Notifications and boundaries
 
-Non-modal local Windows popups (with a bell and GitHub button) appear on PR creation,
-CI/QA failure, four green checks, and worker blocking. They contain only issue/PR numbers,
-fixed trusted status text and repository links. Popups are bounded to four visible windows
-and expire after 20 seconds; the monitor must be open to receive them. These are Tk desktop
-popups, not Windows notification-center/toast history or a background service.
+Notifications are **sound-only**: a single short `app.bell()` on the UI main thread
+for each new PR-created, CI/QA-failure, all-four-green or worker-blocked event. No popup,
+Toplevel, modal dialog, focus steal, automatic browser opening, toast, tray or background
+service exists. An unavailable audio device fails quietly; audibility depends on desktop
+sound settings. Closing the GUI stops notification delivery; an already running Worker
+remains independent. Reopening can announce an event first observed since the last session,
+but cannot replay a previously claimed event.
 
-`monitor_notifications.json` persists event IDs before presentation, including the PR
+Events remain visible in the selected task card and as a small dot on its history button.
+The in-memory event list is bounded to 400 fixed messages for retained tasks; phase history
+comes only from the worker's sanitized retained events. Notification dedup storage contains
+IDs, not a message archive; no raw logs or task text are stored by the GUI.
+
+`monitor_notifications.json` persists event IDs before sounding, including the PR
 head SHA for failure/green events. Refresh/restart cannot replay an already recorded event.
-A crash between persistence and presentation may lose one notification. Corrupt/unwritable
+A crash between persistence and sounding may lose one notification. Corrupt/unwritable
 storage disables notifications visibly instead of replaying them. At 10,000 IDs the store
 fails closed (no eviction/replay). Run one monitor window per worker folder; cross-window
 notification coordination is outside this MVP. No task text, raw output, or credentials
@@ -175,17 +204,29 @@ all gh responses and process startup; `tests/test_codex_issue_worker.py` covers 
 snapshots, heartbeat, locking, timeout cleanup, mark-before-execution and restart dedup.
 Run with the existing development environment:
 
-```text
-uv run --no-sync pytest -q tests/test_control_center.py tests/test_codex_issue_worker.py
+```powershell
+New-Item -ItemType Directory -Force tests/.offline-tmp | Out-Null
+$env:TEMP = Join-Path (Get-Location) 'tests/.offline-tmp'
+$env:TMP = $env:TEMP
+$env:PYTHONDONTWRITEBYTECODE = '1'
+uv run --no-sync pytest -q -p no:cacheprovider tests/test_control_center.py tests/test_codex_issue_worker.py --basetemp=tests/.offline-tmp/control-center
 ```
 
-No real gh issue creation, live Codex, POST, production data or desktop session is needed.
-Live Windows presentation, installed-worker launch, authenticated GitHub polling and
-actual Windows/Linux CI remain separately verified integration steps, not claims made
-by these offline tests. `CURRENT_STATE.md` is intentionally not changed because this
-request restricts modifications to `scripts/control_center.py`, `tests/test_control_center.py`
-and this document.
+Keep every generated fixture under `tests/.offline-tmp/`; do not use other scratch paths.
+Tests fake CTk, gh responses and process startup. They do not install packages, create real
+windows, call FunPay/Telegram, perform POST, or read runtime credentials. Windows/Linux CI,
+Product/Core QA and ChatGPT audit must all pass before any separately authorized merge.
+Headless tests do not prove real desktop rendering or audible Windows sound.
+`CURRENT_STATE.md` is intentionally unchanged: this request permits exactly five files.
 
+## Rollback after an explicit upgrade
+
+Close the monitor (the Worker stays independent). Restore the previously approved
+`scripts/control_center.py` and `scripts/start_control_center.bat` from the owner's retained
+source copy through the normal source update process. The old launcher uses Python 3.13
+with stdlib Tkinter. Leave the optional venv unused; no deletion or reinstall is needed.
+Do not reset notification IDs: both presentations use the same dedup store. Do not change
+worker state, authentication or the running Worker to roll back the presentation.
 
 ## Windows manual UI smoke (after review)
 
@@ -193,11 +234,11 @@ This is a presentation/integration check for the owner in the normal authorized 
 installation, not an instruction to change worker state or run production. Do not press
 **Запустить Worker** when an existing worker is active or uncertain.
 
-1. Open the monitor with the existing launcher. Confirm no worker starts on opening.
+1. After approval and explicit setup, open the monitor with the new launcher. Confirm no worker starts on opening.
    Keep commands/tasks in ChatGPT; there is no task-entry field in this application.
 2. Inspect at 1150×700 and 1366×768, then Windows display scaling 100%, 125% and 150%.
    Confirm readable text, wrapping in the summary/status strip, four individual check
-   indicators, visible bottom buttons, keyboard row selection and history scrolling.
+   indicators, visible bottom buttons, Up/Down task selection and history/detail scrolling. Switch all three themes.
    Scroll the history and wait for refresh: the view should keep its position.
 3. With a fresh active heartbeat, confirm **Worker запущен** is disabled, heartbeat age
    refreshes, and any previous launch failure is only a historical notice. Closing the
@@ -210,9 +251,15 @@ installation, not an instruction to change worker state or run production. Do no
    GitHub outage and an empty history; do not interrupt the live worker to manufacture
    these cases. Expect unknown health, last recorded phase without elapsed timer,
    explicit cached/unknown GitHub data, and explanatory empty-state text.
-6. Verify existing local **Tk popups** for PR creation, CI/QA failure, four-green and blocked
-   events using fixtures. They remain bounded, expire and deduplicate across restarts.
-   They are not native Windows notification-center/toast notifications.
+6. With synthetic fixture events (not live task execution), verify PR creation,
+   CI/QA failure, four-green and blocked each produce exactly one short sound and a small
+   in-app event indicator. No separate window appears, focus stays in the app, no browser
+   opens. Refresh and reopen: already claimed events stay silent. With unavailable audio,
+   refresh still works quietly. Corrupt/unwritable notification storage disables sound
+   visibly without replay. Do not edit real worker telemetry to manufacture fixtures.
+7. On a copy without the optional venv, double-click the launcher: expect a clear setup
+   message and no automatic install or Worker startup. Reopen after setup; only the GUI
+   starts. Closing it must not terminate an existing Worker.
 
 Native Windows toasts, tray mode, auto-start and app packaging are future **separate
 scoped tasks**, after this phase's UI is checked. None is implemented or enabled here.
