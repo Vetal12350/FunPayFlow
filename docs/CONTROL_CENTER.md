@@ -1,4 +1,4 @@
-# Windows Control Center
+# Windows Control Center · UX 2.0, phase 1
 
 The primary workflow is **ChatGPT → GitHub Issue → existing local Codex Worker →
 Windows monitor**. Tell ChatGPT the requested source change. Its separately authorized
@@ -16,9 +16,21 @@ After the source change has been reviewed and installed through the owner's norm
 source update process, double-click `scripts/start_control_center.bat`.
 This source implementation does not update an installation or start anything during tests.
 
-The window lists issue numbers, observed stages, PR links, four individual check
-statuses, audit status, worker heartbeat/phase elapsed time, and recent sanitized events.
-Select a row and click **Open GitHub**. **Start installed worker** launches only the
+Phase 1 provides a Russian dashboard with a compact health strip, a current/recent task
+card, separate Windows CI, Linux CI, Product QA and Core QA indicators, and a scrollable
+history of at most 100 tasks. Select a row to inspect its checks and click **Открыть GitHub**.
+An empty dashboard explains that tasks originate in ChatGPT. The UI uses stdlib Tk/ttk,
+11 pt text, a neutral light palette and a restrained accent; no theme/font assets are installed.
+Heartbeat age and the last phase are separate. Only the freshly observed current task
+is described as executing; historical task phases explicitly say execution is unconfirmed.
+A merged/closed PR takes precedence over the worker's historical phase.
+
+While heartbeat is fresh and active, **Worker запущен** is disabled. A fresh heartbeat
+also relegates any earlier launch notice to history. When health is unknown/stale,
+**Запустить Worker** still performs the existing fail-closed lock/process inventory checks.
+Ambiguous safety results say **Сначала проверьте уже запущенный Worker**; stale telemetry
+never proves that no process exists. Opening the window never starts a worker.
+The start action launches only the
 fixed `%LOCALAPPDATA%\FunPayFlowCodexWorker\source\scripts\codex_issue_worker.py`
 with `--watch --interval 90`, using the current Python 3.13 interpreter and `shell=False`.
 It performs no pull or installation. The installed worker must exactly match the worker
@@ -58,7 +70,7 @@ A fresh heartbeat proves a recent observation, not that the worker cannot subseq
 The job's last observed phase remains visible after a crash; it is not proof of continued work.
 Missing/incompatible status means unknown, never proof that an external worker is dead.
 
-This MVP deliberately displays **Codex running**, with heartbeat and phase elapsed time.
+Phase 1 deliberately displays **Codex работает**, with heartbeat and freshly observed phase elapsed time.
 It does not parse JSONL, infer editing/test activity, expose reasoning or raw logs, or show
 percentages. Codex stdout/stderr go to the null device; its existing last-message report
 stays outside the GUI. Prompt stdin uses an automatically deleted temporary file
@@ -87,6 +99,16 @@ The queue display is a candidate queue; the worker still checks the complete own
 label, prefix, nonempty-body and size policy before claiming an issue.
 
 PR discovery requires both the worker's sanitized PR URL and the matching issue branch.
+The fixed `gh pr list -R Vetal12350/FunPayFlow --state all` read-only request includes
+`state,mergedAt` alongside number, URL, branch and head SHA. Lifecycle metadata is used
+only after the exact URL, branch and SHA shape pass validation. Consistent GitHub
+`MERGED` plus a valid `mergedAt` shows **Слито в main**; `CLOSED` with null `mergedAt`
+shows **Закрыто без merge**. Missing, malformed or inconsistent lifecycle fields show
+**Неизвестно**. An open PR with all four exact checks successful shows
+**Ожидает проверки кода**; queued/running checks show **Проверки выполняются**.
+Merged status does not assert review, release or deployment. Check indicators remain
+independent, so merged PRs can retain four verified green checks. Cached GitHub data
+is explicitly marked when refresh is unavailable. No unrestricted gh API was added.
 Actions queries bind to the PR's current head SHA, `pull_request` event and exact
 workflow path. If the run has a nonempty `pull_requests` association list, it must
 name the exact PR. GitHub can return an empty association list after a PR is merged:
@@ -119,8 +141,8 @@ Historical jobs are limited to the 100 retained safe records. Previously observe
 jobs become blocked on worker restart; they are not automatically resumed or requeued
 (existing processed-state safety applies).
 
-Four green checks means **audit pending human/ChatGPT review**, not completed, merged,
-released or deployed. There is no trusted automated audit-completion signal in the current
+For an open PR, four green checks means **Ожидает проверки кода**, not reviewed, merged,
+released or deployed. A merged/closed PR instead shows its verified GitHub lifecycle state. There is no trusted automated audit-completion signal in the current
 pipeline, so this MVP never invents one. Review the diff in GitHub before any separately
 authorized merge. This task does not run or alter production workflow #72; it must remain
 DISABLED. No workflow configuration is changed by this feature.
@@ -161,4 +183,38 @@ No real gh issue creation, live Codex, POST, production data or desktop session 
 Live Windows presentation, installed-worker launch, authenticated GitHub polling and
 actual Windows/Linux CI remain separately verified integration steps, not claims made
 by these offline tests. `CURRENT_STATE.md` is intentionally not changed because this
-request restricts modifications to the six specified deliverable files.
+request restricts modifications to `scripts/control_center.py`, `tests/test_control_center.py`
+and this document.
+
+
+## Windows manual UI smoke (after review)
+
+This is a presentation/integration check for the owner in the normal authorized local
+installation, not an instruction to change worker state or run production. Do not press
+**Запустить Worker** when an existing worker is active or uncertain.
+
+1. Open the monitor with the existing launcher. Confirm no worker starts on opening.
+   Keep commands/tasks in ChatGPT; there is no task-entry field in this application.
+2. Inspect at 1150×700 and 1366×768, then Windows display scaling 100%, 125% and 150%.
+   Confirm readable text, wrapping in the summary/status strip, four individual check
+   indicators, visible bottom buttons, keyboard row selection and history scrolling.
+   Scroll the history and wait for refresh: the view should keep its position.
+3. With a fresh active heartbeat, confirm **Worker запущен** is disabled, heartbeat age
+   refreshes, and any previous launch failure is only a historical notice. Closing the
+   monitor must leave the worker running. Reopening must not launch another worker.
+4. Inspect issue #79 / PR #80 when the trusted GitHub response actually reports merged:
+   expect **Слито в main** and each verified successful check green. An open four-green
+   PR instead says **Ожидает проверки кода**. A closed unmerged PR says
+   **Закрыто без merge**. Selecting an older task must not imply current execution.
+5. Use synthetic offline fixtures for stale/future/missing heartbeat, unreadable PR fields,
+   GitHub outage and an empty history; do not interrupt the live worker to manufacture
+   these cases. Expect unknown health, last recorded phase without elapsed timer,
+   explicit cached/unknown GitHub data, and explanatory empty-state text.
+6. Verify existing local **Tk popups** for PR creation, CI/QA failure, four-green and blocked
+   events using fixtures. They remain bounded, expire and deduplicate across restarts.
+   They are not native Windows notification-center/toast notifications.
+
+Native Windows toasts, tray mode, auto-start and app packaging are future **separate
+scoped tasks**, after this phase's UI is checked. None is implemented or enabled here.
+Windows/Linux CI, Product/Core QA, and ChatGPT security/UI review are subsequent gates;
+offline tests alone do not claim those external reviews or a desktop smoke PASS.
