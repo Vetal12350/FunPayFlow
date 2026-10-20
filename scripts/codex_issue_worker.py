@@ -472,7 +472,9 @@ def task_profile(task: dict) -> tuple[str, str]:
     # directive is ambiguous rather than a harmless override.
     for line in lines[3:]:
         normalized = line.lstrip("\ufeff \t").lower()
-        if normalized.startswith(("codex-model", "codex-effort")):
+        if normalized.startswith("codex-model:") and normalized.split(":", 1)[1].strip() in MODELS:
+            raise WorkerError("Invalid Codex profile metadata")
+        if normalized.startswith("codex-effort:") and normalized.split(":", 1)[1].strip() in EFFORTS:
             raise WorkerError("Invalid Codex profile metadata")
     return model, effort
 
