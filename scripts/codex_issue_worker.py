@@ -27,6 +27,9 @@ ALLOWED_PREFIXES = ("src/funpayflow/", "tests/", "docs/", "scripts/")
 ALLOWED_FILES = {"README.md"}
 BLOCKED_FRAGMENTS = (".env", "secret", "credential", "private", "token", "keyfile")
 MAX_TASK_CHARS = 12000
+MODELS = frozenset({"gpt-6.1-sol", "gpt-6-astra"})
+EFFORTS = frozenset({"low", "medium", "high", "xhigh"})
+DEFAULT_PROFILE = ("gpt-6.1-sol", "medium")
 
 
 class WorkerError(Exception):
@@ -264,7 +267,7 @@ def run_codex(command: list[str], checkout: Path, task: dict) -> None:
                     raise
                 raise WorkerError("Codex unavailable or timed out") from None
             if child.returncode:
-                raise WorkerError("Codex failed; no changes pushed")
+                raise WorkerError("Codex model unavailable or CLI failed; no changes pushed")
     except (OSError, subprocess.TimeoutExpired):
         raise WorkerError("Codex unavailable or timed out") from None
 
@@ -445,14 +448,50 @@ def stage_and_pr(checkout: Path, issue: int) -> str:
               "--title", title, "--body", body, timeout=90)
 
 
-def codex_exec_command(message_file: Path) -> list[str]:
+def task_profile(task: dict) -> tuple[str, str]:
+    """Only an owner-authorized leading header can select CLI options.
+
+    LF and GitHub/Windows CRLF are accepted. Mid-body examples are task prose.
+    Header-like first lines must match exactly; never echo rejected input.
+    """
+    if not is_trusted_task(task):
+        raise WorkerError("Unauthorized Codex task")
+    lines = task["body"].replace("\r\n", "\n").split("\n")
+    first = lines[0].lstrip("\ufeff \t").lower()
+    if not first.startswith(("codex-model", "codex-effort")):
+        return DEFAULT_PROFILE
+    if (len(lines) < 4 or lines[2] != "" or not "\n".join(lines[3:]).strip()
+            or not lines[0].startswith("Codex-Model: ")
+            or not lines[1].startswith("Codex-Effort: ")):
+        raise WorkerError("Invalid Codex profile metadata")
+    model = lines[0][len("Codex-Model: "):]
+    effort = lines[1][len("Codex-Effort: "):]
+    if model not in MODELS or effort not in EFFORTS:
+        raise WorkerError("Invalid Codex profile metadata")
+    # For tasks WITH an explicit profile, a second profile-looking
+    # directive is ambiguous rather than a harmless override.
+    for line in lines[3:]:
+        normalized = line.lstrip("\ufeff \t").lower()
+        if normalized.startswith("codex-model:") and normalized.split(":", 1)[1].strip() in MODELS:
+            raise WorkerError("Invalid Codex profile metadata")
+        if normalized.startswith("codex-effort:") and normalized.split(":", 1)[1].strip() in EFFORTS:
+            raise WorkerError("Invalid Codex profile metadata")
+    return model, effort
+
+
+def codex_exec_command(message_file: Path, model: str = DEFAULT_PROFILE[0],
+                       effort: str = DEFAULT_PROFILE[1]) -> list[str]:
     """Approval must precede the exec subcommand (Codex CLI parser rule)."""
+    if model not in MODELS or effort not in EFFORTS:
+        raise WorkerError("Invalid Codex profile metadata")
     return ["codex", "--ask-for-approval", "never",
             "exec", "--sandbox", "workspace-write",
+            "--model", model, "-c", f'model_reasoning_effort="{effort}"',
             "--output-last-message", str(message_file), "-"]
 
 
 def execute_task(task: dict, root: Path, status: LiveStatus | None = None) -> str:
+    model, effort = task_profile(task)  # Before telemetry, mkdir, clone or any mutation.
     issue = task["number"]
     checkout = root / "jobs" / f"issue-{issue}"
     if checkout.exists():
@@ -473,7 +512,7 @@ def execute_task(task: dict, root: Path, status: LiveStatus | None = None) -> st
     run(["uv", "sync", "--locked", "--dev"], cwd=checkout, timeout=600)
     message_file = root / "reports" / f"issue-{issue}.txt"
     message_file.parent.mkdir(parents=True, exist_ok=True)
-    command = codex_exec_command(message_file)
+    command = codex_exec_command(message_file, model, effort)
     if status:
         status.publish("codex_running", issue)
     run_codex(command, checkout, task)
@@ -495,6 +534,7 @@ def process_once(root: Path, status: LiveStatus | None = None) -> bool:
         print("No new authorized Codex tasks.")
         return False
     task = tasks[0]
+    task_profile(task)  # Reject malformed metadata before claiming/writing state.
     number = task["number"]
     key = str(number)
     # Mark BEFORE executing, so a restart cannot duplicate work or push.
