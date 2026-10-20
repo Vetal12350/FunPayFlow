@@ -30,7 +30,7 @@ FAILURES = {"failure", "cancelled", "timed_out", "action_required", "startup_fai
 ISSUES = ["gh", "issue", "list", "-R", REPO, "--state", "open", "--label", worker.LABEL,
           "--author", worker.OWNER, "--limit", "100", "--json", "number,title,author,labels"]
 PRS = ["gh", "pr", "list", "-R", REPO, "--state", "all", "--limit", "100", "--json",
-       "number,url,headRefName,headRefOid"]
+       "number,url,headRefName,headRefOid,state,mergedAt"]
 
 
 class Unavailable(Exception):
@@ -184,33 +184,123 @@ def health(live, now):
     return "heartbeat observed"
 
 
+PHASE_TEXT = {
+    "waiting": "Ожидание задач", "Queued": "В очереди GitHub",
+    "claimed": "Задача принята", "clone": "Подготовка копии проекта",
+    "dependencies": "Подготовка зависимостей", "codex_running": "Codex работает",
+    "branch_pr": "Создание ветки и PR", "pr_created": "PR создан",
+    "blocked": "Worker заблокирован", "unavailable": "Worker недоступен",
+    "stopped": "Worker остановлен",
+}
+CHECK_LABELS = {
+    "offline-tests (windows-latest)": "Windows CI",
+    "offline-tests (ubuntu-latest)": "Linux CI",
+    "Owner journeys and regression QA": "Product QA",
+    "Runtime and order reliability QA": "Core QA",
+}
+CHECK_TEXT = {
+    "success": "✓ Успешно", "failure": "Ошибка", "cancelled": "Отменено",
+    "timed_out": "Время истекло", "action_required": "Нужно действие",
+    "startup_failure": "Ошибка запуска", "stale": "Устарело",
+    "skipped": "Пропущено", "neutral": "Без результата", "waiting": "Ожидание",
+    "queued": "В очереди", "pending": "Ожидание", "in_progress": "Выполняется",
+}
+
+
+def worker_active(live, now):
+    return health(live, now) == "heartbeat observed"
+
+
 def worker_status_text(live, online, now):
-    """Never describe an old phase as still running when heartbeat is stale."""
     condition = health(live, now)
-    value = f"Worker: {condition} | GitHub: {'observed' if online else 'unavailable (cached data)'}"
+    label = {"heartbeat observed": "активен, heartbeat свежий", "stopped": "остановлен",
+             "unavailable": "недоступен"}.get(condition, "состояние неизвестно")
+    value = f"Worker: {label} | GitHub: {'обновлён' if online else 'недоступен; данные ранее'}"
     if live:
-        value += f" | heartbeat {time.strftime('%H:%M:%S', time.localtime(live['heartbeat']))}"
-        if condition == "heartbeat observed":
-            value += f" | phase elapsed {max(0, int(now - live['phase_started']))}s"
-        else:
-            value += f" | last recorded phase: {live['phase']}"
+        age = now - live["heartbeat"]
+        value += f" | Heartbeat: {int(age)} с назад" if age >= 0 else " | Heartbeat: время в будущем"
     return value
 
 
+def phase_status_text(live, now, rows=None):
+    if not live:
+        return "Последний этап: неизвестно"
+    row = (rows or {}).get(live.get("issue"), {})
+    if row.get("pr_state") in {"MERGED", "CLOSED"}:
+        return f"Задача #{row['issue']}: {stage(row)} · этап Worker сохранён в истории"
+    phase = PHASE_TEXT.get(live["phase"], "Неизвестно")
+    if worker_active(live, now) and live["phase"] not in {"pr_created", "blocked"}:
+        return f"Наблюдаемый этап: {phase} · {max(0, int(now - live['phase_started']))} с"
+    return f"Последний записанный этап: {phase} (текущее выполнение не подтверждено)"
+
+
+def pr_state(pr):
+    """Only consistent GitHub lifecycle fields count; no inference from green checks."""
+    state, merged = pr.get("state"), pr.get("mergedAt")
+    if isinstance(state, str) and state in {"OPEN", "CLOSED"} and "mergedAt" in pr and merged is None:
+        return state
+    if (state == "MERGED" and isinstance(merged, str) and
+            re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z", merged)):
+        try:
+            time.strptime(merged, "%Y-%m-%dT%H:%M:%SZ")
+            return state
+        except ValueError:
+            pass
+    return "UNKNOWN"
+
+
 def stage(row):
-    if row["phase"] == "pr_created" and row.get("checks"):
-        checks = row["checks"].values()
-        if any(value in FAILURES for value in checks):
-            return "Audit blocked"
-        if len(row["checks"]) == 4 and all(value == "success" for value in checks):
-            return "Audit pending"
-        if any(value == "in_progress" for value in checks):
-            return "CI / QA running"
-        return "CI / QA waiting"
-    return {"claimed": "Worker claimed", "clone": "Isolated clone",
-            "dependencies": "Dependency setup", "codex_running": "Codex running",
-            "branch_pr": "Branch / PR creation", "pr_created": "PR created",
-            "blocked": "Worker blocked"}.get(row["phase"], row["phase"])
+    if row.get("pr_url") or row.get("pr"):
+        state = row.get("pr_state", "UNKNOWN")
+        if state == "MERGED":
+            return "Слито в main"
+        if state == "CLOSED":
+            return "Закрыто без merge"
+        if state != "OPEN":
+            return "Неизвестно"
+        if row["phase"] == "blocked":
+            return "Worker заблокирован"
+        if "checks" not in row:
+            return "Неизвестно"
+        checks = row["checks"]
+        if any(value in FAILURES for value in checks.values()):
+            return "Ошибка проверок"
+        if set(checks) == set(REQUIRED) and all(value == "success" for value in checks.values()):
+            return "Ожидает проверки кода"
+        if any(value in {"queued", "pending", "in_progress"} for value in checks.values()):
+            return "Проверки выполняются"
+        return "Ожидание проверок"
+    return PHASE_TEXT.get(row["phase"], "Неизвестно")
+
+
+def task_text(row, live, now):
+    text = stage(row)
+    if row.get("pr_url") or row.get("pr") or row["phase"] in {"Queued", "blocked"}:
+        return text
+    if (worker_active(live, now) and live.get("issue") == row["issue"]
+            and live["phase"] == row["phase"]):
+        return text
+    return f"Последний этап: {text} · выполнение не подтверждено"
+
+
+def featured_task(rows, live, now):
+    current = (live or {}).get("issue")
+    if worker_active(live, now) and current in rows:
+        row = rows[current]
+        if (row.get("pr_state") not in {"MERGED", "CLOSED"} and row["phase"] == live["phase"]
+                and row["phase"] in {"claimed", "clone", "dependencies", "codex_running", "branch_pr"}):
+            return "Текущая задача", row
+    if rows:
+        return "Последняя задача", rows[max(rows)]
+    return "Задач пока нет", None
+
+
+def launch_notice(message, live, now):
+    if not message:
+        return ""
+    if worker_active(live, now):
+        return "Ранее: запуск не был подтверждён. Сейчас Worker активен по heartbeat."
+    return message
 
 
 class Notifications:
@@ -274,7 +364,9 @@ def collect(root):
             row = rows.get(n)
             if row is None or row.get("pr_url") != pr["url"]:
                 continue
-            row.update(pr=pr["number"], link=pr["url"])
+            if not isinstance(pr.get("headRefOid"), str) or not re.fullmatch(r"[0-9a-f]{40}", pr["headRefOid"]):
+                continue
+            row.update(pr=pr["number"], link=pr["url"], pr_state=pr_state(pr))
             matched.append((row, pr))
         # Bound each refresh; older PRs remain visibly waiting rather than falsely green.
         for row, pr in sorted(matched, key=lambda pair: pair[1]["number"], reverse=True)[:10]:
@@ -286,10 +378,10 @@ def collect(root):
                     row["audit"] = "blocked (worker)"
                 if any(s in FAILURES for s in checks.values()):
                     row["audit"] = "blocked (checks)"
-                    notices.append((f"failure:{pr['number']}:{sha}", f"PR #{pr['number']}: CI/QA failure", pr["url"]))
+                    notices.append((f"failure:{pr['number']}:{sha}", f"PR #{pr['number']}: ошибка CI/QA", pr["url"]))
                 elif all(s == "success" for s in checks.values()):
                     row["audit"] = "blocked (worker)" if row["phase"] == "blocked" else "pending human/ChatGPT review"
-                    notices.append((f"green:{pr['number']}:{sha}", f"PR #{pr['number']}: four checks green", pr["url"]))
+                    notices.append((f"green:{pr['number']}:{sha}", f"PR #{pr['number']}: все четыре проверки успешны", pr["url"]))
                 else:
                     row["audit"] = "waiting for checks"
             except Unavailable:
@@ -302,10 +394,12 @@ def collect(root):
         if url:
             row["link"] = url
             prn = url.rsplit("/", 1)[1]
-            notices.append((f"pr:{prn}", f"Issue #{n}: PR #{prn} created", url))
+            notices.append((f"pr:{prn}", f"Задача #{n}: создан PR #{prn}", url))
         if row["phase"] == "blocked":
             link = f"{BASE}/issues/{n}"
-            notices.append((f"blocked:{n}", f"Issue #{n}: worker blocked", link))
+            notices.append((f"blocked:{n}", f"Задача #{n}: Worker заблокирован", link))
+        if row.get("pr_state") in {"MERGED", "CLOSED", "UNKNOWN"}:
+            row["audit"] = stage(row)
         row.setdefault("link", f"{BASE}/issues/{n}")
     return {"live": live, "rows": rows, "online": online, "notices": notices}
 
@@ -336,26 +430,71 @@ def main():
     from tkinter import ttk
     root = worker.home()
     app = tk.Tk()
-    app.title("FunPayFlow — ChatGPT → GitHub → Worker")
+    from tkinter import font
+    app.title("FunPayFlow — Центр задач")
     app.geometry("1150x700")
-    ttk.Label(app, text="Commands originate in ChatGPT. No GitHub Issue yet = not queued.").pack(anchor="w")
-    status = tk.StringVar(value="Worker unknown; GitHub waiting")
-    ttk.Label(app, textvariable=status).pack(anchor="w")
-    columns = ("issue", "stage", "pr", "checks", "audit")
-    tree = ttk.Treeview(app, columns=columns, show="headings")
-    for name, width in zip(columns, (80, 160, 80, 440, 240)):
-        tree.heading(name, text=name)
-        tree.column(name, width=width)
+    app.minsize(980, 640)
+    for name in ("TkDefaultFont", "TkTextFont", "TkHeadingFont"):
+        font.nametofont(name).configure(size=11)
+    style = ttk.Style(app)
+    style.theme_use("clam")
+    style.configure("TFrame", background="#f3f5f7")
+    style.configure("TLabel", background="#f3f5f7", foreground="#253448")
+    style.configure("Title.TLabel", font=("Segoe UI", 17, "bold"))
+    style.configure("Accent.TLabel", foreground="#225c90", font=("Segoe UI", 12, "bold"))
+    style.configure("Treeview", font=("Segoe UI", 11), rowheight=max(34, font.nametofont("TkDefaultFont").metrics("linespace") + 12))
+    style.configure("Treeview.Heading", font=("Segoe UI", 11, "bold"))
+    app.configure(background="#f3f5f7")
+    body = ttk.Frame(app, padding=16)
+    body.pack(fill="both", expand=True)
+    body.columnconfigure(0, weight=1)
+    body.rowconfigure(6, weight=1)
+    ttk.Label(body, text="FunPayFlow · Центр задач", style="Title.TLabel").grid(row=0, column=0, sticky="w")
+    ttk.Label(body, text="Задачи создаются в ChatGPT и появляются здесь после регистрации в GitHub.", wraplength=940).grid(row=1, column=0, sticky="w", pady=(4, 8))
+    status = tk.StringVar(value="Worker: состояние неизвестно | GitHub: ожидание")
+    ttk.Label(body, textvariable=status, wraplength=940).grid(row=2, column=0, sticky="w")
+    phase_text = tk.StringVar(value="Последний этап: неизвестно")
+    ttk.Label(body, textvariable=phase_text, wraplength=940).grid(row=3, column=0, sticky="w", pady=(2, 8))
+    card = ttk.LabelFrame(body, text="Задача", padding=12)
+    card.grid(row=4, column=0, sticky="ew", pady=(0, 10))
+    summary = tk.StringVar(value="Задач пока нет. Отправьте задачу в ChatGPT.")
+    ttk.Label(card, textvariable=summary, style="Accent.TLabel", wraplength=920).pack(anchor="w")
+    ttk.Label(card, text="Codex сообщает только крупные этапы: отдельные правки и процент готовности недоступны.",
+              wraplength=920).pack(anchor="w", pady=(6, 8))
+    indicators = ttk.Frame(card)
+    indicators.pack(fill="x")
+    check_vars = {}
+    check_widgets = {}
+    for index, (name, label) in enumerate(CHECK_LABELS.items()):
+        indicators.columnconfigure(index % 2, weight=1)
+        value = tk.StringVar(value=f"{label}: Неизвестно")
+        check_vars[name] = value
+        label_widget = ttk.Label(indicators, textvariable=value)
+        label_widget.grid(row=index // 2, column=index % 2, sticky="w", padx=(0, 12), pady=2)
+        check_widgets[name] = label_widget
+    ttk.Label(body, text="Задачи и история · до 100 записей (выберите строку для просмотра)").grid(row=5, column=0, sticky="w")
+    history = ttk.Frame(body)
+    history.grid(row=6, column=0, sticky="nsew", pady=(5, 8))
+    columns = ("issue", "stage", "pr")
+    tree = ttk.Treeview(history, columns=columns, show="headings", height=6, selectmode="browse")
+    for name, label, width in (("issue", "Задача", 100), ("stage", "Состояние", 720), ("pr", "PR", 100)):
+        tree.heading(name, text=label)
+        tree.column(name, width=width, minwidth=80, stretch=name == "stage")
+    scrollbar = ttk.Scrollbar(history, orient="vertical", command=tree.yview)
+    tree.configure(yscrollcommand=scrollbar.set)
+    scrollbar.pack(side="right", fill="y")
     tree.pack(fill="both", expand=True)
-    details = tk.Text(app, height=12, state="disabled")
-    details.pack(fill="x")
-    buttons = ttk.Frame(app)
-    buttons.pack(fill="x")
+    tree.tag_configure("merged", foreground="#237249")
+    details = tk.Text(body, height=3, wrap="word", state="disabled", relief="flat", font="TkTextFont")
+    details.grid(row=7, column=0, sticky="ew")
+    buttons = ttk.Frame(body)
+    buttons.grid(row=8, column=0, sticky="ew", pady=(8, 0))
     result_queue = queue.Queue(maxsize=2)
     live_queue = queue.Queue(maxsize=1)
     launch_queue = queue.Queue(maxsize=1)
     stop = threading.Event()
     launch = threading.Event()
+    launch_busy = threading.Event()
     notification_store = Notifications(root)
     snapshot = {}
     children = []
@@ -376,17 +515,19 @@ def main():
     def poll_launch():
         while not stop.is_set():
             if launch.wait(1):
+                launch_busy.set()
                 launch.clear()
                 try:
                     children.append(start_worker(root))
-                    message = "Worker launch requested; waiting for heartbeat"
-                except Unavailable as exc:
-                    message = str(exc)
+                    message = "Запуск запрошен; ожидается heartbeat Worker"
+                except Unavailable:
+                    message = "Сначала проверьте уже запущенный Worker. Запуск не подтверждён проверкой безопасности."
                 try:
                     launch_queue.get_nowait()
                 except queue.Empty:
                     pass
                 launch_queue.put_nowait(message)
+                launch_busy.clear()
             for child in children[:]:
                 if child.poll() is not None:
                     children.remove(child)
@@ -406,9 +547,9 @@ def main():
 
     def popup(message, link):
         window = tk.Toplevel(app)
-        window.title("FunPayFlow notification")
+        window.title("FunPayFlow · Уведомление")
         ttk.Label(window, text=message).pack(padx=20, pady=12)
-        ttk.Button(window, text="Open GitHub", command=lambda: webbrowser.open(link)).pack(pady=8)
+        ttk.Button(window, text="Открыть GitHub", command=lambda: webbrowser.open(link)).pack(pady=8)
         window.attributes("-topmost", True)
         app.bell()
         popups.append(window)
@@ -451,30 +592,60 @@ def main():
                     row["link"] = job["pr_url"]
                     prn = job["pr_url"].rsplit("/", 1)[1]
                     if notification_store.claim(f"pr:{prn}"):
-                        popup(f"Issue #{n}: PR #{prn} created", job["pr_url"])
+                        popup(f"Задача #{n}: создан PR #{prn}", job["pr_url"])
                 if job["phase"] == "blocked" and notification_store.claim(f"blocked:{n}"):
-                    popup(f"Issue #{n}: worker blocked", f"{BASE}/issues/{n}")
+                    popup(f"Задача #{n}: Worker заблокирован", f"{BASE}/issues/{n}")
         except queue.Empty:
             pass
         if last is not None:
             now = time.time()
             live = last["live"]
             status.set(worker_status_text(live, last["online"], now))
+            phase_text.set(phase_status_text(live, now, snapshot))
+            active = worker_active(live, now)
+            start_button.configure(text="Worker запущен" if active else "Запустить Worker",
+                                   state="disabled" if active or launch.is_set() or launch_busy.is_set() else "normal")
             selection = tree.selection()
+            scroll_position = tree.yview()[0]
             tree.delete(*tree.get_children())
-            for n, row in sorted(snapshot.items(), reverse=True):
-                check_text = "; ".join(f"{k}: {v}" for k, v in row.get("checks", {}).items()) or "waiting / unknown"
-                tree.insert("", "end", iid=str(n), values=(f"#{n}", stage(row), row.get("pr", ""), check_text, row.get("audit", "unknown")))
+            visible = dict(sorted(snapshot.items(), reverse=True)[:100])
+            for n, row in visible.items():
+                text = task_text(row, live, now)
+                if not last["online"] and row.get("pr_url"):
+                    text += " (данные ранее)"
+                tree.insert("", "end", iid=str(n), values=(f"#{n}", text, f"#{row['pr']}" if row.get("pr") else "—"),
+                            tags=("merged",) if row.get("pr_state") == "MERGED" else ())
             for selected in selection:
                 if tree.exists(selected):
                     tree.selection_add(selected)
-            lines = [last_launch, "Recent sanitized worker events:"]
-            for event in (live or {}).get("events", []):
-                lines.append(f"{time.strftime('%H:%M:%S', time.localtime(event['timestamp']))}  #{event['issue'] or '-'}  {event['phase']}")
-            if not snapshot:
-                lines.append("Not queued: no observed tasks. Eligibility is checked by the worker.")
+            tree.yview_moveto(scroll_position)
+            heading, featured = featured_task(visible, live, now)
+            selected = tree.selection()
+            if selected:
+                heading, featured = "Выбранная задача", visible[int(selected[0])]
+            card.configure(text=heading)
+            if featured:
+                pr_label = f" · PR #{featured['pr']}" if featured.get("pr") else ""
+                cache_label = " · данные GitHub ранее" if not last["online"] and featured.get("pr_url") else ""
+                summary.set(f"Задача #{featured['issue']}{pr_label} · {task_text(featured, live, now)}{cache_label}")
+            else:
+                summary.set("Задач пока нет. Отправьте задачу в ChatGPT; Worker проверяет очередь GitHub.")
+            for name, value in check_vars.items():
+                state = (featured or {}).get("checks", {}).get(name)
+                value.set(f"{CHECK_LABELS[name]}: {CHECK_TEXT.get(state, 'Неизвестно')}")
+                check_widgets[name].configure(foreground="#237249" if state == "success" else
+                                              "#a02f34" if state in FAILURES else "#253448")
+            lines = []
+            notice = launch_notice(last_launch, live, now)
+            if notice:
+                lines.append(notice)
+            events = (live or {}).get("events", [])[-2:]
+            for event in events:
+                lines.append(f"{time.strftime('%H:%M:%S', time.localtime(event['timestamp']))} · Задача #{event['issue'] or '—'} · {PHASE_TEXT.get(event['phase'], 'Неизвестно')}")
+            if not lines:
+                lines.append("Ожидание событий Worker. Открытие окна не запускает Worker.")
             if not notification_store.available:
-                lines.append("Notifications unavailable: deduplication storage unreadable/unwritable.")
+                lines.append("Уведомления отключены: хранилище защиты от повторов недоступно.")
             details.config(state="normal")
             details.delete("1.0", "end")
             details.insert("1.0", "\n".join(lines))
@@ -487,8 +658,14 @@ def main():
         if link == BASE or safe_link(link):
             webbrowser.open(link)
 
-    ttk.Button(buttons, text="Start installed worker", command=launch.set).pack(side="left")
-    ttk.Button(buttons, text="Open GitHub", command=open_selected).pack(side="left")
+    def request_launch():
+        if not launch.is_set() and not launch_busy.is_set() and not worker_active((last or {}).get("live"), time.time()):
+            launch.set()
+            start_button.configure(state="disabled")
+
+    start_button = ttk.Button(buttons, text="Запустить Worker", command=request_launch)
+    start_button.pack(side="left")
+    ttk.Button(buttons, text="Открыть GitHub", command=open_selected).pack(side="left")
     def close():
         stop.set()
         app.destroy()  # Worker remains independent; never terminate external processes.

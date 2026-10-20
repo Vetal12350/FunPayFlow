@@ -24,7 +24,7 @@ def no_processes(monkeypatch):
 
 
 def pr():
-    return {"number": 88, "url": URL, "headRefName": "codex/issue-42", "headRefOid": SHA}
+    return {"number": 88, "url": URL, "headRefName": "codex/issue-42", "headRefOid": SHA, "state": "OPEN", "mergedAt": None}
 
 
 def fake_live(tmp_path, phase="pr_created"):
@@ -189,12 +189,14 @@ def test_missing_workflow_association_does_not_count_as_success(monkeypatch):
 
 
 def test_stale_worker_does_not_display_elapsed_running_time():
-    stale = {"heartbeat": 100.0, "phase_started": 95.0, "phase": "waiting"}
+    stale = {"heartbeat": 100.0, "phase_started": 95.0, "phase": "codex_running"}
     msg = cc.worker_status_text(stale, True, 54100.0)
-    assert "stale" in msg and "last recorded phase: waiting" in msg
-    assert "phase elapsed" not in msg
+    assert "состояние неизвестно" in msg
+    assert "Последний записанный этап" in cc.phase_status_text(stale, 54100.0)
+    assert " с" not in cc.phase_status_text(stale, 54100.0)
     active = cc.worker_status_text(stale, True, 105.0)
-    assert "heartbeat observed" in active and "phase elapsed 10s" in active
+    assert "heartbeat свежий" in active
+    assert "10 с" in cc.phase_status_text(stale, 105.0)
 
 
 def test_latest_run_and_exact_job_names(monkeypatch):
@@ -240,7 +242,7 @@ def test_status_sanitizes_payload_and_notifications(monkeypatch, tmp_path):
     monkeypatch.setattr(cc, "gh_json", lambda args: [])
     result = cc.collect(tmp_path)
     assert "synthetic-private-marker" not in json.dumps(result)
-    assert result["notices"] == [("blocked:42", "Issue #42: worker blocked", cc.BASE + "/issues/42")]
+    assert result["notices"] == [("blocked:42", "Задача #42: Worker заблокирован", cc.BASE + "/issues/42")]
 
 
 @pytest.mark.parametrize("text", ["[]", "{", '{"version": 99}', "x" * 65537], ids=["list", "truncated", "version", "oversized"])
@@ -333,17 +335,18 @@ def test_safe_issue_links_strict_allowlist(value, expected):
 
 
 def test_stage_comes_only_from_observed_checks():
-    assert cc.stage({"phase": "codex_running"}) == "Codex running"
-    assert cc.stage({"phase": "pr_created"}) == "PR created"
-    states = dict.fromkeys(cc.REQUIRED, "waiting")
-    assert cc.stage({"phase": "pr_created", "checks": states}) == "CI / QA waiting"
-    states[next(iter(states))] = "in_progress"
-    assert cc.stage({"phase": "pr_created", "checks": states}) == "CI / QA running"
-    states = dict.fromkeys(cc.REQUIRED, "success")
-    assert cc.stage({"phase": "pr_created", "checks": states}) == "Audit pending"
-    states[next(iter(states))] = "failure"
-    assert cc.stage({"phase": "pr_created", "checks": states}) == "Audit blocked"
-    assert cc.stage({"phase": "blocked", "checks": states}) == "Worker blocked"
+    assert cc.stage({"phase": "codex_running"}) == "Codex работает"
+    assert cc.stage({"phase": "pr_created"}) == "PR создан"
+    row = {"phase": "pr_created", "pr": 88, "pr_state": "OPEN",
+           "checks": dict.fromkeys(cc.REQUIRED, "waiting")}
+    assert cc.stage(row) == "Ожидание проверок"
+    row["checks"][next(iter(cc.REQUIRED))] = "in_progress"
+    assert cc.stage(row) == "Проверки выполняются"
+    row["checks"] = dict.fromkeys(cc.REQUIRED, "success")
+    assert cc.stage(row) == "Ожидает проверки кода"
+    row["checks"][next(iter(cc.REQUIRED))] = "failure"
+    assert cc.stage(row) == "Ошибка проверок"
+    assert cc.stage({"phase": "blocked"}) == "Worker заблокирован"
 
 
 def test_notification_write_failure_cannot_replay_or_popup(monkeypatch, tmp_path):
@@ -354,3 +357,157 @@ def test_notification_write_failure_cannot_replay_or_popup(monkeypatch, tmp_path
     assert not notices.claim("pr:88")
     assert not notices.available
     assert not notices.claim("pr:89")
+
+
+@pytest.mark.parametrize("metadata,expected", [
+    ({"state": "OPEN", "mergedAt": None}, "OPEN"),
+    ({"state": "CLOSED", "mergedAt": None}, "CLOSED"),
+    ({"state": "MERGED", "mergedAt": "2026-10-20T09:10:00Z"}, "MERGED"),
+    ({}, "UNKNOWN"), ({"state": "MERGED", "mergedAt": None}, "UNKNOWN"),
+    ({"state": "OPEN"}, "UNKNOWN"),
+    ({"state": {}, "mergedAt": None}, "UNKNOWN"),
+    ({"state": "OPEN", "mergedAt": "2026-10-20T09:10:00Z"}, "UNKNOWN"),
+    ({"state": "MERGED", "mergedAt": "2026-99-99T09:10:00Z"}, "UNKNOWN"),
+    ({"state": "MERGED", "mergedAt": "synthetic-private-marker"}, "UNKNOWN"),
+    ({"state": "synthetic-private-marker", "mergedAt": {}}, "UNKNOWN"),
+])
+def test_pr_lifecycle_exact_metadata(metadata, expected):
+    assert cc.pr_state(metadata) == expected
+
+
+@pytest.mark.parametrize("state,label", [
+    ("MERGED", "Слито в main"), ("CLOSED", "Закрыто без merge"),
+    ("OPEN", "Ожидает проверки кода"), ("UNKNOWN", "Неизвестно"),
+])
+def test_verified_lifecycle_overrides_historical_phase(monkeypatch, tmp_path, state, label):
+    fake_live(tmp_path)
+    github(monkeypatch)
+    original = cc.gh_json
+    def query(args):
+        if args == cc.PRS:
+            return [{**pr(), "state": state,
+                     "mergedAt": "2026-10-20T09:10:00Z" if state == "MERGED" else None}]
+        return original(args)
+    monkeypatch.setattr(cc, "gh_json", query)
+    result = cc.collect(tmp_path)
+    row = result["rows"][42]
+    assert cc.stage(row) == label
+    if state in {"MERGED", "CLOSED", "UNKNOWN"}:
+        assert row["audit"] == label
+    assert set(row["checks"].values()) == {"success"}
+    assert cc.task_text(row, result["live"], 9999999999) == label
+    assert "synthetic-private-marker" not in json.dumps(result)
+
+
+def test_historical_task_and_fresh_current_task():
+    live = {"heartbeat": 100, "phase_started": 95, "phase": "codex_running", "issue": 42}
+    row = {"phase": "codex_running", "issue": 42}
+    assert cc.task_text(row, live, 105) == "Codex работает"
+    assert "не подтверждено" in cc.task_text(row, live, 131)
+    assert "не подтверждено" in cc.task_text({**row, "issue": 41}, live, 105)
+    assert cc.featured_task({42: row}, live, 105)[0] == "Текущая задача"
+    assert cc.featured_task({42: row}, live, 131)[0] == "Последняя задача"
+    merged = {**row, "pr": 88, "pr_state": "MERGED"}
+    assert cc.featured_task({42: merged}, live, 105)[0] == "Последняя задача"
+    assert cc.featured_task({}, None, 105) == ("Задач пока нет", None)
+
+
+def test_worker_launch_observation_and_historical_notice():
+    live = {"heartbeat": 100, "phase_started": 95, "phase": "waiting"}
+    assert cc.worker_active(live, 105)
+    assert not cc.worker_active(live, 131)
+    assert not cc.worker_active(live, 99)
+    assert not cc.worker_active(None, 105)
+    notice = "Сначала проверьте уже запущенный Worker"
+    assert cc.launch_notice(notice, live, 131) == notice
+    assert "Ранее" in cc.launch_notice(notice, live, 105)
+    assert "Сейчас Worker активен" in cc.launch_notice(notice, live, 105)
+    assert cc.launch_notice("", live, 105) == ""
+
+
+def test_import_does_not_spawn_or_import_tk(monkeypatch):
+    import builtins
+    original = builtins.__import__
+    def guarded(name, *args, **kwargs):
+        assert not name.startswith("tkinter")
+        return original(name, *args, **kwargs)
+    monkeypatch.setattr(builtins, "__import__", guarded)
+    spec = importlib.util.spec_from_file_location("headless_monitor", SCRIPT)
+    spec.loader.exec_module(importlib.util.module_from_spec(spec))
+
+
+def test_pr_listing_fixed_fields_allowlist(monkeypatch):
+    calls = []
+    def run(args, **kwargs):
+        calls.append(args)
+        return SimpleNamespace(returncode=0, stdout="[]")
+    monkeypatch.setattr(cc.subprocess, "run", run)
+    cc.gh_json(cc.PRS)
+    assert cc.PRS[-1] == "number,url,headRefName,headRefOid,state,mergedAt"
+    for args in (cc.PRS + ["--web"], cc.PRS[:-1] + ["body"],
+                 ["gh", "api", "--method=GET", "--", f"repos/{cc.REPO}/pulls/88"]):
+        with pytest.raises(cc.Unavailable):
+            cc.gh_json(args)
+    assert calls == [cc.PRS]
+
+
+@pytest.mark.parametrize("state", ["MERGED", "CLOSED"])
+def test_terminal_github_task_never_shows_live_phase_elapsed(state):
+    live = {"heartbeat": 100, "phase_started": 95, "phase": "codex_running", "issue": 79}
+    row = {"issue": 79, "phase": "codex_running", "pr": 80, "pr_state": state}
+    text = cc.phase_status_text(live, 105, {79: row})
+    assert "сохранён в истории" in text
+    assert "10 с" not in text
+    assert "Codex работает" not in text
+
+
+def test_unreadable_checks_do_not_imply_waiting_or_review():
+    row = {"issue": 79, "phase": "pr_created", "pr": 80, "pr_state": "OPEN"}
+    assert cc.stage(row) == "Неизвестно"
+    assert cc.stage({**row, "phase": "blocked"}) == "Worker заблокирован"
+
+
+def test_smoke_79_80_merged_four_green(monkeypatch, tmp_path):
+    status = cc.worker.LiveStatus(tmp_path)
+    url = cc.BASE + "/pull/80"
+    status.publish("pr_created", 79, url)
+    github(monkeypatch)
+    original = cc.gh_json
+    def query(args):
+        if args == cc.PRS:
+            return [{**pr(), "number": 80, "url": url, "headRefName": "codex/issue-79",
+                     "state": "MERGED", "mergedAt": "2026-10-20T09:10:00Z"}]
+        if "/actions/runs?" in args[-1]:
+            data = original(args)
+            for run in data["workflow_runs"]:
+                run["pull_requests"] = [{"number": 80}]
+            return data
+        return original(args)
+    monkeypatch.setattr(cc, "gh_json", query)
+    result = cc.collect(tmp_path)
+    row = result["rows"][79]
+    assert cc.stage(row) == row["audit"] == "Слито в main"
+    assert set(row["checks"].values()) == {"success"}
+    assert "pending" not in row["audit"]
+
+
+@pytest.mark.parametrize("field,value", [
+    ("url", "https://github.com/Attacker/Fork/pull/88"),
+    ("headRefName", "codex/issue-999"),
+    ("headRefOid", "not-a-sha"),
+])
+def test_lifecycle_requires_trusted_pr_identity(monkeypatch, tmp_path, field, value):
+    fake_live(tmp_path)
+    github(monkeypatch)
+    original = cc.gh_json
+    def query(args):
+        if args == cc.PRS:
+            return [{**pr(), "state": "MERGED", "mergedAt": "2026-10-20T09:10:00Z",
+                     field: value}]
+        return original(args)
+    monkeypatch.setattr(cc, "gh_json", query)
+    result = cc.collect(tmp_path)
+    row = result["rows"][42]
+    assert "pr_state" not in row
+    assert cc.stage(row) == "Неизвестно"
+    assert not any(key.startswith("green:") for key, _, _ in result["notices"])
