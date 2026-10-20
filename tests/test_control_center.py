@@ -142,6 +142,61 @@ def test_missing_qa_waits_and_wrong_sha_or_pr_never_green(monkeypatch, tmp_path)
         assert set(cc.checks_for(pr()).values()) == {"waiting"}
 
 
+def test_merged_pr_workflow_with_empty_associations_uses_exact_sha_branch_and_repo(monkeypatch, tmp_path):
+    """GitHub can clear pull_requests on completed runs after PR merge."""
+    fake_live(tmp_path)
+    paths = sorted(set(cc.REQUIRED.values()))
+    runs = [
+        dict(id=i, run_attempt=1, path=path, head_sha=SHA, event="pull_request",
+             pull_requests=[], head_branch="codex/issue-42",
+             repository={"full_name": cc.REPO},
+             head_repository={"full_name": cc.REPO})
+        for i, path in enumerate(paths, 1)
+    ]
+    github(monkeypatch, runs=runs)
+    result = cc.collect(tmp_path)
+    assert set(result["rows"][42]["checks"].values()) == {"success"}
+    assert result["rows"][42]["audit"] == "pending human/ChatGPT review"
+
+
+@pytest.mark.parametrize("bad_field,bad_value", [
+    ("head_branch", "codex/issue-999"),
+    ("repository", {"full_name": "Attacker/Fork"}),
+    ("head_repository", {"full_name": "Attacker/Fork"}),
+    ("head_sha", "b" * 40),
+    ("event", "push"),
+    ("pull_requests", [{"number": 999}]),
+])
+def test_empty_association_fallback_rejects_wrong_identity(monkeypatch, bad_field, bad_value):
+    run = dict(id=1, run_attempt=1, path=".github/workflows/ci.yml",
+               head_sha=SHA, event="pull_request", pull_requests=[],
+               head_branch="codex/issue-42",
+               repository={"full_name": cc.REPO},
+               head_repository={"full_name": cc.REPO})
+    run[bad_field] = bad_value
+    github(monkeypatch, runs=[run])
+    assert set(cc.checks_for(pr()).values()) == {"waiting"}
+
+
+def test_missing_workflow_association_does_not_count_as_success(monkeypatch):
+    run = dict(id=1, run_attempt=1, path=".github/workflows/ci.yml",
+               head_sha=SHA, event="pull_request", head_branch="codex/issue-42",
+               repository={"full_name": cc.REPO},
+               head_repository={"full_name": cc.REPO})
+    github(monkeypatch, runs=[run])
+    with pytest.raises(cc.Unavailable, match="association"):
+        cc.checks_for(pr())
+
+
+def test_stale_worker_does_not_display_elapsed_running_time():
+    stale = {"heartbeat": 100.0, "phase_started": 95.0, "phase": "waiting"}
+    msg = cc.worker_status_text(stale, True, 54100.0)
+    assert "stale" in msg and "last recorded phase: waiting" in msg
+    assert "phase elapsed" not in msg
+    active = cc.worker_status_text(stale, True, 105.0)
+    assert "heartbeat observed" in active and "phase elapsed 10s" in active
+
+
 def test_latest_run_and_exact_job_names(monkeypatch):
     runs = [dict(id=n, run_attempt=1, path=".github/workflows/ci.yml", head_sha=SHA,
                  event="pull_request", pull_requests=[{"number": 88}]) for n in (1, 2)]
