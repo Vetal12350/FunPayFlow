@@ -89,9 +89,24 @@ def checks_for(pr):
         if (path not in set(REQUIRED.values()) or run.get("head_sha") != sha
                 or run.get("event") != "pull_request"):
             continue
-        if not any(isinstance(p, dict) and p.get("number") == pr["number"]
-                   for p in run.get("pull_requests", [])):
-            continue
+        associations = run.get("pull_requests")
+        if not isinstance(associations, list):
+            raise Unavailable("Workflow PR association unavailable")
+        if associations:
+            # A nonempty association list must explicitly name this PR.
+            if not any(isinstance(p, dict) and p.get("number") == pr["number"]
+                       for p in associations):
+                continue
+        else:
+            # GitHub may clear pull_requests after a PR is merged. In that
+            # narrow case independently bind the exact SHA, branch and repo.
+            # SHA, event and workflow path were already validated above.
+            if (run.get("head_branch") != pr.get("headRefName")
+                    or not isinstance(run.get("repository"), dict)
+                    or run["repository"].get("full_name") != REPO
+                    or not isinstance(run.get("head_repository"), dict)
+                    or run["head_repository"].get("full_name") != REPO):
+                continue
         if not number(run.get("id")) or not number(run.get("run_attempt")):
             raise Unavailable("Malformed run identity")
         if path not in selected or (run["id"], run["run_attempt"]) > (
@@ -167,6 +182,19 @@ def health(live, now):
     if live["phase"] in {"stopped", "unavailable"}:
         return live["phase"]
     return "heartbeat observed"
+
+
+def worker_status_text(live, online, now):
+    """Never describe an old phase as still running when heartbeat is stale."""
+    condition = health(live, now)
+    value = f"Worker: {condition} | GitHub: {'observed' if online else 'unavailable (cached data)'}"
+    if live:
+        value += f" | heartbeat {time.strftime('%H:%M:%S', time.localtime(live['heartbeat']))}"
+        if condition == "heartbeat observed":
+            value += f" | phase elapsed {max(0, int(now - live['phase_started']))}s"
+        else:
+            value += f" | last recorded phase: {live['phase']}"
+    return value
 
 
 def stage(row):
@@ -431,10 +459,7 @@ def main():
         if last is not None:
             now = time.time()
             live = last["live"]
-            text = f"Worker: {health(live, now)} | GitHub: {'observed' if last['online'] else 'unavailable (cached data)'}"
-            if live:
-                text += f" | heartbeat {time.strftime('%H:%M:%S', time.localtime(live['heartbeat']))} | phase elapsed {max(0, int(now-live['phase_started']))}s"
-            status.set(text)
+            status.set(worker_status_text(live, last["online"], now))
             selection = tree.selection()
             tree.delete(*tree.get_children())
             for n, row in sorted(snapshot.items(), reverse=True):
