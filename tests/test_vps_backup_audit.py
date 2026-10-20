@@ -77,6 +77,28 @@ def test_complete_candidate_is_not_restore_proof(roots, fmt, prefix):
 
 
 @pytest.mark.parametrize('fmt', ['tar', 'zip'])
+def test_required_members_from_mixed_roots_are_rejected(roots, fmt):
+    payload = dict(payloads(roots))
+    mixed = [
+        ('.env', payload['.env']),
+        ('FunPayFlow-data/bot_settings.json', payload['bot_settings.json']),
+        ('root/FunPayFlow-data/state.sqlite3', payload['state.sqlite3']),
+    ]
+    archive(roots, mixed, fmt)
+    result = inspect(roots)['results'][0]
+    assert result['rejected'] and not result['verified']
+
+
+@pytest.mark.parametrize('fmt', ['tar', 'zip'])
+def test_optional_members_do_not_influence_required_root(roots, fmt):
+    payload = [('unrelated/info.txt', b'synthetic'), *[
+        ('FunPayFlow-data/' + name, value) for name, value in payloads(roots)
+    ]]
+    archive(roots, payload, fmt)
+    assert inspect(roots)['results'][0]['verified']
+
+
+@pytest.mark.parametrize('fmt', ['tar', 'zip'])
 @pytest.mark.parametrize('missing', audit.REQUIRED)
 def test_missing_components(roots, fmt, missing):
     archive(roots, [(n, v) for n, v in payloads(roots) if n != missing], fmt)
