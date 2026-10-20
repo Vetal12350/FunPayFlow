@@ -52,6 +52,8 @@ Failures expose only the fixed category `task_failed`, never raw exception text.
 Heartbeat is written every five seconds, including during the bounded Codex call.
 Local observations refresh once per second independently of GitHub requests. More than
 30 seconds without a heartbeat, or a future heartbeat, means **stale / health unknown**.
+The UI shows the *last recorded phase* for stale workers, not an ever-growing
+"phase elapsed" timer that could be mistaken for active execution.
 A fresh heartbeat proves a recent observation, not that the worker cannot subsequently crash.
 The job's last observed phase remains visible after a crash; it is not proof of continued work.
 Missing/incompatible status means unknown, never proof that an external worker is dead.
@@ -85,8 +87,12 @@ The queue display is a candidate queue; the worker still checks the complete own
 label, prefix, nonempty-body and size policy before claiming an issue.
 
 PR discovery requires both the worker's sanitized PR URL and the matching issue branch.
-Actions queries bind to the PR's current head SHA, `pull_request` event, matching PR
-number, and exact workflow path. The newest run/latest attempt is used, with these exact
+Actions queries bind to the PR's current head SHA, `pull_request` event and exact
+workflow path. If the run has a nonempty `pull_requests` association list, it must
+name the exact PR. GitHub can return an empty association list after a PR is merged:
+only then the monitor requires the exact PR head SHA, matching branch, and both
+run repository identities matching this repository. Missing association data or any
+mismatch cannot count as success. The newest run/latest attempt is used, with these exact
 job names from the current source workflows:
 
 | Workflow path | Required job |
