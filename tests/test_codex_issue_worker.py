@@ -244,8 +244,8 @@ def test_profile_requires_task_description():
     " Codex-Effort: high",
 ])
 def test_duplicate_profile_directives_after_header_rejected(duplicate, tmp_path):
-    task = issue(body="Codex-Model: gpt-6.1-sol\\nCodex-Effort: medium\\n\\n"
-                      + "Do a safe offline task.\\n" + duplicate)
+    task = issue(body="Codex-Model: gpt-6.1-sol\nCodex-Effort: medium\n\n"
+                      + "Do a safe offline task.\n" + duplicate)
     with pytest.raises(worker.WorkerError, match="Invalid Codex profile metadata"):
         worker.task_profile(task)
     assert not list(tmp_path.iterdir())
