@@ -468,6 +468,12 @@ def task_profile(task: dict) -> tuple[str, str]:
     effort = lines[1][len("Codex-Effort: "):]
     if model not in MODELS or effort not in EFFORTS:
         raise WorkerError("Invalid Codex profile metadata")
+    # For tasks WITH an explicit profile, a second profile-looking
+    # directive is ambiguous rather than a harmless override.
+    for line in lines[3:]:
+        normalized = line.lstrip("\ufeff \t").lower()
+        if normalized.startswith(("codex-model", "codex-effort")):
+            raise WorkerError("Invalid Codex profile metadata")
     return model, effort
 
 
