@@ -430,6 +430,7 @@ def test_import_does_not_spawn_or_import_tk(monkeypatch):
     original = builtins.__import__
     def guarded(name, *args, **kwargs):
         assert not name.startswith("tkinter")
+        assert not name.startswith("customtkinter")
         return original(name, *args, **kwargs)
     monkeypatch.setattr(builtins, "__import__", guarded)
     spec = importlib.util.spec_from_file_location("headless_monitor", SCRIPT)
@@ -511,3 +512,160 @@ def test_lifecycle_requires_trusted_pr_identity(monkeypatch, tmp_path, field, va
     assert "pr_state" not in row
     assert cc.stage(row) == "Неизвестно"
     assert not any(key.startswith("green:") for key, _, _ in result["notices"])
+
+
+@pytest.mark.parametrize("key", ["pr:88", "green:88:" + SHA, "failure:88:" + SHA, "blocked:42"])
+def test_sound_once_per_event_across_restart(tmp_path, key):
+    calls = []
+    app = SimpleNamespace(bell=lambda: calls.append("bell"))
+    assert cc.sound_notification(app, cc.Notifications(tmp_path), key)
+    assert not cc.sound_notification(app, cc.Notifications(tmp_path), key)
+    assert calls == ["bell"]
+
+
+def test_audio_failure_is_quiet_and_never_replayed(tmp_path):
+    def bell():
+        raise RuntimeError("No desktop audio")
+    app = SimpleNamespace(bell=bell)
+    assert cc.sound_notification(app, cc.Notifications(tmp_path), "pr:88")
+    assert not cc.sound_notification(app, cc.Notifications(tmp_path), "pr:88")
+
+
+def test_sound_requires_main_thread(tmp_path):
+    import threading
+    errors = []
+    store = cc.Notifications(tmp_path)
+    def run():
+        try:
+            cc.sound_notification(SimpleNamespace(), store, "pr:88")
+        except RuntimeError as error:
+            errors.append(str(error))
+    thread = threading.Thread(target=run)
+    thread.start()
+    thread.join()
+    assert errors == ["Notifications require the UI main thread"]
+    assert not store.seen
+
+
+def test_missing_optional_dependency_does_not_access_state(monkeypatch, capsys):
+    import builtins
+    original = builtins.__import__
+    def guarded(name, *args, **kwargs):
+        if name == "customtkinter":
+            raise ImportError("optional")
+        return original(name, *args, **kwargs)
+    monkeypatch.setattr(builtins, "__import__", guarded)
+    monkeypatch.setattr(cc.worker, "home", lambda: pytest.fail("State accessed"))
+    assert cc.main() == 1
+    assert "setup_control_center_ui.ps1" in capsys.readouterr().err
+
+
+def test_wrong_optional_version_does_not_access_state(monkeypatch, capsys):
+    import sys
+    monkeypatch.setitem(sys.modules, "customtkinter", SimpleNamespace(__version__="5.2.2"))
+    monkeypatch.setattr(cc.worker, "home", lambda: pytest.fail("State accessed"))
+    assert cc.main() == 1
+    assert "CustomTkinter==6.0.0" in capsys.readouterr().err
+
+
+def test_fresh_waiting_health_is_distinct_from_running():
+    live = {"heartbeat": 100, "phase_started": 95, "phase": "waiting"}
+    assert "ожидает задачи" in cc.worker_status_text(live, True, 105)
+    assert "состояние неизвестно" in cc.worker_status_text(live, True, 131)
+
+
+def test_ctk_ui_refresh_is_sound_only_and_worker_stays_disabled(monkeypatch, tmp_path):
+    """Exercise startup, queue consumption, refresh and close with a headless CTk fake."""
+    import queue
+    import sys
+    widgets = []
+    bells = []
+    callbacks = []
+    protocols = {}
+    class Widget:
+        def __init__(self, *args, **kwargs):
+            self.options = kwargs
+            widgets.append(self)
+        def configure(self, **kwargs):
+            self.options.update(kwargs)
+        def grid(self, **kwargs):
+            pass
+        pack = grid
+        grid_columnconfigure = lambda *args, **kwargs: None
+        grid_rowconfigure = grid_columnconfigure
+        title = grid_columnconfigure
+        geometry = grid_columnconfigure
+        minsize = grid_columnconfigure
+        update_idletasks = grid_columnconfigure
+        winfo_width = lambda self: 1150
+        winfo_screenwidth = lambda self: 1366
+        winfo_screenheight = lambda self: 768
+        bind = grid_columnconfigure
+        destroy = grid_columnconfigure
+        def protocol(self, name, callback):
+            protocols[name] = callback
+        def after(self, delay, callback):
+            callbacks.append(callback)
+        def bell(self):
+            bells.append("bell")
+        def mainloop(self):
+            callbacks.pop(0)()  # Duplicate refresh cannot ring again.
+            protocols["WM_DELETE_WINDOW"]()
+    fake = SimpleNamespace(__version__="6.0.0", CTk=Widget, CTkFrame=Widget,
+                           CTkButton=Widget, CTkLabel=Widget, CTkScrollableFrame=Widget,
+                           CTkOptionMenu=Widget, set_appearance_mode=lambda value: None,
+                           set_default_color_theme=lambda value: None)
+    monkeypatch.setitem(sys.modules, "customtkinter", fake)
+    live = {"heartbeat": 100, "phase_started": 95, "phase": "pr_created", "issue": 42,
+            "jobs": {42: {"phase": "pr_created", "pr_url": URL}}, "events": []}
+    row = {"issue": 42, **live["jobs"][42], "pr": 88, "pr_state": "OPEN", "link": URL,
+           "checks": dict.fromkeys(cc.REQUIRED, "success")}
+    result = {"live": live, "rows": {42: row}, "online": True,
+              "notices": [("pr:88", "PR создан", URL), ("green:88:" + SHA, "Все четыре успешны", URL)]}
+    queues = [queue.Queue(), queue.Queue(), queue.Queue()]
+    queues[0].put(result)
+    queues[1].put(live)
+    monkeypatch.setattr(cc.queue, "Queue", lambda **kwargs: queues.pop(0))
+    monkeypatch.setattr(cc.threading, "Thread", lambda **kwargs: SimpleNamespace(start=lambda: None))
+    monkeypatch.setattr(cc.worker, "home", lambda: tmp_path)
+    monkeypatch.setattr(cc.time, "time", lambda: 105)
+    monkeypatch.setattr(cc.webbrowser, "open", lambda *args: pytest.fail("Automatic browser"))
+    assert cc.main() == 0
+    assert bells == ["bell", "bell"]
+    assert any(w.options.get("text") == "Worker запущен" and w.options.get("state") == "disabled" for w in widgets)
+    assert any("PR создан" in w.options.get("text", "") for w in widgets)
+    assert not cc.Notifications(tmp_path).claim("pr:88")
+
+
+def test_launcher_and_explicit_setup_contract():
+    launcher = SCRIPT.with_name("start_control_center.bat").read_text(encoding="utf-8")
+    setup = SCRIPT.with_name("setup_control_center_ui.ps1").read_text(encoding="utf-8")
+    assert "control-center-venv\\Scripts\\python.exe" in launcher
+    assert 'if not exist "%UI_PYTHON%"' in launcher
+    assert '"%UI_PYTHON%" "%~dp0control_center.py"' in launcher
+    assert "echo Run explicitly:" in launcher
+    assert "pip" not in launcher and "py -3.13" not in launcher
+    assert "CustomTkinter==6.0.0" in setup
+    assert "https://pypi.org/simple" in setup and "--isolated" in setup
+    assert "-m venv $uiVenv" in setup and "-I -m pip" in setup
+    assert "include-system-site-packages = false" in setup
+    for forbidden in ("RunAs", "ExecutionPolicy", "Invoke-WebRequest", "uv sync", "--user", "--extra-index-url"):
+        assert forbidden not in setup
+
+
+def test_presentation_contains_no_popups_or_focus_steals():
+    import ast
+    tree = ast.parse(SCRIPT.read_text(encoding="utf-8"))
+    forbidden = {"Toplevel", "CTkToplevel", "messagebox", "showinfo", "showerror",
+                 "focus_force", "attributes", "grab_set"}
+    assert not any(isinstance(node, ast.Attribute) and node.attr in forbidden for node in ast.walk(tree))
+    assert SCRIPT.read_text(encoding="utf-8").count("app.bell()") == 1
+
+
+def test_timeline_contains_only_observed_events():
+    live = {"events": [{"issue": 42, "phase": "claimed", "timestamp": 100},
+                       {"issue": 99, "phase": "codex_running", "timestamp": 101}]}
+    text = cc.observed_timeline(live, 42)
+    assert cc.PHASE_TEXT["claimed"] in text
+    assert cc.PHASE_TEXT["codex_running"] not in text
+    assert "%" not in text

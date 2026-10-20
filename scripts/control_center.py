@@ -215,6 +215,8 @@ def worker_status_text(live, online, now):
     condition = health(live, now)
     label = {"heartbeat observed": "активен, heartbeat свежий", "stopped": "остановлен",
              "unavailable": "недоступен"}.get(condition, "состояние неизвестно")
+    if condition == "heartbeat observed" and live["phase"] == "waiting":
+        label = "ожидает задачи, heartbeat свежий"
     value = f"Worker: {label} | GitHub: {'обновлён' if online else 'недоступен; данные ранее'}"
     if live:
         age = now - live["heartbeat"]
@@ -328,7 +330,7 @@ class Notifications:
             return False
         self.seen.add(key)
         try:
-            # Persist BEFORE showing popup: a crash may lose one popup, never replay it.
+            # Persist BEFORE sounding: a crash may lose one sound, never replay it.
             worker.state_write(self.path, sorted(self.seen))
         except OSError:
             self.available = False
@@ -424,71 +426,111 @@ def start_worker(root):
         raise Unavailable("Worker active or startup safety check unavailable") from None
 
 
+def sound_notification(app, store, key):
+    """Called only by the UI thread; claim before a best-effort, single short bell."""
+    if threading.current_thread() is not threading.main_thread():
+        raise RuntimeError("Notifications require the UI main thread")
+    if not store.claim(key):
+        return False
+    try:
+        app.bell()
+    except Exception:
+        pass  # Desktop audio/Tk can be unavailable. Never replay a claimed event.
+    return True
+
+
+def observed_timeline(live, issue):
+    events = [event for event in (live or {}).get("events", []) if event["issue"] == issue][-5:]
+    return "\n".join(
+        f"{time.strftime('%H:%M:%S', time.localtime(event['timestamp']))}  ·  {PHASE_TEXT[event['phase']]}"
+        for event in events) or "Нет сохранённых событий для этой задачи."
+
+
 def main():
-    # Tk is deliberately lazy: headless Linux tests can import every model function.
-    import tkinter as tk
-    from tkinter import ttk
-    root = worker.home()
-    app = tk.Tk()
-    from tkinter import font
+    # Optional dependency must be checked BEFORE accessing worker state or starting threads.
+    try:
+        import customtkinter as ctk
+    except ImportError:
+        print("Control Center requires optional CustomTkinter==6.0.0. "
+              "Run scripts/setup_control_center_ui.ps1 explicitly, then start_control_center.bat.", file=sys.stderr)
+        return 1
+    if ctk.__version__ != "6.0.0":
+        print("Control Center requires CustomTkinter==6.0.0; run the optional UI setup.", file=sys.stderr)
+        return 1
+    ctk.set_appearance_mode("System")
+    ctk.set_default_color_theme("blue")
+    app = ctk.CTk()
     app.title("FunPayFlow — Центр задач")
     app.geometry("1150x700")
-    app.minsize(980, 640)
-    for name in ("TkDefaultFont", "TkTextFont", "TkHeadingFont"):
-        font.nametofont(name).configure(size=11)
-    style = ttk.Style(app)
-    style.theme_use("clam")
-    style.configure("TFrame", background="#f3f5f7")
-    style.configure("TLabel", background="#f3f5f7", foreground="#253448")
-    style.configure("Title.TLabel", font=("Segoe UI", 17, "bold"))
-    style.configure("Accent.TLabel", foreground="#225c90", font=("Segoe UI", 12, "bold"))
-    style.configure("Treeview", font=("Segoe UI", 11), rowheight=max(34, font.nametofont("TkDefaultFont").metrics("linespace") + 12))
-    style.configure("Treeview.Heading", font=("Segoe UI", 11, "bold"))
-    app.configure(background="#f3f5f7")
-    body = ttk.Frame(app, padding=16)
-    body.pack(fill="both", expand=True)
-    body.columnconfigure(0, weight=1)
-    body.rowconfigure(6, weight=1)
-    ttk.Label(body, text="FunPayFlow · Центр задач", style="Title.TLabel").grid(row=0, column=0, sticky="w")
-    ttk.Label(body, text="Задачи создаются в ChatGPT и появляются здесь после регистрации в GitHub.", wraplength=940).grid(row=1, column=0, sticky="w", pady=(4, 8))
-    status = tk.StringVar(value="Worker: состояние неизвестно | GitHub: ожидание")
-    ttk.Label(body, textvariable=status, wraplength=940).grid(row=2, column=0, sticky="w")
-    phase_text = tk.StringVar(value="Последний этап: неизвестно")
-    ttk.Label(body, textvariable=phase_text, wraplength=940).grid(row=3, column=0, sticky="w", pady=(2, 8))
-    card = ttk.LabelFrame(body, text="Задача", padding=12)
-    card.grid(row=4, column=0, sticky="ew", pady=(0, 10))
-    summary = tk.StringVar(value="Задач пока нет. Отправьте задачу в ChatGPT.")
-    ttk.Label(card, textvariable=summary, style="Accent.TLabel", wraplength=920).pack(anchor="w")
-    ttk.Label(card, text="Codex сообщает только крупные этапы: отдельные правки и процент готовности недоступны.",
-              wraplength=920).pack(anchor="w", pady=(6, 8))
-    indicators = ttk.Frame(card)
-    indicators.pack(fill="x")
-    check_vars = {}
+    app.minsize(760, 480)
+    app.update_idletasks()
+    # CTk geometry is logical; screen/widget sizes are physical pixels at Windows DPI.
+    screen_ratio = 1150 / max(1, app.winfo_width())
+    width = min(1150, max(760, int((app.winfo_screenwidth() - 40) * screen_ratio)))
+    height = min(700, max(480, int((app.winfo_screenheight() - 48) * screen_ratio)))
+    app.geometry(f"{width}x{height}")
+    app.configure(fg_color=("#edf3fa", "#111b29"))
+    app.grid_columnconfigure(0, weight=1)
+    app.grid_rowconfigure(2, weight=1)
+    ink = ("#23364e", "#e0ebf7")
+    muted = ("#526780", "#a5b8ce")
+    surface = ("#ffffff", "#1a293b")
+    accent = "#2686cf"
+
+    def label(parent, text="", **kwargs):
+        return ctk.CTkLabel(parent, text=text, anchor="w", justify="left",
+                            text_color=ink, font=("Segoe UI", 14), **kwargs)
+
+    header = ctk.CTkFrame(app, fg_color="transparent")
+    header.grid(row=0, column=0, sticky="ew", padx=20, pady=(16, 6))
+    header.grid_columnconfigure(0, weight=1)
+    title = label(header, "FunPayFlow · Центр задач")
+    title.configure(font=("Segoe UI", 24, "bold"))
+    title.grid(row=0, column=0, sticky="w")
+    themes = {"Системная": "System", "Светлая": "Light", "Тёмная": "Dark"}
+    theme = ctk.CTkOptionMenu(header, values=list(themes), width=145,
+                            command=lambda value: ctk.set_appearance_mode(themes[value]))
+    theme.grid(row=0, column=1, padx=(8, 0))
+    status = label(header, "Worker: состояние неизвестно | GitHub: ожидание", wraplength=900)
+    status.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+    phase_text = label(app, "Задачи создаются в ChatGPT → GitHub. Здесь — только наблюдение.", wraplength=900)
+    phase_text.grid(row=1, column=0, sticky="ew", padx=20, pady=(0, 10))
+    content = ctk.CTkFrame(app, fg_color="transparent")
+    content.grid(row=2, column=0, sticky="nsew", padx=20)
+    content.grid_columnconfigure(0, weight=2, minsize=230)
+    content.grid_columnconfigure(1, weight=3)
+    content.grid_rowconfigure(0, weight=1)
+    history = ctk.CTkScrollableFrame(content, corner_radius=16, fg_color=surface,
+                                    label_text="Задачи и история · до 100", label_anchor="w")
+    history.grid(row=0, column=0, sticky="nsew", padx=(0, 12))
+    history.grid_columnconfigure(0, weight=1)
+    card = ctk.CTkScrollableFrame(content, corner_radius=16, fg_color=surface)
+    card.grid(row=0, column=1, sticky="nsew")
+    card.grid_columnconfigure(0, weight=1)
+    heading = label(card, "Задач пока нет")
+    heading.grid(row=0, column=0, sticky="ew", padx=12, pady=(12, 4))
+    summary = label(card, "Отправьте задачу в ChatGPT.", wraplength=500)
+    summary.configure(font=("Segoe UI", 19, "bold"))
+    summary.grid(row=1, column=0, sticky="ew", padx=12, pady=(0, 12))
     check_widgets = {}
-    for index, (name, label) in enumerate(CHECK_LABELS.items()):
-        indicators.columnconfigure(index % 2, weight=1)
-        value = tk.StringVar(value=f"{label}: Неизвестно")
-        check_vars[name] = value
-        label_widget = ttk.Label(indicators, textvariable=value)
-        label_widget.grid(row=index // 2, column=index % 2, sticky="w", padx=(0, 12), pady=2)
-        check_widgets[name] = label_widget
-    ttk.Label(body, text="Задачи и история · до 100 записей (выберите строку для просмотра)").grid(row=5, column=0, sticky="w")
-    history = ttk.Frame(body)
-    history.grid(row=6, column=0, sticky="nsew", pady=(5, 8))
-    columns = ("issue", "stage", "pr")
-    tree = ttk.Treeview(history, columns=columns, show="headings", height=6, selectmode="browse")
-    for name, label, width in (("issue", "Задача", 100), ("stage", "Состояние", 720), ("pr", "PR", 100)):
-        tree.heading(name, text=label)
-        tree.column(name, width=width, minwidth=80, stretch=name == "stage")
-    scrollbar = ttk.Scrollbar(history, orient="vertical", command=tree.yview)
-    tree.configure(yscrollcommand=scrollbar.set)
-    scrollbar.pack(side="right", fill="y")
-    tree.pack(fill="both", expand=True)
-    tree.tag_configure("merged", foreground="#237249")
-    details = tk.Text(body, height=3, wrap="word", state="disabled", relief="flat", font="TkTextFont")
-    details.grid(row=7, column=0, sticky="ew")
-    buttons = ttk.Frame(body)
-    buttons.grid(row=8, column=0, sticky="ew", pady=(8, 0))
+    for index, (name, text) in enumerate(CHECK_LABELS.items(), 2):
+        item = ctk.CTkFrame(card, corner_radius=12, fg_color=("#f0f5fb", "#22364c"))
+        item.grid(row=index, column=0, sticky="ew", padx=12, pady=3)
+        value = label(item, f"{text}: Неизвестно", wraplength=470)
+        value.pack(fill="x", padx=12, pady=8)
+        check_widgets[name] = value
+    label(card, "Наблюдаемые этапы · без процента готовности").grid(
+        row=6, column=0, sticky="ew", padx=12, pady=(16, 4))
+    timeline = label(card, "Нет сохранённых событий.", wraplength=500)
+    timeline.grid(row=7, column=0, sticky="ew", padx=12)
+    event_indicator = label(card, "Событий пока нет", wraplength=500)
+    event_indicator.configure(text_color=muted)
+    event_indicator.grid(row=8, column=0, sticky="ew", padx=12, pady=12)
+    footer = ctk.CTkFrame(app, fg_color="transparent")
+    footer.grid(row=3, column=0, sticky="ew", padx=20, pady=12)
+    details = label(footer, "Открытие окна не запускает Worker.", wraplength=900)
+    details.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 8))
+    root = worker.home()
     result_queue = queue.Queue(maxsize=2)
     live_queue = queue.Queue(maxsize=1)
     launch_queue = queue.Queue(maxsize=1)
@@ -498,9 +540,11 @@ def main():
     notification_store = Notifications(root)
     snapshot = {}
     children = []
-    popups = []
     last = None
     last_launch = ""
+    selected = None
+    history_buttons = {}
+    notice_history = {}  # Safe fixed messages only, bounded by visible task history below.
 
     def poll_live():
         while not stop.is_set():
@@ -545,20 +589,74 @@ def main():
                 pass
             stop.wait(5)
 
-    def popup(message, link):
-        window = tk.Toplevel(app)
-        window.title("FunPayFlow · Уведомление")
-        ttk.Label(window, text=message).pack(padx=20, pady=12)
-        ttk.Button(window, text="Открыть GitHub", command=lambda: webbrowser.open(link)).pack(pady=8)
-        window.attributes("-topmost", True)
-        app.bell()
-        popups.append(window)
-        # Bounded, non-modal local Windows popups. Never block the refresh loop.
-        if len(popups) > 4:
-            old = popups.pop(0)
-            if old.winfo_exists():
-                old.destroy()
-        window.after(20000, window.destroy)
+    def notify(key, message, link):
+        notice_history[key] = (message, link)
+        if len(notice_history) > 400:
+            del notice_history[next(iter(notice_history))]
+        sound_notification(app, notification_store, key)
+
+    def select_task(issue):
+        nonlocal selected
+        selected = issue
+        display()
+
+    def display():
+        if last is None:
+            return
+        now = time.time()
+        live = last["live"]
+        status.configure(text=worker_status_text(live, last["online"], now))
+        phase_text.configure(text=phase_status_text(live, now, snapshot))
+        active = worker_active(live, now)
+        start_button.configure(text="Worker запущен" if active else "Запустить Worker",
+                               state="disabled" if active or launch.is_set() or launch_busy.is_set() else "normal")
+        visible = dict(sorted(snapshot.items(), reverse=True)[:100])
+        # Keep widgets during refresh so focus, selection and scroll position survive.
+        for n in list(history_buttons):
+            if n not in visible:
+                history_buttons.pop(n).destroy()
+        for index, (n, row) in enumerate(visible.items()):
+            if n not in history_buttons:
+                history_buttons[n] = ctk.CTkButton(history, anchor="w", height=74, corner_radius=12,
+                    command=lambda issue=n: select_task(issue), text_color=ink, hover_color=("#dcecff", "#314d6b"))
+            text = task_text(row, live, now)
+            if not last["online"] and row.get("pr_url"):
+                text += " · данные ранее"
+            button = history_buttons[n]
+            short = text if len(text) <= 34 else text[:31] + "…"
+            task_links = {f"{BASE}/issues/{n}", row.get("pr_url")}
+            marker = " · •" if any(link in task_links for _, link in notice_history.values()) else ""
+            button.configure(text=f"#{n}" + (f" · PR #{row['pr']}" if row.get("pr") else "") + marker + f"\n{short}",
+                             fg_color=("#dcecff", "#314d6b") if selected == n else ("#f0f5fb", "#22364c"))
+            button.grid(row=index, column=0, sticky="ew", padx=4, pady=4)
+        empty.configure(text="Отправьте задачу в ChatGPT.\nЗдесь появится очередь GitHub." if not visible else "")
+        empty.grid(row=len(visible), column=0, sticky="ew", padx=4)
+        caption, featured = featured_task(visible, live, now)
+        if selected in visible:
+            caption, featured = "Выбранная задача", visible[selected]
+        heading.configure(text=caption)
+        summary.configure(text=(f"Задача #{featured['issue']} · {task_text(featured, live, now)}"
+                                if featured else "Отправьте задачу в ChatGPT; Worker проверяет очередь GitHub."))
+        for name, widget in check_widgets.items():
+            state = (featured or {}).get("checks", {}).get(name)
+            widget.configure(text=f"{CHECK_LABELS[name]}: {CHECK_TEXT.get(state, 'Неизвестно')}",
+                             text_color=("#207547", "#70d69d") if state == "success" else
+                             ("#ae343c", "#ff9299") if state in FAILURES else ink)
+        timeline.configure(text=observed_timeline(live, (featured or {}).get("issue")))
+        links = {f"{BASE}/issues/{n}" for n in visible}
+        links.update(row.get("pr_url") for row in visible.values())
+        for key in list(notice_history):
+            if notice_history[key][1] not in links:
+                del notice_history[key]
+        task_links = {f"{BASE}/issues/{featured['issue']}", featured.get("pr_url")} if featured else set()
+        messages = [message for message, link in notice_history.values() if link in task_links][-4:]
+        event_indicator.configure(text="События\n" + "\n".join(messages) if messages else "Событий для задачи пока нет")
+        notice = launch_notice(last_launch, live, now)
+        if not notification_store.available:
+            notice += " · Звуки отключены: хранилище защиты от повторов недоступно."
+        if not last["online"]:
+            notice += " · GitHub недоступен; результаты могут быть сохранёнными ранее."
+        details.configure(text=notice.strip(" ·") or "Звук — только для новых событий. Worker работает независимо от окна.")
 
     def render():
         nonlocal last, snapshot, last_launch
@@ -575,8 +673,7 @@ def main():
                 else:
                     snapshot.update(result["rows"])
                 for key, message, link in result["notices"]:
-                    if notification_store.claim(key):
-                        popup(message, link)
+                    notify(key, message, link)
         except queue.Empty:
             pass
         try:
@@ -591,70 +688,19 @@ def main():
                 if job.get("pr_url"):
                     row["link"] = job["pr_url"]
                     prn = job["pr_url"].rsplit("/", 1)[1]
-                    if notification_store.claim(f"pr:{prn}"):
-                        popup(f"Задача #{n}: создан PR #{prn}", job["pr_url"])
-                if job["phase"] == "blocked" and notification_store.claim(f"blocked:{n}"):
-                    popup(f"Задача #{n}: Worker заблокирован", f"{BASE}/issues/{n}")
+                    notify(f"pr:{prn}", f"Задача #{n}: создан PR #{prn}", job["pr_url"])
+                if job["phase"] == "blocked":
+                    notify(f"blocked:{n}", f"Задача #{n}: Worker заблокирован", f"{BASE}/issues/{n}")
         except queue.Empty:
             pass
-        if last is not None:
-            now = time.time()
-            live = last["live"]
-            status.set(worker_status_text(live, last["online"], now))
-            phase_text.set(phase_status_text(live, now, snapshot))
-            active = worker_active(live, now)
-            start_button.configure(text="Worker запущен" if active else "Запустить Worker",
-                                   state="disabled" if active or launch.is_set() or launch_busy.is_set() else "normal")
-            selection = tree.selection()
-            scroll_position = tree.yview()[0]
-            tree.delete(*tree.get_children())
-            visible = dict(sorted(snapshot.items(), reverse=True)[:100])
-            for n, row in visible.items():
-                text = task_text(row, live, now)
-                if not last["online"] and row.get("pr_url"):
-                    text += " (данные ранее)"
-                tree.insert("", "end", iid=str(n), values=(f"#{n}", text, f"#{row['pr']}" if row.get("pr") else "—"),
-                            tags=("merged",) if row.get("pr_state") == "MERGED" else ())
-            for selected in selection:
-                if tree.exists(selected):
-                    tree.selection_add(selected)
-            tree.yview_moveto(scroll_position)
-            heading, featured = featured_task(visible, live, now)
-            selected = tree.selection()
-            if selected:
-                heading, featured = "Выбранная задача", visible[int(selected[0])]
-            card.configure(text=heading)
-            if featured:
-                pr_label = f" · PR #{featured['pr']}" if featured.get("pr") else ""
-                cache_label = " · данные GitHub ранее" if not last["online"] and featured.get("pr_url") else ""
-                summary.set(f"Задача #{featured['issue']}{pr_label} · {task_text(featured, live, now)}{cache_label}")
-            else:
-                summary.set("Задач пока нет. Отправьте задачу в ChatGPT; Worker проверяет очередь GitHub.")
-            for name, value in check_vars.items():
-                state = (featured or {}).get("checks", {}).get(name)
-                value.set(f"{CHECK_LABELS[name]}: {CHECK_TEXT.get(state, 'Неизвестно')}")
-                check_widgets[name].configure(foreground="#237249" if state == "success" else
-                                              "#a02f34" if state in FAILURES else "#253448")
-            lines = []
-            notice = launch_notice(last_launch, live, now)
-            if notice:
-                lines.append(notice)
-            events = (live or {}).get("events", [])[-2:]
-            for event in events:
-                lines.append(f"{time.strftime('%H:%M:%S', time.localtime(event['timestamp']))} · Задача #{event['issue'] or '—'} · {PHASE_TEXT.get(event['phase'], 'Неизвестно')}")
-            if not lines:
-                lines.append("Ожидание событий Worker. Открытие окна не запускает Worker.")
-            if not notification_store.available:
-                lines.append("Уведомления отключены: хранилище защиты от повторов недоступно.")
-            details.config(state="normal")
-            details.delete("1.0", "end")
-            details.insert("1.0", "\n".join(lines))
-            details.config(state="disabled")
+        snapshot = dict(sorted(snapshot.items(), reverse=True)[:100])
+        display()
         app.after(1000, render)
 
     def open_selected():
-        selected = tree.selection()
-        link = snapshot.get(int(selected[0]), {}).get("link") if selected else BASE
+        _, featured = featured_task(snapshot, (last or {}).get("live"), time.time())
+        row = snapshot.get(selected, featured or {})
+        link = row.get("link", BASE)
         if link == BASE or safe_link(link):
             webbrowser.open(link)
 
@@ -663,9 +709,31 @@ def main():
             launch.set()
             start_button.configure(state="disabled")
 
-    start_button = ttk.Button(buttons, text="Запустить Worker", command=request_launch)
-    start_button.pack(side="left")
-    ttk.Button(buttons, text="Открыть GitHub", command=open_selected).pack(side="left")
+    empty = label(history, "", wraplength=250)
+    start_button = ctk.CTkButton(footer, text="Запустить Worker", corner_radius=10,
+                               fg_color=accent, command=request_launch)
+    start_button.grid(row=1, column=0, sticky="w")
+    ctk.CTkButton(footer, text="Открыть GitHub", corner_radius=10, command=open_selected).grid(
+        row=1, column=1, sticky="w", padx=10)
+
+    def resize(event):
+        if event.widget is app:
+            ratio = int(app.geometry().split("x")[0]) / max(1, app.winfo_width())
+            width = max(220, int(card.winfo_width() * ratio) - 50)
+            for widget in (summary, timeline, event_indicator, *check_widgets.values()):
+                widget.configure(wraplength=width)
+            for widget in (status, phase_text, details):
+                widget.configure(wraplength=max(400, int(header.winfo_width() * ratio) - 20))
+    app.bind("<Configure>", resize, add="+")
+
+    def browse(direction):
+        ids = sorted(snapshot, reverse=True)
+        if ids:
+            index = ids.index(selected) if selected in ids else (-1 if direction > 0 else len(ids))
+            select_task(ids[max(0, min(len(ids) - 1, index + direction))])
+    app.bind("<Down>", lambda event: browse(1), add="+")
+    app.bind("<Up>", lambda event: browse(-1), add="+")
+
     def close():
         stop.set()
         app.destroy()  # Worker remains independent; never terminate external processes.
@@ -675,7 +743,8 @@ def main():
     threading.Thread(target=poll, daemon=True).start()
     render()
     app.mainloop()
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
