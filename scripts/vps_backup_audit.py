@@ -87,7 +87,7 @@ def _known(name):
     for prefix in PREFIXES:
         for leaf in REQUIRED:
             if name == prefix + leaf:
-                return leaf
+                return leaf, prefix
     return None
 
 
@@ -119,6 +119,7 @@ class Members:
         self.temp_root = temp_root
         self.names = set()
         self.found = set()
+        self.required_prefix = None
         self.total = 0
         self.sqlite_ok = False
 
@@ -129,8 +130,16 @@ class Members:
         _require(0 <= size <= MAX_MEMBER and (not directory or size == 0))
         self.total += size
         _require(self.total <= MAX_EXPANDED)
-        leaf = None if directory else _known(name)
-        if leaf:
+        known = None if directory else _known(name)
+        leaf = None
+        if known is not None:
+            leaf, prefix = known
+            # All required files must be from ONE permitted archive root.
+            # Mixed roots may be incompatible with safe recovery even when
+            # each basename is recognized individually.
+            if self.required_prefix is None:
+                self.required_prefix = prefix
+            _require(prefix == self.required_prefix)
             _require(leaf not in self.found)
             self.found.add(leaf)
         # Reject embedded archives by suffix and content signature; never recurse.
