@@ -13,7 +13,7 @@ from .product_store import ProductStore
 from .product_templates import TemplateService, default_template, validate_overrides, validate_variable_value, BUILTIN_TYPES
 from .product_drafts import validate_price
 from .node_products import NodeDraftService, LEGACY_NODE_VARIABLES, LEGACY_WARNING, STALE_WARNING, NodeSelectionError, NodeVariantConflictError, VARIANT_WARNING
-from .node_form import NodeFormError
+from .node_form import NodeFormError, NodeFormService
 from . import telegram_node_fields as node_ui
 from .product_variants import VariantService
 from .state import StateError
@@ -302,15 +302,64 @@ def _draft_label(row):
     return ' · '.join(part for part in parts if part)[:64]
 
 
-def _route_screen(row):
+def _route_screen(row, check_token=None):
     text = ('🗺 <b>Game Route</b>\n'
             f"Категория каталога (legacy game_name): {escape(row['game_name'][:150])}\n"
             f"Раздел: {escape(row['section_name'][:150])} · node {row['node_id']}\n"
             f"Aliases: {escape(', '.join(row.get('game_aliases', []))[:250])}\n"
             f"Emoji: {escape(row.get('overrides', {}).get('emoji', 'template default'))}")
-    return text, _menu([[('Aliases / emoji', f"prd:routeedit:{row['id']}")],
+    check = []
+    if check_token:
+        text += ('\nПроверка — только чтение, публикация НЕ проверена. '
+                 'get может вернуть кеш до 900 с; клиент следует редиректам. '
+                 'Это не гарантированно одна ограниченная HTTP-транзакция.')
+        check = [[('🧪 Проверить форму раздела (только чтение)', f'prd:routeform:{check_token}')]]
+    return text, _menu(check + [[('Aliases / emoji', f"prd:routeedit:{row['id']}")],
                         [('🎚 Варианты / Editions', f"prd:variants:{row['id']}:0")],
                         [('🔙 Routes', 'prd:routepage:0')], [('Лоты', 'products')]])
+
+
+async def _check_route_form(callback, user_id, parts, store, templates, routes):
+    """Consume one owner intent before I/O; never enter draft/input machinery."""
+    flow = _flows.get(user_id)
+    state = flow.pop('route_form', None) if flow else None
+
+    def current():
+        if (not state or len(parts) != 3 or parts[2] != state['token']
+                or _flows.get(user_id) is not flow or flow.get('purpose') != 'routes'
+                or flow.get('template_id') != state['template']['id']
+                or flow.get('route_id') != state['route']['id']
+                or state['context'] != _catalog_context(routes, store, flow['template_id'])
+                or _ui()._runtime_client is not routes.client
+                or not _ui()._owner_id(user_id)):
+            raise ValueError('Stale route form intent')
+        if (templates.get(flow['template_id']) != state['template']
+                or routes.resolve_route(flow['route_id']) != state['route']):
+            raise ValueError('Changed route form context')
+
+    def read():
+        # Validate again after acquiring the same lock used by all Account work.
+        with routes.client._account_lock:
+            current()
+            schema = NodeFormService(routes.client, store).get(state['route']['node_id'])
+            current()
+            return min(100, len(schema['fields']))
+
+    try:
+        count = await asyncio.to_thread(read)
+        status = f'доступна\nВидимых SELECT-полей: {count} (метаданные).'
+    except NodeFormError as cause:
+        status = 'не удалось прочитать\n' + node_ui.safe_error_text(cause)
+    except (ValueError, KeyError, IndexError, StateError, sqlite3.Error):
+        await callback.message.answer('Проверка недоступна: экран устарел. Откройте маршрут заново.')
+        return
+    row = state['route']
+    await callback.message.answer(
+        f"🧪 Каталог {row['metadata']['category_id']} · node {row['node_id']}\nФорма: {status}\n"
+        'публикация НЕ проверена\n'
+        'get может вернуть кеш до 900 с; клиент следует редиректам. '
+        'Это не гарантированно одна ограниченная HTTP-транзакция.',
+        reply_markup=_menu([[('🔙 Маршрут', f"prd:route:{row['id']}")], [('Лоты', 'products')]]))
 
 
 def _preview_screen(flow):
@@ -662,7 +711,7 @@ async def products_callback(callback, action, user_id):
 
 async def _products_callback(callback, action, user_id):
     ui = _ui()
-    if not ui._owner_id(user_id):
+    if callback.from_user.id != user_id or not ui._owner_id(user_id):
         await callback.answer('Доступно только владельцу.', show_alert=True)
         return True
     await callback.answer()
@@ -671,6 +720,11 @@ async def _products_callback(callback, action, user_id):
         store, templates, routes, drafts = _kit(user_id)
         parts = action.split(':')
         command = parts[1] if len(parts) > 1 else 'home'
+        if command == 'routeform':
+            await _check_route_form(callback, user_id, parts, store, templates, routes)
+            return True
+        if user_id in _flows:
+            _flows[user_id].pop('route_form', None)
         if command == 'preset':
             flow = _active(user_id)
             if (len(parts) != 4 or parts[2] != flow.get('type_token')
@@ -931,7 +985,13 @@ async def _products_callback(callback, action, user_id):
                 raise ValueError('Маршрут относится к другому шаблону.')
             if flow['purpose'] == 'routes':
                 flow['route_id'] = row['id']
-                await _show(callback, *_route_screen(row))
+                template = await asyncio.to_thread(templates.get, flow['template_id'])
+                token = None
+                if template['name'] == 'GAME_KEY':
+                    token = uuid.uuid4().hex[:12]
+                    flow['route_form'] = dict(token=token, route=deepcopy(row), template=deepcopy(template),
+                        context=_catalog_context(routes, store, flow['template_id']))
+                await _show(callback, *_route_screen(row, token))
             else:
                 await _start_route_draft(callback, user_id, row, store, routes, templates)
         elif command in {'variantpage', 'variantpick'}:

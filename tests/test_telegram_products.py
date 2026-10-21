@@ -79,6 +79,221 @@ def seed_route(ctx, index=0):
         f'https://funpay.com/lots/{ctx.nodes[index].id}/'))
 
 
+async def route_form_button(ctx, route):
+    cb = await pick(ctx, 'routes')
+    await view.products_callback(cb, f"prd:route:{route['id']}", 1)
+    token = view._flows[1]['route_form']['token']
+    assert f'prd:routeform:{token}' in str(cb.message.edit_text.call_args)
+    return cb, f'prd:routeform:{token}'
+
+
+def database_snapshot(ctx):
+    with ctx.receipt._connect() as db:
+        return '\n'.join(db.iterdump())
+
+
+def test_route_form_explicit_get_sanitized_metadata_and_no_mutations(context):
+    ctx = context
+    route = seed_route(ctx, 1)
+    original_account = ctx.client.account
+    fake_get = original_account.method.side_effect
+    canary = 'SYNTHETIC_PRIVATE_CANARY'
+    def response(*args, **kwargs):
+        assert ctx.client._account_lock._is_owned()
+        result = fake_get(*args, **kwargs)
+        result.content = result.content.replace(b'Global', canary.encode())
+        result.content = result.content.replace(b'</form>',
+            f'<input type="hidden" name="csrf_token" value="{canary}"></form>'.encode())
+        return result
+    original_account.method.side_effect = response
+    before = database_snapshot(ctx)
+
+    async def run():
+        cb, action = await route_form_button(ctx, route)
+        original_account.method.assert_not_called()
+        assert '900' in str(cb.message.edit_text.call_args)
+        await asyncio.gather(*(view.products_callback(cb, action, 1) for _ in range(2)))
+        original_account.method.assert_called_once_with('get', 'lots/offerEdit?node=101',
+            {'accept-language': 'ru'}, {}, raise_not_200=True)
+        shown = str(cb.message.answer.call_args_list)
+        assert 'Каталог 201 · node 101' in shown and 'доступна' in shown
+        assert 'SELECT-полей: 4 (метаданные)' in shown
+        assert 'публикация НЕ проверена' in shown
+        assert 'редиректам' in shown and '900' in shown
+        for forbidden in (canary, 'fields[', 'Steam', 'csrf_token', 'https://', 'Traceback'):
+            assert forbidden not in shown
+        assert 'route_form' not in view._flows[1]
+        assert ctx.client.account is original_account
+        original_account.save_lot.assert_not_called()
+        original_account.get_user.assert_not_called()
+        assert database_snapshot(ctx) == before
+        await view.products_callback(cb, f"prd:route:{route['id']}", 1)
+        assert 'route_form' in view._flows[1]
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize('failure,reason', [
+    ('login', 'URL_AUTH'), ('auth', 'HTTP_AUTH'), ('html', 'FIELD_NAME_UNSUPPORTED'),
+    ('exception', 'REQUEST_FAILED'),
+])
+def test_route_form_safe_errors_no_persistence(context, failure, reason):
+    ctx = context
+    route = seed_route(ctx)
+    canary = 'SYNTHETIC_PRIVATE_CANARY'
+    fake_get = ctx.client.account.method.side_effect
+    def response(*args, **kwargs):
+        result = fake_get(*args, **kwargs)
+        if failure == 'login':
+            result.url = 'https://funpay.com/account/login?private=' + canary
+        elif failure == 'auth':
+            result.status_code = 403
+            result.content = canary.encode()
+        elif failure == 'html':
+            result.content = result.content.replace(b'fields[platform]', b'unsupported[platform]')
+        else:
+            raise RuntimeError(canary)
+        return result
+    ctx.client.account.method.side_effect = response
+    before = database_snapshot(ctx)
+
+    async def run():
+        cb, action = await route_form_button(ctx, route)
+        await view.products_callback(cb, action, 1)
+        shown = str(cb.message.answer.call_args)
+        assert 'не удалось прочитать' in shown and reason in shown
+        assert 'публикация НЕ проверена' in shown
+        for forbidden in (canary, 'fields[', 'csrf_token', 'https://', 'RuntimeError', 'SELECT-полей:'):
+            assert forbidden not in shown
+        assert database_snapshot(ctx) == before
+        assert 'route_form' not in view._flows[1]
+        ctx.client.account.save_lot.assert_not_called()
+        ctx.client.account.method.assert_called_once()
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize('change', [
+    'forged', 'account_id', 'account_object', 'client', 'template', 'template_revision',
+    'route', 'route_revision', 'removed_node', 'navigation', 'cancel',
+])
+def test_route_form_rejects_changed_or_stale_context(context, monkeypatch, change):
+    ctx = context
+    route = seed_route(ctx)
+    other = seed_route(ctx, 1)
+    account = ctx.client.account
+
+    async def run():
+        cb, action = await route_form_button(ctx, route)
+        flow = view._flows[1]
+        if change == 'forged':
+            action += ':100'
+        elif change == 'account_id':
+            account.id = 43
+        elif change == 'account_object':
+            ctx.client.account = SimpleNamespace(**vars(account))
+        elif change == 'client':
+            monkeypatch.setattr(ui, '_runtime_client', SimpleNamespace(**vars(ctx.client)))
+        elif change == 'template':
+            flow['template_id'] = 'DLC_KEY'
+        elif change == 'template_revision':
+            ctx.templates.save(dict(ctx.template, display_name='Changed'), ctx.template['id'], ctx.template['revision'])
+        elif change == 'route':
+            flow['route_id'] = other['id']
+        elif change == 'route_revision':
+            ctx.store.save_route(dict(route, game_aliases=['Changed']), expected_revision=route['revision'])
+        elif change == 'removed_node':
+            ctx.nodes.pop(0)  # No route enabled flag exists: unavailable catalog nodes fail closed.
+        elif change == 'navigation':
+            await view.products_callback(cb, 'prd:routepage:0', 1)
+        else:
+            view.discard_session(1)
+        before = database_snapshot(ctx)
+        await view.products_callback(cb, action, 1)
+        account.method.assert_not_called()
+        assert database_snapshot(ctx) == before
+        assert 'устарел' in str(cb.message.answer.call_args)
+    asyncio.run(run())
+
+
+def test_route_form_other_user_and_old_button_preserve_active_wizard(context):
+    ctx = context
+    route = seed_route(ctx)
+
+    async def run():
+        cb, action = await route_form_button(ctx, route)
+        stranger = callback(action)
+        stranger.from_user.id = 2
+        await view.products_callback(stranger, action, 2)
+        await view.products_callback(stranger, action, 1)  # Mismatched caller identity.
+        ctx.client.account.method.assert_not_called()
+        assert view._flows[1].get('route_form')
+        await fill_variables(ctx, route)
+        flow = deepcopy(view._flows[1])
+        pending = ui._interaction_state[1]
+        calls = ctx.client.account.method.call_count
+        cb.data = action
+        await ui.callback_handler(cb)
+        assert view._flows[1] == flow and ui._interaction_state[1] is pending
+        assert ctx.client.account.method.call_count == calls
+    asyncio.run(run())
+
+
+def test_route_form_revalidates_account_after_waiting_for_shared_lock(context):
+    ctx = context
+    route = seed_route(ctx)
+
+    async def run():
+        cb, action = await route_form_button(ctx, route)
+        # The event-loop thread holds the RLock; only the worker can wait for it.
+        with ctx.client._account_lock:
+            task = asyncio.create_task(view.products_callback(cb, action, 1))
+            await asyncio.sleep(0.01)
+            assert not task.done()
+            ctx.client.account.id = 43
+        await task
+        ctx.client.account.method.assert_not_called()
+        assert 'устарел' in str(cb.message.answer.call_args)
+    asyncio.run(run())
+
+
+def test_route_form_cache_reuse_and_expiry(context, monkeypatch):
+    from funpayflow import node_form
+    ctx = context
+    route = seed_route(ctx)
+    now = [10.0]
+    monkeypatch.setattr(node_form.time, 'monotonic', lambda: now[0])
+
+    async def run():
+        cb, action = await route_form_button(ctx, route)
+        await view.products_callback(cb, action, 1)
+        now[0] += 899
+        cb, action = await route_form_button(ctx, route)
+        await view.products_callback(cb, action, 1)
+        assert ctx.client.account.method.call_count == 1
+        now[0] += 2
+        cb, action = await route_form_button(ctx, route)
+        ctx.client.account.method.side_effect = RuntimeError('Synthetic failure')
+        await view.products_callback(cb, action, 1)
+        assert ctx.client.account.method.call_count == 2
+        assert 'не удалось прочитать' in str(cb.message.answer.call_args)
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize('kind', [kind for kind, _ in BUILTIN_TYPES if kind != 'GAME_KEY'])
+def test_route_form_not_offered_for_other_product_types(context, kind):
+    ctx = context
+    ctx.template = ctx.templates.ensure_builtin(kind)
+    route = seed_route(ctx)
+
+    async def run():
+        cb = await pick(ctx, 'routes')
+        await view.products_callback(cb, f"prd:route:{route['id']}", 1)
+        assert 'routeform' not in str(cb.message.edit_text.call_args)
+        assert not view._flows[1].get('route_form')
+        ctx.client.account.method.assert_not_called()
+    asyncio.run(run())
+
+
 async def pick(ctx, purpose='single'):
     cb = callback()
     assert await view.products_callback(cb, 'products', 1)
