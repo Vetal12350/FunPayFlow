@@ -150,7 +150,8 @@ def other_workers() -> bool:
         "$_.CommandLine -match 'codex_issue_worker\\.py' -and "
         "$_.ProcessId -ne $selfId -and "
         "-not ($_.ProcessId -eq $parentId -and "
-        "$_.Name -match '^(pythonw?|pyw?)([0-9.]*)?\\.exe        "[Console]::Write($items.Count)"
+        "$_.Name -match '^(pythonw?|pyw?)([0-9.]*)?\\.exe$') }); "
+        "[Console]::Write($items.Count)"
     )
     value = run(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],
                 timeout=15).stdout.strip()
