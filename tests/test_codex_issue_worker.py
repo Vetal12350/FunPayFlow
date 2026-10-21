@@ -453,8 +453,8 @@ def test_legacy_inventory_only_returns_count_and_fails_closed(monkeypatch):
 
 
 def test_legacy_inventory_excludes_direct_python_launcher_parent_only(monkeypatch):
-    # Windows venv python.exe may be a redirector: its child sees the same
-    # worker.py command line on that direct parent. Other workers remain counted.
+    # The direct parent can be the Windows venv redirector python.exe;
+    # it retains worker.py argv although it isn't a second Worker.
     monkeypatch.setattr(worker, "WINDOWS", True)
     seen = []
 
@@ -467,7 +467,13 @@ def test_legacy_inventory_excludes_direct_python_launcher_parent_only(monkeypatc
     query = seen[0]
     assert "$_.ProcessId -ne $selfId" in query
     assert "$_.ProcessId -eq $parentId" in query
-    assert "$_.Name -match '^(pythonw?|pyw?)([0-9.]*)?\\\\.exe    status = worker.LiveStatus(tmp_path)
+    assert r"$_.Name -match '^(pythonw?|pyw?)([0-9.]*)?\.exe$'" in query
+    monkeypatch.setattr(worker, "run", lambda *a, **k: SimpleNamespace(stdout="1"))
+    assert worker.other_workers() is True
+
+
+def test_restarted_inflight_job_is_blocked_not_requeued(tmp_path):
+    status = worker.LiveStatus(tmp_path)
     status.publish("codex_running", 42)
     restarted = worker.LiveStatus(tmp_path)
     restarted.publish("waiting")
