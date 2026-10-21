@@ -298,6 +298,10 @@ def test_type_selector_confirmed_catalog_node_fields_preview_save_restart(contex
         screen = str(cb.message.edit_text.call_args)
         assert [screen.index(label) for _, label in BUILTIN_TYPES] == sorted(
             screen.index(label) for _, label in BUILTIN_TYPES)
+        markup = cb.message.edit_text.call_args.kwargs['reply_markup']
+        assert len(markup.inline_keyboard) == 8  # Seven readable choices plus Back.
+        assert all(len(button.callback_data.encode()) <= 64
+            for row in markup.inline_keyboard for button in row)
         action = f"prd:preset:{view._flows[1]['type_token']}:{kind}"
         await asyncio.gather(*(view.products_callback(callback(), action, 1) for _ in range(2)))
         flow = view._flows[1]
@@ -326,6 +330,8 @@ def test_type_selector_confirmed_catalog_node_fields_preview_save_restart(contex
             availability='не указано / unspecified', delivery_method='Разрешённое приглашение / Permitted invitation',
             ps_platform='PS5', sale_edition='Owner edition', product_form='Код / Code',
             plan='Owner plan', duration='30 дней / 30 days',
+            base_game='Required base game', currency_name='Crystals', denomination='500 crystals',
+            gaming_product_type='Подарочная карта / Gift card', term_or_value='25 EUR',
             authorized_delivery='Подтверждаю разрешение провайдера / I confirm provider permission', price='12.34')
         for _ in range(15):
             if flow.get('preview'):
@@ -352,6 +358,12 @@ def test_type_selector_confirmed_catalog_node_fields_preview_save_restart(contex
                 assert 'PS5' in title and 'Code' in description
             elif kind == 'GIFT':
                 assert ('гифт' if lang == 'ru' else 'gift') in title
+            elif kind == 'DLC_CONTENT':
+                assert 'Required base game' in description and 'DLC' in title
+            elif kind == 'GAME_CURRENCY':
+                assert 'Crystals' in title and '500 crystals' in description
+            elif kind == 'GAMING_SUBSCRIPTION':
+                assert 'Gift card' in title and '25 EUR' in description
         save = preview_action('prd:save')
         await view.products_callback(cb, save, 1)
         saved = ctx.store.list_drafts()[0]
@@ -377,7 +389,8 @@ def test_type_selector_confirmed_catalog_node_fields_preview_save_restart(contex
     asyncio.run(run())
 
 
-def test_type_selector_invalid_stale_nonowner_and_scope_do_not_change_input(context):
+@pytest.mark.parametrize('kind', ['GIFT', 'DLC_CONTENT', 'GAME_CURRENCY', 'GAMING_SUBSCRIPTION'])
+def test_type_selector_invalid_stale_nonowner_and_scope_do_not_change_input(context, kind):
     ctx = context
 
     async def run():
@@ -388,14 +401,14 @@ def test_type_selector_invalid_stale_nonowner_and_scope_do_not_change_input(cont
         flow = view._flows[1]
         token = flow['type_token']
         ui._interaction_state[1] = pending = {'sentinel': True}
-        for action in (f'prd:preset:{old}:GIFT', f'prd:preset:{token}:arbitrary',
-                       f'prd:preset:{token}:GIFT:extra'):
+        for action in (f'prd:preset:{old}:{kind}', f'prd:preset:{token}:arbitrary',
+                       f'prd:preset:{token}:{kind}:extra'):
             await view.products_callback(cb, action, 1)
             assert view._flows[1] is flow and ui._interaction_state[1] is pending
-        await view.products_callback(callback(), f'prd:preset:{token}:GIFT', 2)
+        await view.products_callback(callback(), f'prd:preset:{token}:{kind}', 2)
         assert 2 not in view._flows
         ctx.client.account.id = 43
-        await view.products_callback(cb, f'prd:preset:{token}:GIFT', 1)
+        await view.products_callback(cb, f'prd:preset:{token}:{kind}', 1)
         assert view._flows[1] is flow and ui._interaction_state[1] is pending
         assert ProductStore(ctx.receipt, 1, 43).list_templates() == []
         ctx.client.account.id = 42
@@ -405,7 +418,8 @@ def test_type_selector_invalid_stale_nonowner_and_scope_do_not_change_input(cont
     asyncio.run(run())
 
 
-def test_type_selector_leaving_screen_and_missing_safe_category(context):
+@pytest.mark.parametrize('kind', ['AI_SUBSCRIPTION', 'DLC_CONTENT', 'GAME_CURRENCY', 'GAMING_SUBSCRIPTION'])
+def test_type_selector_leaving_screen_and_missing_safe_category(context, kind):
     ctx = context
 
     async def run():
@@ -417,7 +431,7 @@ def test_type_selector_leaving_screen_and_missing_safe_category(context):
         assert ctx.store.get_template('GIFT') is None
         ctx.client.account.subcategories = []
         await view.products_callback(cb, 'prd:types', 1)
-        await view.products_callback(cb, f"prd:preset:{view._flows[1]['type_token']}:AI_SUBSCRIPTION", 1)
+        await view.products_callback(cb, f"prd:preset:{view._flows[1]['type_token']}:{kind}", 1)
         assert 'Без подходящей подтверждённой COMMON-категории' in str(cb.message.edit_text.call_args)
         flow = view._flows[1]
         assert not flow.get('preview') and not flow.get('route_id')
@@ -428,6 +442,49 @@ def test_type_selector_leaving_screen_and_missing_safe_category(context):
         assert 1 not in view._flows
         ctx.client.account.method.assert_not_called()
         ctx.client.account.save_lot.assert_not_called()
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize('kind', ['DLC_CONTENT', 'GAME_CURRENCY', 'GAMING_SUBSCRIPTION'])
+@pytest.mark.parametrize('unsafe_form', [False, True])
+def test_second_wave_cancel_or_unsafe_form_never_saves_draft(context, kind, unsafe_form):
+    ctx = context
+    if unsafe_form:
+        ctx.client.account.method = Mock(return_value=SimpleNamespace(status_code=200,
+            url='https://funpay.com/lots/offerEdit?node=100', content=b'<html>No create form</html>'))
+
+    async def run():
+        cb = callback()
+        await view.products_callback(cb, 'prd:types', 1)
+        await view.products_callback(cb, f"prd:preset:{view._flows[1]['type_token']}:{kind}", 1)
+        flow = view._flows[1]
+        state = flow['catalog_state']
+        await view.products_callback(cb, f"prd:rt:{state['token']}:game:200", 1)
+        state = flow['catalog_state']
+        await view.products_callback(cb, f"prd:rt:{state['token']}:confirm:0", 1)
+        assert len(ctx.store.list_routes()) == 1  # Explicitly confirmed route survives cancellation.
+        assert not flow.get('preview')
+        if unsafe_form:
+            assert flow['node_state']['phase'] == 'error'
+            assert not flow.get('node_ready')
+        else:
+            while flow.get('step') == 'nodefields':
+                await view.products_input(message('-'), 1)
+            assert flow['field'] == 'quantity'
+            await view.products_input(message('-'), 1)
+            # Missing offer details cannot be replaced with catalogue labels/defaults.
+            assert flow['field'] == 'sale_name'
+            for value in ('-', '   '):
+                await view.products_input(message(value), 1)
+                assert flow['field'] == 'sale_name' and not flow.get('preview')
+        await view.products_callback(cb, 'prd:save:invented', 1)
+        assert ctx.store.list_drafts() == []
+        await ui.text_handler(message('❌ Отмена'))
+        assert 1 not in view._flows
+        assert ctx.store.list_drafts() == [] and len(ctx.store.list_routes()) == 1
+        ctx.client.account.save_lot.assert_not_called()
+        assert all(call.args[0] == 'get' for call in ctx.client.account.method.call_args_list)
+
     asyncio.run(run())
 
 
