@@ -452,9 +452,9 @@ def test_legacy_inventory_only_returns_count_and_fails_closed(monkeypatch):
         worker.other_workers()
 
 
-def test_legacy_inventory_excludes_direct_python_launcher_parent_only(monkeypatch):
-    # The direct parent can be the Windows venv redirector python.exe;
-    # it retains worker.py argv although it isn't a second Worker.
+def test_inventory_excludes_self_and_direct_python_venv_launcher_only(monkeypatch):
+    # Windows venv python.exe redirector keeps worker.py argv when it launches
+    # the real interpreter. Do not count this direct parent as a second worker.
     monkeypatch.setattr(worker, "WINDOWS", True)
     seen = []
 
@@ -466,142 +466,17 @@ def test_legacy_inventory_excludes_direct_python_launcher_parent_only(monkeypatc
     assert worker.other_workers() is False
     query = seen[0]
     assert "$_.ProcessId -ne $selfId" in query
-    assert "$_.ProcessId -eq $parentId" in query
-    assert r"$_.Name -match '^(pythonw?|pyw?)([0-9.]*)?\.exe$'" in query
+    assert "-not ($_.ProcessId -eq $parentId)" in query
+    assert "$_.CommandLine -match 'codex_issue_worker" in query
+    assert "Get-CimInstance Win32_Process" in query
+
+    # Non-parent worker PIDs remain counted, independently of the parent's
+    # redirector; malformed/unknown process inventory still fails closed.
     monkeypatch.setattr(worker, "run", lambda *a, **k: SimpleNamespace(stdout="1"))
     assert worker.other_workers() is True
-
-
-def test_restarted_inflight_job_is_blocked_not_requeued(tmp_path):
-    status = worker.LiveStatus(tmp_path)
-    status.publish("codex_running", 42)
-    restarted = worker.LiveStatus(tmp_path)
-    restarted.publish("waiting")
-    assert worker.state_read(restarted.path)["jobs"]["42"] == {"phase": "blocked", "failure": "task_failed"}
-
-
-def test_background_heartbeat_runs_without_resetting_phase(monkeypatch, tmp_path):
-    status = worker.LiveStatus(tmp_path)
-    clock = [100.0]
-    monkeypatch.setattr(worker.time, "time", lambda: clock[0])
-    status.publish("codex_running", 42)
-    class Tick:
-        count = 0
-        def wait(self, interval):
-            assert interval == 5
-            self.count += 1
-            clock[0] += 5
-            return self.count > 1
-    status.stop = Tick()
-    status._heartbeat()
-    value = worker.state_read(status.path)
-    assert value["heartbeat"] == 105
-    assert value["phase_started"] == 100
-    assert value["phase"] == "codex_running"
-
-
-def test_codex_cancel_cleans_up_and_preserves_keyboard_interrupt(monkeypatch, tmp_path):
-    class Child:
-        pid = 123456
-        returncode = 0
-        calls = 0
-        killed = False
-        def wait(self, *args, **kwargs):
-            self.calls += 1
-            if self.calls == 1:
-                raise KeyboardInterrupt
-        def kill(self):
-            self.killed = True
-    child = Child()
-    monkeypatch.setattr(worker.subprocess, "Popen", lambda *a, **k: child)
-    monkeypatch.setattr(worker.subprocess, "run", lambda *a, **k: None)
-    monkeypatch.setattr(worker, "resolve_argv", lambda args: args)
-    if worker.os.name != "nt":
-        monkeypatch.setattr(worker.os, "killpg", lambda *args: None)
-    with pytest.raises(KeyboardInterrupt):
-        worker.run_codex(["codex", "exec"], tmp_path, issue())
-    assert child.killed
-
-
-def test_main_refuses_existing_worker_before_any_task(monkeypatch, tmp_path):
-    monkeypatch.setattr(worker.sys, "argv", ["worker", "--once"])
-    monkeypatch.setattr(worker, "check_tools", lambda: None)
-    monkeypatch.setattr(worker, "home", lambda: tmp_path)
-    monkeypatch.setattr(worker, "other_workers", lambda: True)
-    monkeypatch.setattr(worker, "ensure_label", lambda: pytest.fail("must not contact GitHub"))
-    monkeypatch.setattr(worker, "process_once", lambda *a: pytest.fail("must not execute"))
-    assert worker.main() == 1
-
-
-def test_os_lock_is_released_on_child_crash(tmp_path):
-    # A separate offline Python process, never gh/Codex or bot source.
-    code = (
-        "import importlib.util,sys,os; from pathlib import Path; "
-        "s=importlib.util.spec_from_file_location('lock_test',sys.argv[1]); "
-        "m=importlib.util.module_from_spec(s); s.loader.exec_module(m); "
-        "lock=m.instance_lock(Path(sys.argv[2])); lock.__enter__(); "
-        "print('locked',flush=True); sys.stdin.readline(); os._exit(0)"
-    )
-    child = worker.subprocess.Popen([worker.sys.executable, "-c", code, str(SCRIPT), str(tmp_path)],
-                                    stdin=worker.subprocess.PIPE, stdout=worker.subprocess.PIPE,
-                                    stderr=worker.subprocess.PIPE, text=True, shell=False)
-    try:
-        # communicate has a bounded deadline; child keeps its kernel lock until stdin closes.
-        # Poll for ready via a dedicated reader with a deadline rather than blocking readline.
-        ready = []
-        reader = worker.threading.Thread(target=lambda: ready.append(child.stdout.readline()), daemon=True)
-        reader.start()
-        reader.join(timeout=10)
-        assert ready == ["locked\n"]
-        with pytest.raises(worker.WorkerError):
-            with worker.instance_lock(tmp_path):
-                pytest.fail("second process acquired kernel lock")
-        child.communicate("exit\n", timeout=10)
-        assert child.returncode == 0
-        with worker.instance_lock(tmp_path):
-            pass
-    finally:
-        if child.poll() is None:
-            child.kill()
-            child.communicate(timeout=10)
-
-
-def test_known_pytest_scratch_ignored_only_in_local_checkout(tmp_path):
-    """Real offline Git status integration: ignore only the exact scratch tree."""
-    repo = tmp_path / "checkout"
-    repo.mkdir()
-    result = worker.subprocess.run(["git", "init", "-q", str(repo)],
-                                   stdout=worker.subprocess.PIPE,
-                                   stderr=worker.subprocess.PIPE,
-                                   timeout=15, check=False)
-    assert result.returncode == 0
-    worker.ignore_known_pytest_scratch(repo)
-    worker.ignore_known_pytest_scratch(repo)
-    exclude = (repo / ".git" / "info" / "exclude").read_text(encoding="utf-8")
-    assert exclude.splitlines().count("/tests/.offline-tmp/") == 1
-
-    scratch = repo / "tests" / ".offline-tmp" / "case"
-    scratch.mkdir(parents=True)
-    (scratch / "live_status.json").write_text("synthetic")
-    legitimate = repo / "tests" / "test_allowed.py"
-    legitimate.write_text("# test")
-    assert worker.changed_paths(repo) == ["tests/test_allowed.py"]
-
-    disallowed = repo / "outside-repo-policy.txt"
-    disallowed.write_text("synthetic")
-    with pytest.raises(worker.WorkerError, match="unauthorized file"):
-        worker.changed_paths(repo)
-    assert not worker.safe_path("tests/.offline-tmp/case/live_status.json")
-
-
-def test_known_pytest_scratch_refuses_untrusted_git_metadata(tmp_path):
-    with pytest.raises(worker.WorkerError, match="metadata unavailable"):
-        worker.ignore_known_pytest_scratch(tmp_path)
-" in query
-    # The exclusion cannot suppress an unrelated PID, and the single-instance
-    # OS lock separately guards against genuinely concurrent worker processes.
-    monkeypatch.setattr(worker, "run", lambda *a, **k: SimpleNamespace(stdout="1"))
-    assert worker.other_workers() is True
+    monkeypatch.setattr(worker, "run", lambda *a, **k: SimpleNamespace(stdout="unknown"))
+    with pytest.raises(worker.WorkerError, match="Process inventory unavailable"):
+        worker.other_workers()
 
 
 def test_restarted_inflight_job_is_blocked_not_requeued(tmp_path):
