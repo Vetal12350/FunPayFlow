@@ -62,6 +62,7 @@ def _home():
             'Product Template + Game Route + variables = RU/EN draft.\n'
             'Публикация FunPay недоступна. Существующие лоты не изменяются.', _menu([
                 [('➕ Создать', 'prd:choose:single:0')],
+                [('⚡ Быстрый черновик', 'prd:quick')],
                 [('📚 Массовые drafts', 'prd:choose:bulk:0')],
                 [('📝 Сохранённые drafts', 'prd:drafts:0')],
                 [('🗺 Game Routes', 'prd:choose:routes:0')],
@@ -650,7 +651,7 @@ async def _products_callback(callback, action, user_id):
     catalog_valid = False
     try:
         store, templates, routes, drafts = _kit(user_id)
-        await asyncio.to_thread(templates.ensure_builtin)
+        builtin = await asyncio.to_thread(templates.ensure_builtin)
         parts = action.split(':')
         command = parts[1] if len(parts) > 1 else 'home'
         if command == 'nb':
@@ -748,8 +749,9 @@ async def _products_callback(callback, action, user_id):
             await _show(callback, *_home())
         elif command == 'choose':
             await _template_picker(callback, parts[2], int(parts[3]), templates)
-        elif command == 'pick':
-            purpose, template_id = parts[2:4]
+        elif command in {'pick', 'quick'}:
+            # One-tap GAME_KEY entry into the same scoped, confirmed draft wizard.
+            purpose, template_id = ('single', builtin['id']) if command == 'quick' else parts[2:4]
             await asyncio.to_thread(templates.get, template_id)
             if purpose not in {'single', 'bulk', 'routes'}:
                 raise ValueError('Недоступное действие.')
