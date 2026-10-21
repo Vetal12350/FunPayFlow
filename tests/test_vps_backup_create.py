@@ -290,7 +290,18 @@ def test_metadata_only_source_inode_walk(fixture, monkeypatch, fault):
                 (data / 'late-file').write_bytes(b'synthetic')
 
         monkeypatch.setattr(backup.os, 'scandir', changing)
-    if fault:
+    if fault == 'churn':
+        # On Windows, a directory's stat identity may remain unchanged when a
+        # new child appears. source_inodes can therefore miss the mutation
+        # within one walk; the caller also compares its pre/post inode sets.
+        # Accept either immediate Refused or detection by the second walk.
+        try:
+            before = backup.source_inodes(data)
+        except backup.Refused:
+            return
+        after = backup.source_inodes(data)
+        assert before != after
+    elif fault:
         with pytest.raises(backup.Refused):
             backup.source_inodes(data)
     else:
