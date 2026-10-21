@@ -7,6 +7,7 @@
 Владелец открывает `📦 Лоты`:
 
 - **Создать:** template → saved route или поиск игры в каталоге → явное подтверждение нового route → variant (если есть) → реальные Node Fields → content variables / quantity → цена → RU/EN preview → сохранить draft.
+- **⚡ Быстрый черновик:** `📦 Лоты → ⚡ Быстрый черновик` сразу открывает выбор игры/маршрута для встроенного GAME_KEY. Например: Elden Ring → реальные Node Fields → quantity 1 → цена 29.99 → обычный RU/EN preview → сохранить локально. Это однокнопочный shortcut: он убирает экран выбора шаблона, переиспользуя весь мастер «Создать», его validators и scoped DraftService. Сохранённые изменения GAME_KEY, route/variant overrides и дополнительные content variables учитываются как прежде; варианты и Node Fields не пропускаются и defaults формы не подтверждаются автоматически. При отсутствии route используется прежний каталог с явным подтверждением маршрута. Отмена до Save не создаёт draft; уже подтверждённый новый route остаётся. Это LOCAL DRAFT, публикации нет: create/manual-delivery/write/verification contract ещё не подтверждён.
 - **Массовые drafts:** новый ввод требует `needs_resolution` для Node Fields; скрытых fetch/confirm для каждой строки нет. Уже подготовленные legacy batches сохраняют прежнее подтверждение.
 - **Game Routes:** template → собственный лот, URL или cached catalog → preview → подтвердить.
 - **Product Templates:** список и полный JSON editor. При создании копии поменять internal `name`.

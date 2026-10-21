@@ -87,8 +87,12 @@ async def pick(ctx, purpose='single'):
     return cb
 
 
-async def fill_variables(ctx, route=None, bulk=False):
-    cb = await pick(ctx, 'bulk' if bulk else 'single')
+async def fill_variables(ctx, route=None, bulk=False, quick=False):
+    if quick:
+        cb = callback()
+        await view.products_callback(cb, 'prd:quick', 1)
+    else:
+        cb = await pick(ctx, 'bulk' if bulk else 'single')
     if not bulk:
         await view.products_callback(cb, f"prd:route:{route['id']}", 1)
     for value in ['Steam', 'Global', 'Standard', '-', '2']:
@@ -168,17 +172,23 @@ def test_route_bulk_partial_success_preview_and_cancel(context):
     asyncio.run(run())
 
 
-def test_single_draft_wizard_edit_save_duplicate_and_restart(context):
+@pytest.mark.parametrize('quick', [False, True])
+def test_single_draft_wizard_edit_save_duplicate_and_restart(context, quick):
     ctx = context
     route = seed_route(ctx)
 
     async def run():
-        cb = await fill_variables(ctx, route)
+        cb = await fill_variables(ctx, route, quick=quick)
         invalid = message('NaN')
         await view.products_input(invalid, 1)
         assert ui._interaction_state[1]['flow']['field'] == 'price'
         await view.products_input(message('29.99'), 1)
         assert ctx.store.list_drafts() == []
+        payload = view._flows[1]['preview']['payload']
+        assert payload['price'] == '29.99' and payload['amount'] == 2
+        for lang in ('ru', 'en'):
+            assert 'Elden Ring' in payload['title_' + lang]
+            assert payload['description_' + lang]
         assert 'RU + EN' in str(view._preview_screen(view._flows[1]))
         await view.products_callback(cb, preview_action('prd:edit:emoji'), 1)
         await view.products_input(message('⚔️'), 1)
@@ -188,6 +198,10 @@ def test_single_draft_wizard_edit_save_duplicate_and_restart(context):
         rows = ctx.store.list_drafts()
         assert len(rows) == 1
         saved = rows[0]
+        reopened = ProductStore(ReviewReceiptStore(ctx.receipt.path), 1, 42)
+        assert reopened.get_draft(saved['id']) == saved
+        assert ProductStore(ctx.receipt, 2, 42).list_drafts() == []
+        assert ProductStore(ctx.receipt, 1, 43).list_drafts() == []
         assert saved['payload']['title_en'].startswith('⚔️')
         assert saved['payload']['description_en'] == 'English description'
         assert saved['payload']['amount'] == 2
@@ -205,6 +219,103 @@ def test_single_draft_wizard_edit_save_duplicate_and_restart(context):
         assert ctx.store.get_draft(saved['id'])['status'] == 'cancelled'
         ctx.client.account.save_lot.assert_not_called()
         assert all(call.args[0] == 'get' and call.args[1].startswith('lots/offerEdit?node=') for call in ctx.client.account.method.call_args_list)
+
+    asyncio.run(run())
+
+
+def test_quick_entry_saved_routes_custom_template_and_cancel(context):
+    ctx = context
+    routes = [seed_route(ctx, i) for i in range(2)]
+    customized = ctx.templates.save(dict(ctx.template, display_name='My keys', default_emoji='🎮'),
+                                    ctx.template['id'], ctx.template['revision'])
+
+    async def run():
+        cb = callback()
+        await view.products_callback(cb, 'products', 1)
+        assert '⚡ Быстрый черновик' in str(cb.message.edit_text.call_args)
+        await view.products_callback(cb, 'prd:quick', 1)
+        shown = str(cb.message.edit_text.call_args)
+        assert all(route['game_name'] in shown for route in routes)
+        assert 'Выберите Product Template' not in shown
+        assert view._flows[1]['template_id'] == customized['id']
+        assert ctx.templates.get(customized['id']) == customized
+        ctx.client.account.method.assert_not_called()
+        await view.products_callback(cb, f"prd:route:{routes[0]['id']}", 1)
+        flow = view._flows[1]
+        assert flow['step'] == 'nodefields' and not flow.get('preview')
+        token = flow['node_state']['token']
+        pending = ui._interaction_state[1]
+        await view.products_callback(callback(), 'prd:quick', 2)
+        assert view._flows[1] is flow and ui._interaction_state[1] is pending
+        assert 2 not in view._flows
+        await view.products_callback(cb, f'prd:nf:{token}:choose:1', 1)
+        current = flow['node_state']['token']
+        await view.products_callback(cb, f'prd:nf:{token}:choose:1', 1)
+        assert flow['node_state']['token'] == current
+        await view.products_callback(cb, f'prd:nf:{current}:cancel:0', 1)
+        assert 1 not in view._flows and ctx.store.list_drafts() == []
+        assert len(ctx.store.list_routes()) == 2
+        ctx.client.account.save_lot.assert_not_called()
+
+    asyncio.run(run())
+
+
+def test_quick_without_routes_uses_confirmed_catalog_and_cancel(context):
+    ctx = context
+
+    async def run():
+        cb = callback()
+        await view.products_callback(cb, 'prd:quick', 1)
+        flow = view._flows[1]
+        assert flow['purpose'] == 'single' and 'catalog_state' in flow
+        assert ctx.store.list_routes() == []
+        state = flow['catalog_state']
+        await view.products_callback(cb, f"prd:rt:{state['token']}:game:200", 1)
+        state = flow['catalog_state']
+        assert state['view'] == 'confirm'
+        assert ctx.store.list_routes() == []
+        old_confirm = f"prd:rt:{state['token']}:confirm:0"
+        await view.products_callback(cb, f"prd:rt:{state['token']}:cancel:0", 1)
+        await view.products_callback(cb, old_confirm, 1)
+        assert ctx.store.list_routes() == [] and ctx.store.list_drafts() == []
+        ctx.client.account.method.assert_not_called()
+        ctx.client.account.save_lot.assert_not_called()
+
+    asyncio.run(run())
+
+
+def test_quick_variant_and_stop_preserve_saved_route(context):
+    from funpayflow.product_variants import VariantService
+    ctx = context
+    route = seed_route(ctx)
+    variant = VariantService(ctx.store, ctx.routes).save({
+        'template_id': ctx.template['id'], 'route_id': route['id'],
+        'display_name': 'Deluxe', 'overrides': {'variables': {'edition': 'Deluxe Edition'}}})
+
+    async def run():
+        cb = callback()
+        await view.products_callback(cb, 'prd:quick', 1)
+        await view.products_callback(cb, f"prd:route:{route['id']}", 1)
+        flow = view._flows[1]
+        assert 'node_state' not in flow
+        token = flow['variant_picker']['token']
+        await view.products_callback(cb, f"prd:vp:{token}:pick:{variant['id']}", 1)
+        assert flow['variant_id'] == variant['id'] and flow['step'] == 'nodefields'
+        for value in ('-', '-', '-', '-', '1', '39.99'):
+            await view.products_input(message(value), 1)
+        assert flow['preview']['variables']['edition'] == 'Deluxe Edition'
+        assert flow['preview']['payload']['price'] == '39.99'
+        old_save = preview_action('prd:save')
+        await view.products_callback(cb, 'prd:quick', 1)
+        await view.products_callback(cb, old_save, 1)
+        assert view._flows[1].get('preview') is None
+        await view.products_callback(cb, f"prd:route:{route['id']}", 1)
+        token = view._flows[1]['variant_picker']['token']
+        await view.products_callback(cb, f'prd:vp:{token}:pick:base', 1)
+        await view.products_input(message('/stop'), 1)
+        assert 1 not in view._flows and ctx.store.list_drafts() == []
+        assert ctx.store.get_route(route['id']) == route
+        ctx.client.account.save_lot.assert_not_called()
 
     asyncio.run(run())
 
