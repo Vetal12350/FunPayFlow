@@ -133,7 +133,9 @@ def other_workers() -> bool:
     """Legacy workers do not hold our lock. Unknown process inventory fails closed.
 
     Only a count leaves PowerShell, never command lines or environment contents.
-    Exclude the py.exe parent launcher used by the existing start script.
+    Exclude the direct parent Python launcher: Windows venv python.exe can be
+    a redirector which starts the base interpreter with the same worker argv.
+    The kernel-held instance lock still rejects genuinely concurrent workers.
     """
     if not WINDOWS:
         raise WorkerError("Windows process inventory required")
@@ -147,7 +149,7 @@ def other_workers() -> bool:
         "$items=@($pythonProcesses | Where-Object { "
         "$_.CommandLine -match 'codex_issue_worker\\.py' -and "
         "$_.ProcessId -ne $selfId -and "
-        "-not ($_.ProcessId -eq $parentId -and $_.Name -eq 'py.exe') }); "
+        "-not ($_.ProcessId -eq $parentId) }); "
         "[Console]::Write($items.Count)"
     )
     value = run(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],

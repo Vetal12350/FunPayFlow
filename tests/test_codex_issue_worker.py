@@ -452,6 +452,33 @@ def test_legacy_inventory_only_returns_count_and_fails_closed(monkeypatch):
         worker.other_workers()
 
 
+def test_inventory_excludes_self_and_direct_python_venv_launcher_only(monkeypatch):
+    # Windows venv python.exe redirector keeps worker.py argv when it launches
+    # the real interpreter. Do not count this direct parent as a second worker.
+    monkeypatch.setattr(worker, "WINDOWS", True)
+    seen = []
+
+    def fake(argv, **kwargs):
+        seen.append(argv[-1])
+        return SimpleNamespace(stdout="0")
+
+    monkeypatch.setattr(worker, "run", fake)
+    assert worker.other_workers() is False
+    query = seen[0]
+    assert "$_.ProcessId -ne $selfId" in query
+    assert "-not ($_.ProcessId -eq $parentId)" in query
+    assert "$_.CommandLine -match 'codex_issue_worker" in query
+    assert "Get-CimInstance Win32_Process" in query
+
+    # Non-parent worker PIDs remain counted, independently of the parent's
+    # redirector; malformed/unknown process inventory still fails closed.
+    monkeypatch.setattr(worker, "run", lambda *a, **k: SimpleNamespace(stdout="1"))
+    assert worker.other_workers() is True
+    monkeypatch.setattr(worker, "run", lambda *a, **k: SimpleNamespace(stdout="unknown"))
+    with pytest.raises(worker.WorkerError, match="Process inventory unavailable"):
+        worker.other_workers()
+
+
 def test_restarted_inflight_job_is_blocked_not_requeued(tmp_path):
     status = worker.LiveStatus(tmp_path)
     status.publish("codex_running", 42)
