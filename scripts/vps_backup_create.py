@@ -2,7 +2,7 @@
 """Standalone, opt-in backup primitive. See docs/VPS_BACKUP_CREATE.md.
 
 Importing this module does nothing. Production entry requires a protected pinned
-installation AND an already read-only dedicated data filesystem. No service
+installation AND a live trusted maintenance coordinator. No service
 mutation, mount operation, bot import, network access, or source write exists here.
 """
 from __future__ import annotations
@@ -29,6 +29,11 @@ DATA = Path('/root/FunPayFlow-data')
 BACKUPS = Path('/root/backups')
 INSTALLED = Path('/usr/local/libexec/funpayflow-backup-create.py')
 RECEIPT = Path('/usr/local/libexec/funpayflow-backup-create.reviewed.json')
+COORDINATOR = Path('/usr/local/libexec/funpayflow-maintenance.py')
+COORDINATOR_RECEIPT = Path('/usr/local/libexec/funpayflow-maintenance.reviewed.json')
+MAINTENANCE = Path('/run/funpayflow-maintenance')
+AUTHORIZATION = MAINTENANCE / 'backup.json'
+MAINTENANCE_LOCK = MAINTENANCE / 'exclusive.lock'
 UNITS = ('funpayflow.service', 'funpay-bot.service')
 REQUIRED = {'.env', 'bot_settings.json', 'state.sqlite3'}
 TRANSIENT = {'bot.lock', 'state.sqlite3-wal', 'state.sqlite3-shm'}
@@ -45,7 +50,8 @@ MAX_PROCESSES = 4096
 MAX_FDS = 16384
 STATUSES = {
     'created', 'invalid_arguments', 'untrusted_installation', 'not_quiescent',
-    'source_not_frozen', 'unsafe_source', 'limit_exceeded', 'insufficient_space',
+    'source_not_frozen', 'maintenance_required', 'unsafe_source', 'limit_exceeded',
+    'insufficient_space',
     'busy', 'verification_failed', 'io_failed', 'cleanup_failed',
     'publication_unknown',
 }
@@ -439,14 +445,19 @@ def create(*, data, backups, platform):
     try:
         data, backups = Path(data).absolute(), Path(backups).absolute()
         require(not data.is_relative_to(backups) and not backups.is_relative_to(data))
+        platform.authorized()
         platform.paths(data, backups)
         platform.quiescent(data)
         platform.frozen(data)
         with platform.lock(backups):
+            platform.authorized()
             platform.quiescent(data)
             platform.frozen(data)
             baseline = inventory(data, platform, budget)
-            platform.space(backups, baseline[2] * 5 + RESERVE + MAX_MANIFEST * 2)
+            # WAL page numbers can expand a tiny input to MAX_FILE. Account for
+            # the standalone clone, tree, recovery and archive, not just input bytes.
+            platform.space(backups, baseline[2] * 5 + MAX_FILE * 4 + RESERVE
+                           + MAX_MANIFEST * 2 + MAX_ENTRIES * 2048)
             token = uuid.uuid4().hex
             work = owned.mkdir(backups / ('.pending-' + token))
             incoming = owned.mkdir(work / 'input')
@@ -493,7 +504,7 @@ def create(*, data, backups, platform):
             archive_restore(archive, recovery, entries, owned, platform, budget)
             recovered = inventory(recovery, platform, budget)
             require(portable_entries(recovered[1]) == entries, 'verification_failed')
-            manifest = dict(format='funpayflow-backup-v1', runtime_sha='unknown',
+            manifest = dict(format='funpayflow-backup-v2', runtime_sha='unknown',
                             restore_verified=True,
                             verification_scope='offline-filesystem-and-sqlite-only',
                             code_compatibility='unknown', entries=entries,
@@ -515,10 +526,12 @@ def create(*, data, backups, platform):
             platform.paths(data, backups)
             platform.sync_dir(bundle)
             budget.check()
+            platform.authorized()
             publication_attempted = True
             platform.publish(bundle, backups / ('snapshot-' + token))
             owned.forget(bundle)
             platform.sync_dir(backups)
+            platform.authorized()
             result = report('created', sum(not e['directory'] for e in entries.values()),
                             recovered[2])
     except Refused as exc:
@@ -527,7 +540,8 @@ def create(*, data, backups, platform):
         result = report('publication_unknown' if publication_attempted else 'io_failed')
     finally:
         try:
-            owned.cleanup()
+            if result['status'] != 'publication_unknown':
+                owned.cleanup()
         except (Exception, KeyboardInterrupt):
             result = report('publication_unknown' if publication_attempted else 'cleanup_failed')
         os.umask(previous_mask)
@@ -626,21 +640,28 @@ def systemd_status(unit):
 
 
 def frozen_mount(raw, device):
-    """Require filesystem-level RO, not a RO bind over a writable filesystem."""
+    """Validate the supported single rw ext4 root layout; NOT immutability.
+
+    Kept under the original name for the injected platform API. Quiescence is
+    supplied by the separate coordinator, never by these mount observations.
+    """
     found = False
     for line in raw.decode('ascii', 'strict').splitlines():
         left, separator, right = line.partition(' - ')
         fields, after = left.split(), right.split()
         require(separator and len(fields) >= 6 and len(after) == 3, 'source_not_frozen')
         mount = fields[4]
-        if mount.startswith(DATA.as_posix() + '/'):
-            raise Refused('source_not_frozen')
+        require('\\' not in mount, 'source_not_frozen')
+        path = Path(mount)
+        sensitive = any(path == target or path in target.parents
+                        or path.is_relative_to(target) for target in (DATA, BACKUPS))
+        require(mount == '/' or not sensitive, 'source_not_frozen')
         if fields[2] == device:
-            require('ro' in fields[5].split(',') and 'ro' in after[2].split(','),
+            require(mount == '/' and fields[3] == '/' and after[0] == 'ext4'
+                    and 'rw' in fields[5].split(',') and 'rw' in after[2].split(','),
                     'source_not_frozen')
-        if mount == DATA.as_posix():
-            require(fields[2] == device and fields[3] == '/', 'source_not_frozen')
-            require(after[0] in ('ext4', 'xfs'), 'source_not_frozen')
+        if mount == '/':
+            require(fields[2] == device and not found, 'source_not_frozen')
             found = True
     require(found, 'source_not_frozen')
 
@@ -651,7 +672,143 @@ def process_safe(command):
                     (b'funpay', b'securebot', b'python', b'pypy')), 'not_quiescent')
 
 
+def pinned_digest(script, receipt_path):
+    protected(script)
+    protected(receipt_path)
+    receipt = json.loads(read_bounded(receipt_path, 1024))
+    require(set(receipt) == {'reviewed_commit', 'script_sha256'})
+    require(re.fullmatch('[0-9a-f]{40}', receipt['reviewed_commit']) is not None)
+    digest = hashlib.sha256(read_bounded(script, 128 * 1024)).hexdigest()
+    require(digest == receipt['script_sha256'])
+    return digest
+
+
+def process_identity(pid):
+    fields = read_bounded(Path('/proc') / str(pid) / 'stat', 4096).rsplit(b') ', 1)[1].split()
+    require(len(fields) >= 20 and fields[0] not in (b'Z', b'X'))
+    return int(fields[1]), int(fields[19])  # PPID and kernel start ticks (field 22).
+
+
+def maintenance_evidence():
+    """Consume, never create, a coordinator's live authorization.
+
+    Trust rests on the separately reviewed root coordinator/installer, not the
+    JSON booleans. FD 3 MUST be its inherited, still exclusively flocked OFD.
+    A plain marker, CLI option, environment variable or a helper-created lock
+    cannot pass. Root capable of impersonating the installer is out of scope.
+    """
+    try:
+        import fcntl
+        parent, start = process_identity(os.getpid())
+        require(parent == os.getppid() and parent > 1)
+        _, parent_start = process_identity(parent)
+        coordinator_hash = pinned_digest(COORDINATOR, COORDINATOR_RECEIPT)
+        helper_hash = pinned_digest(INSTALLED, RECEIPT)
+        executable = Path(sys.executable).resolve()
+        root = Path('/proc') / str(parent)
+        require(Path(os.readlink(root / 'exe')) == executable)
+        for namespace in ('pid', 'mnt', 'user'):
+            require(os.readlink(root / 'ns' / namespace) ==
+                    os.readlink('/proc/self/ns/' + namespace))
+        command = read_bounded(root / 'cmdline', 4096).split(b'\0')
+        require(len(command) == 6 and command[1:] ==
+                [b'-I', b'-S', bytes(COORDINATOR), b'maintain-backup', b''])
+        require(Path(os.fsdecode(command[0])).resolve() == executable)
+        credentials = read_bounded(root / 'status', 16384).splitlines()
+        for key in (b'Uid:', b'Gid:'):
+            require([line.split()[1:] for line in credentials if line.startswith(key)]
+                    == [[b'0'] * 4])
+        for path in (MAINTENANCE, AUTHORIZATION, MAINTENANCE_LOCK):
+            protected(path)
+            secure_stat(path.lstat(), path == MAINTENANCE)
+        lock_stat = MAINTENANCE_LOCK.lstat()
+        require(inode(os.fstat(3)) == inode(lock_stat))
+        # fdinfo exposes the lock attached to THIS inherited open description,
+        # including its original owner PID. A different process's lock is not enough.
+        locks = [line.split() for line in read_bounded('/proc/self/fdinfo/3', 4096).splitlines()
+                 if line.startswith(b'lock:')]
+        require(len(locks) == 1 and len(locks[0]) == 9)
+        lock = locks[0]
+        require(lock[2:6] == [b'FLOCK', b'ADVISORY', b'WRITE', str(parent).encode()]
+                and lock[7:] == [b'0', b'EOF'])
+        major, minor, number = lock[6].split(b':')
+        require((int(major, 16), int(minor, 16), int(number)) ==
+                (os.major(lock_stat.st_dev), os.minor(lock_stat.st_dev), lock_stat.st_ino))
+        fd = os.open(MAINTENANCE_LOCK, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        try:
+            require(inode(os.fstat(fd)) == inode(lock_stat))
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                pass
+            else:
+                raise Refused('maintenance_required')
+        finally:
+            os.close(fd)
+        before = AUTHORIZATION.lstat()
+        raw = read_bounded(AUTHORIZATION, 4096)
+        require(identity(before) == identity(AUTHORIZATION.lstat()))
+        evidence = json.loads(raw)
+        require(raw == json.dumps(evidence, sort_keys=True, separators=(',', ':')).encode())
+        require(type(evidence.get('version')) is int)
+        require(all(evidence.get(key) is True for key in
+                    ('services_inhibited', 'writers_quiescent', 'recovery_armed')))
+        now = time.clock_gettime_ns(time.CLOCK_BOOTTIME)
+        expires = evidence.get('expires_boottime_ns')
+        require(type(expires) is int and now < expires <= now + (SECONDS + 30) * 10**9)
+        boot = read_bounded('/proc/sys/kernel/random/boot_id', 64).strip().decode('ascii')
+        require(re.fullmatch('[0-9a-f-]{36}', boot) is not None)
+        require(evidence == dict(version=1, helper_pid=os.getpid(), helper_start=start,
+                coordinator_pid=parent, coordinator_start=parent_start,
+                helper_sha256=helper_hash, coordinator_sha256=coordinator_hash,
+                boot_id=boot, expires_boottime_ns=expires, units=list(UNITS),
+                data=str(DATA), backups=str(BACKUPS), services_inhibited=True,
+                writers_quiescent=True, recovery_armed=True))
+        require(process_identity(os.getpid()) == (parent, start))
+        require(process_identity(parent)[1] == parent_start)
+        return parent, raw, identity(before), inode(lock_stat)
+    except Exception:
+        raise Refused('maintenance_required') from None
+
+
+def source_inodes(data):
+    """Bounded metadata-only walk before any private payload is read."""
+    result, budget = set(), Budget()
+    device = data.lstat().st_dev
+
+    def visit(path, depth):
+        budget.check()
+        require(depth <= MAX_DEPTH and len(result) < MAX_ENTRIES + 1, 'limit_exceeded')
+        s = path.lstat()
+        directory = stat.S_ISDIR(s.st_mode)
+        secure_stat(s, directory)
+        require(s.st_dev == device)
+        result.add((s.st_dev, s.st_ino))
+        if directory:
+            with os.scandir(path) as entries:
+                for entry in entries:
+                    visit(path / entry.name, depth + 1)
+        require(identity(s) == identity(path.lstat()))
+
+    visit(data, 0)
+    return result
+
+
+def references_data(path, data):
+    # /proc links may end in " (deleted)". Prefix checks deliberately include
+    # that case; inode checks additionally cover renamed/mapped aliases.
+    return path == str(data) or path.startswith(str(data) + '/')
+
+
 class Linux:
+    def __init__(self):
+        self.evidence = None
+
+    def authorized(self):
+        current = maintenance_evidence()
+        require(self.evidence is None or self.evidence == current, 'maintenance_required')
+        self.evidence = current
+
     def validate(self, path, s, directory):
         secure_stat(s, directory)
 
@@ -660,15 +817,17 @@ class Linux:
         for path in (data, backups):
             protected(path)
             secure_stat(path.lstat(), True)
-        require(data.stat().st_dev != backups.stat().st_dev, 'source_not_frozen')
+        require(data.stat().st_dev == backups.stat().st_dev, 'source_not_frozen')
 
     def frozen(self, data):
-        require(os.statvfs(data).f_flag & os.ST_RDONLY, 'source_not_frozen')
+        require(not os.statvfs(data).f_flag & os.ST_RDONLY, 'source_not_frozen')
+        require(not os.statvfs(BACKUPS).f_flag & os.ST_RDONLY, 'source_not_frozen')
         s = data.stat()
         frozen_mount(read_bounded('/proc/self/mountinfo', 1024 * 1024),
                      f'{os.major(s.st_dev)}:{os.minor(s.st_dev)}')
 
     def quiescent(self, data):
+        self.authorized()
         for namespace in ('pid', 'mnt', 'user'):
             require(os.readlink('/proc/self/ns/' + namespace) ==
                     os.readlink('/proc/1/ns/' + namespace), 'not_quiescent')
@@ -676,37 +835,44 @@ class Linux:
         protected(Path('/usr/bin/systemctl'), executable=True)
         for unit in UNITS:
             inactive(systemd_status(unit))
-        device = data.stat().st_dev
+        objects = source_inodes(data)
         before = self.pids()
         for pid in before:
             if pid == str(os.getpid()):
                 continue
             root = Path('/proc') / pid
-            process_safe(read_bounded(root / 'cmdline', 16384))
+            coordinator = self.evidence[0]
+            if pid != str(coordinator):
+                process_safe(read_bounded(root / 'cmdline', 16384))
             # Include executable/cwd aliases; failures/disappearing processes
             # are ambiguous and refuse. Kernel threads have no exe/cwd.
             proc_stat = read_bounded(root / 'stat', 4096).rsplit(b') ', 1)[1].split()
             kernel_thread = bool(int(proc_stat[6]) & 0x00200000)
             if not kernel_thread:
-                process_safe(os.fsencode(os.readlink(root / 'exe')))
-                process_safe(os.fsencode(os.readlink(root / 'cwd')))
+                executable = os.readlink(root / 'exe')
+                cwd = os.readlink(root / 'cwd')
+                require(not references_data(cwd, data), 'not_quiescent')
+                if pid != str(coordinator):
+                    process_safe(os.fsencode(executable))
+                    process_safe(os.fsencode(cwd))
             with os.scandir(root / 'fd') as entries:
                 for index, entry in enumerate(entries):
                     require(index < MAX_FDS, 'limit_exceeded')
                     s = os.stat(entry.path)
-                    if s.st_dev == device:
-                        fields = read_bounded(root / 'fdinfo' / entry.name, 4096).splitlines()
-                        flags = [line.split()[1] for line in fields if line.startswith(b'flags:')]
-                        require(len(flags) == 1 and int(flags[0], 8) & os.O_ACCMODE
-                                == os.O_RDONLY, 'not_quiescent')
+                    require((s.st_dev, s.st_ino) not in objects and
+                            not references_data(os.readlink(entry.path), data),
+                            'not_quiescent')
             maps = read_bounded(root / 'maps', 4 * 1024 * 1024)
             for line in maps.splitlines():
                 fields = line.split(None, 5)
                 require(len(fields) >= 5, 'not_quiescent')
                 major, minor = (int(v, 16) for v in fields[3].split(b':'))
-                require(not ('w' in fields[1].decode('ascii') and
-                             os.makedev(major, minor) == device), 'not_quiescent')
+                require((os.makedev(major, minor), int(fields[4])) not in objects
+                        and not (len(fields) == 6 and references_data(
+                            os.fsdecode(fields[5]), data)), 'not_quiescent')
         require(self.pids() == before, 'not_quiescent')
+        require(source_inodes(data) == objects, 'not_quiescent')
+        self.authorized()
 
     @staticmethod
     def pids():
@@ -777,8 +943,9 @@ def main(argv=None):
     if args == ['create']:
         try:
             trusted_installation()
-            # One hard process deadline also bounds filesystem calls. A killed
-            # process can leave private pending files, never a partial snapshot.
+            # Process alarm supplements cooperative budgets; it cannot interrupt
+            # kernel D-state IO or guarantee recovery. The coordinator must own
+            # an independent deadline. Killed processes can leave pending files.
             def expired(signum, frame):
                 raise Refused('limit_exceeded')
 
