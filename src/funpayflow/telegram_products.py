@@ -10,7 +10,7 @@ import uuid
 from .game_routes import RouteService, RouteError
 from .game_catalog import GameCatalog, saved_routes
 from .product_store import ProductStore
-from .product_templates import TemplateService, default_template, validate_overrides, validate_variable_value
+from .product_templates import TemplateService, default_template, validate_overrides, validate_variable_value, BUILTIN_TYPES
 from .product_drafts import validate_price
 from .node_products import NodeDraftService, LEGACY_NODE_VARIABLES, LEGACY_WARNING, STALE_WARNING, NodeSelectionError, NodeVariantConflictError, VARIANT_WARNING
 from .node_form import NodeFormError
@@ -23,7 +23,14 @@ _flows: dict[int, dict] = {}
 _locks: dict[int, tuple] = {}
 _PAGE = 8
 _TITLES = {'platform': 'Platform', 'region': 'Region', 'edition': 'Edition',
-           'quantity': 'Quantity', 'product_name': 'Product name', 'price': 'Price'}
+           'quantity': 'Quantity', 'product_name': 'Product name', 'price': 'Price',
+           'sale_name': 'Название игры / сервиса / Game or service name',
+           'sale_platform': 'Платформа / Platform', 'ps_platform': 'PlayStation',
+           'sale_edition': 'Издание / Edition', 'product_form': 'Форма товара / Product form',
+           'plan': 'Тариф / Plan', 'duration': 'Срок / Duration',
+           'availability': 'Регион / доступность (или «не указано / unspecified»)',
+           'delivery_method': 'Фактический разрешённый способ передачи / Authorized delivery method',
+           'authorized_delivery': 'Подтвердите разрешение провайдера для указанного способа передачи'}
 
 
 def _ui():
@@ -63,6 +70,7 @@ def _home():
             'Публикация FunPay недоступна. Существующие лоты не изменяются.', _menu([
                 [('➕ Создать', 'prd:choose:single:0')],
                 [('⚡ Быстрый черновик', 'prd:quick')],
+                [('🧩 Тип товара', 'prd:types')],
                 [('📚 Массовые drafts', 'prd:choose:bulk:0')],
                 [('📝 Сохранённые drafts', 'prd:drafts:0')],
                 [('🗺 Game Routes', 'prd:choose:routes:0')],
@@ -124,17 +132,19 @@ async def _route_list(callback, user_id, store, offset=0, recent=False, catalog_
                   f"prd:route:{row['id']}")] for row in rows[:_PAGE]]
     keyboard += _page_buttons('prd:recent' if recent else 'prd:routepage', offset,
                               len(rows) > _PAGE)
-    keyboard += [[('🔎 Поиск игры / alias', 'prd:search')],
+    keyboard += [[('🔎 Поиск категории / alias', 'prd:search')],
                  [('🕘 Недавние', 'prd:recent:0')]]
     if flow['purpose'] == 'routes':
         keyboard += [[('➕ URL / массовый import', 'prd:routeimport')],
                      [('🎮 Каталог FunPay', 'prd:catalog:0')],
                      [('Из собственного лота', 'prd:own:0')]]
     keyboard.append([('🔙 Лоты', 'products')])
-    title = '🕘 Недавние / последние routes' if recent else '🗺 Выберите Game Route'
+    title = '🕘 Недавние / последние routes' if recent else '🗺 Выберите маршрут / категорию'
     await _show(callback, f'<b>{title}</b>\n'
                 f"Найденные маршруты · страница {offset // _PAGE + 1}.\n"
-                'Поиск сначала использует ваши routes; для новой игры предложит каталог FunPay.', _menu(keyboard))
+                'Поиск сначала использует ваши routes, затем каталог FunPay. '
+                'game_name — внутреннее legacy-имя маршрута, не название продаваемого товара. '
+                'Выберите подходящую COMMON-категорию явно; если её нет, создание заблокировано.', _menu(keyboard))
 
 
 def _catalog_action(state, operation, value=0):
@@ -178,7 +188,8 @@ async def _catalog_results(callback, user_id, store, routes, *, offset=0, catego
             keyboard = [[(row['game_name'][:60], _catalog_action(state, 'game', row['category_id']))]
                         for row in rows[:_PAGE]]
             operation = 'gpage'
-            text = '🔎 <b>Найдено в FunPay</b>\nВыберите игру.' if rows else '🔎 Совпадений в каталоге FunPay нет.'
+            text = ('🔎 <b>Найдено в FunPay</b>\nВыберите категорию каталога.' if rows else
+                    '🔎 Совпадений в каталоге FunPay нет. Без подходящей подтверждённой COMMON-категории черновик создать нельзя.')
         else:
             result = await asyncio.to_thread(catalog.sections, category_id, state['generation'],
                                              limit=_PAGE + 1, offset=offset)
@@ -192,7 +203,7 @@ async def _catalog_results(callback, user_id, store, routes, *, offset=0, catego
             keyboard = [[(row['section_name'][:60], _catalog_action(state, 'node', row['node_id']))]
                         for row in rows[:_PAGE]]
             operation = 'spage'
-            game = rows[0]['game_name'] if rows else 'Игра'
+            game = rows[0]['game_name'] if rows else 'Категория каталога'
             text = (f"🔎 <b>{escape(game[:150])}</b>\nВыберите реальный раздел FunPay. "
                     'Тип товара не определяется автоматически.')
         if _flows.get(user_id) is not flow:
@@ -225,9 +236,10 @@ async def _catalog_confirmation(callback, user_id, store, routes, node_id):
         raise RouteError('Каталог изменился.')
     state.update(token=uuid.uuid4().hex[:12], view='confirm', candidate=candidate)
     await _show(callback, '👁 <b>Подтвердите GameRoute</b>\n'
-        f"Игра: {escape(candidate['game_name'][:150])}\n"
+        f"Категория каталога (legacy game_name): {escape(candidate['game_name'][:150])}\n"
         f"Раздел: {escape(candidate['section_name'][:150])} · node {candidate['node_id']}\n"
         'Подтверждение сохранит только локальное соответствие и продолжит создание draft.\n'
+        'Подтвердите пригодность этого COMMON-раздела для вашего товара. Тип шаблона её не гарантирует.\n'
         + (snapshot['warning'] if snapshot['stale'] else 'Публикация FunPay отсутствует.'), _menu([
             [('✅ Использовать', _catalog_action(state, 'confirm'))],
             [('🔄 Обновить каталог', _catalog_action(state, 'refresh'))],
@@ -279,7 +291,7 @@ async def _start_route_draft(callback, user_id, row, store, routes, templates):
 
 def _draft_label(row):
     values = row.get('variables', {})
-    parts = [row['game'][:22], row.get('variant_name', values.get('edition', 'defaults'))[:16],
+    parts = [values.get('sale_name', row['game'])[:22], row.get('variant_name', values.get('edition', 'defaults'))[:16],
              str(values.get('region', ''))[:12], str(values.get('platform', ''))[:12],
              row['payload']['price'][:12] + ' ×' + str(row['payload']['amount'])]
     return ' · '.join(part for part in parts if part)[:64]
@@ -287,7 +299,7 @@ def _draft_label(row):
 
 def _route_screen(row):
     text = ('🗺 <b>Game Route</b>\n'
-            f"Игра: {escape(row['game_name'][:150])}\n"
+            f"Категория каталога (legacy game_name): {escape(row['game_name'][:150])}\n"
             f"Раздел: {escape(row['section_name'][:150])} · node {row['node_id']}\n"
             f"Aliases: {escape(', '.join(row.get('game_aliases', []))[:250])}\n"
             f"Emoji: {escape(row.get('overrides', {}).get('emoji', 'template default'))}")
@@ -301,7 +313,7 @@ def _preview_screen(flow):
     token = flow.setdefault('preview_token', uuid.uuid4().hex[:12])
     clip = _ui()._escaped_preview
     text = ('👁 <b>RU + EN draft</b>\n'
-            f"Game: {clip(body['game'], 80)}\n"
+            f"Route label (legacy game_name): {clip(body['game'], 80)}\n"
             f"Template: {clip(body['template_name'], 60)}\n"
             + (f"Variant: {clip(body['variant_name'], 80)}\n" if body.get('variant_id') else '') +
             f"Section: {clip(body['section'], 80)} · node {body['node']}\n"
@@ -569,7 +581,8 @@ async def _wizard_prompt(message, user_id, flow, templates):
                                    flow['variables'].get(field, defaults.get(field)), 'wizard')
             return False
         await message.answer(f"{_TITLES.get(field, field)} [{default}]\n"
-                             'Введите значение; «-» — оставить default. ❌ Отмена — выйти.',
+                             'Введите значение; «-» — оставить default. ❌ Отмена — выйти. '
+                             'Только публичное описание товара: не вводите логины, пароли, токены, cookies или API keys.',
                              parse_mode=None)
         return False
     return True
@@ -600,7 +613,7 @@ async def _variant_picker(callback, user_id, variants, offset=0):
         keyboard.append([('⬅️ Страница', f'prd:vp:{token}:page:{max(0, offset - _PAGE)}')])
     if len(rows) > _PAGE:
         keyboard.append([('Далее ➡️', f'prd:vp:{token}:page:{offset + _PAGE}')])
-    keyboard += [[('Без варианта / defaults', f'prd:vp:{token}:pick:base')], [('🔙 Игры', 'prd:routepage:0')]]
+    keyboard += [[('Без варианта / defaults', f'prd:vp:{token}:pick:base')], [('🔙 Маршруты', 'prd:routepage:0')]]
     await _show(callback, '🎚 <b>Выберите вариант</b>', _menu(keyboard))
 
 
@@ -651,9 +664,15 @@ async def _products_callback(callback, action, user_id):
     catalog_valid = False
     try:
         store, templates, routes, drafts = _kit(user_id)
-        builtin = await asyncio.to_thread(templates.ensure_builtin)
         parts = action.split(':')
         command = parts[1] if len(parts) > 1 else 'home'
+        if command == 'preset':
+            flow = _active(user_id)
+            if (len(parts) != 4 or parts[2] != flow.get('type_token')
+                    or flow.get('type_context') != _catalog_context(routes, store, None)
+                    or parts[3] not in dict(BUILTIN_TYPES)):
+                raise ValueError('Выбор типа устарел.')
+        builtin = await asyncio.to_thread(templates.ensure_builtin)
         if command == 'nb':
             await node_ui.bindings_callback(callback, user_id, _active(user_id), parts, drafts, templates)
             return True
@@ -724,6 +743,9 @@ async def _products_callback(callback, action, user_id):
                 raise ValueError('Предпросмотр устарел.')
         elif user_id in _flows:
             _flows[user_id].pop('preview_token', None)
+        if command != 'types' and user_id in _flows:
+            _flows[user_id].pop('type_token', None)
+            _flows[user_id].pop('type_context', None)
         # Leaving a batch confirmation abandons its controls even when navigation
         # reuses the same flow dict. Keep the token for repeated confirm/cancel only.
         if command not in {'confirm', 'cancel'} and user_id in _flows:
@@ -749,9 +771,21 @@ async def _products_callback(callback, action, user_id):
             await _show(callback, *_home())
         elif command == 'choose':
             await _template_picker(callback, parts[2], int(parts[3]), templates)
-        elif command in {'pick', 'quick'}:
+        elif command == 'types':
+            token = uuid.uuid4().hex[:12]
+            _flows[user_id] = {'type_token': token, 'type_context': _catalog_context(routes, store, None)}
+            await _show(callback, '🧩 <b>Тип товара · LOCAL DRAFT</b>\n'
+                'Далее явно выберите категорию FunPay и фактические параметры. '
+                'Не вводите данные доступа. Для ИИ допустим только способ передачи, разрешённый провайдером.',
+                _menu([[(label, f'prd:preset:{token}:{kind}')] for kind, label in BUILTIN_TYPES]
+                      + [[('🔙 Лоты', 'products')]]))
+        elif command in {'pick', 'quick', 'preset'}:
             # One-tap GAME_KEY entry into the same scoped, confirmed draft wizard.
-            purpose, template_id = ('single', builtin['id']) if command == 'quick' else parts[2:4]
+            if command == 'preset':
+                chosen = await asyncio.to_thread(templates.ensure_builtin, parts[3])
+                purpose, template_id = 'single', chosen['id']
+            else:
+                purpose, template_id = ('single', builtin['id']) if command == 'quick' else parts[2:4]
             await asyncio.to_thread(templates.get, template_id)
             if purpose not in {'single', 'bulk', 'routes'}:
                 raise ValueError('Недоступное действие.')
@@ -779,7 +813,7 @@ async def _products_callback(callback, action, user_id):
             elif operation == 'search':
                 flow.pop('catalog_state', None)
                 _pending(user_id, flow, 'search')
-                await callback.message.answer('Введите название игры или сохранённый alias.')
+                await callback.message.answer('Введите название категории каталога или сохранённый alias маршрута.')
             elif operation == 'refresh':
                 await _catalog_results(callback, user_id, store, routes, force=True)
             elif operation == 'back':
@@ -883,7 +917,7 @@ async def _products_callback(callback, action, user_id):
             await _similar_screen(callback.message, user_id, flow, templates, drafts)
         elif command == 'search':
             flow = _active(user_id); _pending(user_id, flow, 'search')
-            await callback.message.answer('Введите название игры или alias. ❌ Отмена — выйти.')
+            await callback.message.answer('Введите название категории каталога или alias маршрута. ❌ Отмена — выйти.')
         elif command == 'route':
             flow = _active(user_id)
             row = await asyncio.to_thread(routes.resolve_route, parts[2])
@@ -945,7 +979,7 @@ async def _products_callback(callback, action, user_id):
             _pending(user_id, flow, 'variantedit')
             await callback.message.answer('Отправьте полный JSON variant. overrides: variables, emoji, '
                 'title_ru/en, description_ru/en. Необязательный route_override_url — '
-                'подтверждённый раздел той же игры. enabled=false отключает variant.\n'
+                'подтверждённый раздел той же категории каталога. enabled=false отключает variant.\n'
                 'Сначала preview, затем подтверждение.', parse_mode=None)
             await _plain_chunks(callback.message, json.dumps(body, ensure_ascii=False, indent=2))
             if old is not None and old['enabled']:
@@ -983,7 +1017,7 @@ async def _products_callback(callback, action, user_id):
             if command == 'routeimport':
                 _pending(user_id, flow, 'routeimport')
                 await callback.message.answer('До 100 строк: Game | https://funpay.com/lots/ID/\n'
-                    'Можно отправить только URL либо точное имя игры; несколько разделов дадут warning.\n'
+                    'Можно отправить только URL либо точное имя категории каталога; несколько разделов дадут warning.\n'
                     'Сначала preview, сохранение — после подтверждения.')
             else:
                 offset = int(parts[2])
@@ -1005,7 +1039,7 @@ async def _products_callback(callback, action, user_id):
                 await _show(callback, '🎮 <b>Выберите подтверждённый раздел</b>', _menu(keyboard))
         elif command == 'catalogsearch':
             flow = _active(user_id); _pending(user_id, flow, 'catalogsearch')
-            await callback.message.answer('Название игры для поиска по каталогу FunPay:')
+            await callback.message.answer('Название категории для поиска по каталогу FunPay:')
         elif command in {'node', 'source'}:
             flow = _active(user_id)
             if flow['purpose'] != 'routes':
@@ -1217,6 +1251,10 @@ async def _products_input(message, user_id):
                     flow['variables'][field] = value
             elif field == 'price' and not flow.get('price'):
                 raise ValueError('Цена обязательна.')
+            elif field != 'price':
+                _, defaults, _ = await _variable_model(user_id, flow, templates)
+                if field not in flow['variables'] and field not in defaults:
+                    raise ValueError('У поля нет default; укажите фактическое значение или отмените создание.')
             await _advance_variables(message, user_id, flow, templates, drafts)
         elif step == 'similarinput':
             field = flow['similar_field']

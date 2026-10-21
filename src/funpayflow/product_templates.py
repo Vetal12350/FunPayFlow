@@ -8,6 +8,15 @@ from .node_form import is_safe_node_binding_name
 
 
 GAME_KEY = "GAME_KEY"
+GIFT = "GIFT"
+PLAYSTATION_GAME = "PLAYSTATION_GAME"
+AI_SUBSCRIPTION = "AI_SUBSCRIPTION"
+BUILTIN_TYPES = (
+    (GAME_KEY, '🔑 Игровой ключ'),
+    (GIFT, '🎁 Гифт игры'),
+    (PLAYSTATION_GAME, '🎮 Игра PlayStation'),
+    (AI_SUBSCRIPTION, '🤖 Подписка / доступ к ИИ-сервису'),
+)
 VARIABLES = ("game", "platform", "region", "edition", "product_name", "quantity")
 TEXT_FIELDS = ("title_ru", "title_en", "description_ru", "description_en")
 OVERRIDE_FIELDS = frozenset(("emoji", *TEXT_FIELDS, "variables"))
@@ -46,6 +55,43 @@ def default_template():
         "defaults": {"platform": "Steam", "region": "Global", "edition": "Standard", "quantity": "1"},
         "validation_rules": {},
     }
+
+
+def builtin_template(kind=GAME_KEY):
+    """Opt-in content presets; category and delivery are never inferred."""
+    if kind == GAME_KEY:
+        return default_template()
+    body = default_template()
+    body.update(name=kind, defaults={'quantity': '1'}, validation_rules={})
+    if kind == GIFT:
+        extra = ['sale_name', 'sale_platform', 'availability', 'delivery_method']
+        body.update(display_name='Гифт игры / Game gift', default_emoji='🎁',
+            title_ru='{{sale_name}} — гифт | {{sale_platform}}',
+            title_en='{{sale_name}} — gift | {{sale_platform}}',
+            description_ru='Гифт игры {{sale_name}}. Платформа: {{sale_platform}}. Регион / доступность: {{availability}}. Способ передачи, указанный владельцем: {{delivery_method}}. Количество: {{quantity}}.',
+            description_en='Game gift: {{sale_name}}. Platform: {{sale_platform}}. Region / availability: {{availability}}. Owner-specified delivery method: {{delivery_method}}. Quantity: {{quantity}}.')
+    elif kind == PLAYSTATION_GAME:
+        extra = ['sale_name', 'ps_platform', 'sale_edition', 'availability', 'product_form', 'delivery_method']
+        body.update(display_name='Игра PlayStation / PlayStation game', default_emoji='🎮',
+            title_ru='{{sale_name}} — {{ps_platform}} | {{sale_edition}}',
+            title_en='{{sale_name}} — {{ps_platform}} | {{sale_edition}}',
+            description_ru='Игра {{sale_name}}. Платформа: {{ps_platform}}. Издание: {{sale_edition}}. Регион / доступность: {{availability}}. Форма товара: {{product_form}}. Законный способ передачи, подтверждённый владельцем: {{delivery_method}}. Передача личного аккаунта не предлагается. Количество: {{quantity}}.',
+            description_en='Game: {{sale_name}}. Platform: {{ps_platform}}. Edition: {{sale_edition}}. Region / availability: {{availability}}. Product form: {{product_form}}. Owner-confirmed legitimate delivery method: {{delivery_method}}. No personal account transfer offered. Quantity: {{quantity}}.',
+            validation_rules={'ps_platform': {'choices': ['PS4', 'PS5', 'PS4 / PS5']},
+                'product_form': {'choices': ['Код / Code', 'Законное право на игру / Legitimate entitlement']}})
+    elif kind == AI_SUBSCRIPTION:
+        extra = ['sale_name', 'plan', 'duration', 'availability', 'delivery_method', 'authorized_delivery']
+        body.update(display_name='Подписка / доступ к ИИ-сервису', default_emoji='🤖',
+            title_ru='{{sale_name}} — {{plan}} | {{duration}}',
+            title_en='{{sale_name}} — {{plan}} | {{duration}}',
+            description_ru='Подписка / доступ к сервису {{sale_name}}. Тариф: {{plan}}. Срок: {{duration}}. Регион / доступность: {{availability}}. Способ передачи: {{delivery_method}}. Подтверждение владельца: {{authorized_delivery}}. Только при фактической доступности и разрешении провайдера; перепродажа не считается разрешённой по умолчанию. Личные или общие аккаунты не предлагаются. Количество: {{quantity}}.',
+            description_en='Subscription / service access: {{sale_name}}. Plan: {{plan}}. Duration: {{duration}}. Region / availability: {{availability}}. Delivery method: {{delivery_method}}. Owner confirmation: {{authorized_delivery}}. Only when actually available and permitted by the provider; resale permission is not assumed. No personal or shared accounts offered. Quantity: {{quantity}}.',
+            validation_rules={'authorized_delivery': {'choices': [
+                'Подтверждаю разрешение провайдера / I confirm provider permission']}})
+    else:
+        raise ProductValidationError('Unknown built-in product type')
+    body['allowed_variables'] = [*VARIABLES, *extra]
+    return body
 
 
 def _variables(values, allowed):
@@ -198,25 +244,26 @@ class TemplateService:
     def __init__(self, store):
         self.store = store
 
-    def ensure_builtin(self):
-        # The stable internal name identifies the default even when the display name changes.
-        builtin = self.store.get_template(GAME_KEY)
+    def ensure_builtin(self, kind=GAME_KEY):
+        definition = builtin_template(kind)  # Fixed allowlist, never arbitrary IDs.
+        # Prefer the stable scoped ID, preserving all owner edits including names.
+        builtin = self.store.get_template(kind)
         if builtin is not None:
             return builtin
         offset = 0
         while True:
             page = self.store.list_templates(limit=100, offset=offset)
             for body in page:
-                if body["name"] == GAME_KEY:
+                if body["name"] == kind:
                     return body
             if len(page) < 100:
                 break
             offset += 100
         try:
-            return self.save(default_template(), template_id=GAME_KEY)
+            return self.save(definition, template_id=kind)
         except ValueError:
             # Concurrent first visits use the same scoped ID; keep the winner's definition.
-            builtin = self.store.get_template(GAME_KEY)
+            builtin = self.store.get_template(kind)
             if builtin is None:
                 raise
             return builtin

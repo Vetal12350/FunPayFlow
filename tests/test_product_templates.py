@@ -1,6 +1,7 @@
 import unittest
 
-from funpayflow.product_templates import ProductTemplate, ProductValidationError, default_template
+from funpayflow.product_templates import (ProductTemplate, ProductValidationError, default_template,
+    builtin_template, BUILTIN_TYPES, TemplateService)
 
 
 class ProductTemplateTests(unittest.TestCase):
@@ -67,3 +68,47 @@ class ProductTemplateTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_opt_in_presets_concurrent_initialization_and_customization(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+    from funpayflow.product_store import ProductStore
+    from funpayflow.state import ReviewReceiptStore
+
+    state = ReviewReceiptStore(tmp_path / 'state.sqlite3')
+    state.initialize()
+    store = ProductStore(state, 1, 42)
+    service = TemplateService(store)
+    assert service.list() == []
+    for kind, _ in BUILTIN_TYPES:
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            rows = list(pool.map(lambda _: TemplateService(store).ensure_builtin(kind), range(8)))
+        assert all(row == rows[0] for row in rows)
+        body = rows[0]
+        assert body['id'] == kind and body['revision'] == 1
+        assert set(default_template()['allowed_variables']) <= set(body['allowed_variables'])
+        assert not body.get('node_bindings')
+        edited = service.save(dict(body, name='Custom ' + kind, display_name='Owner name',
+            default_emoji='⭐', description_en='Owner text'), kind, body['revision'])
+        reopened = TemplateService(ProductStore(ReviewReceiptStore(state.path), 1, 42))
+        assert reopened.ensure_builtin(kind) == edited
+    assert len(service.list()) == 4
+    assert ProductStore(state, 2, 42).list_templates() == []
+    assert ProductStore(state, 1, 43).list_templates() == []
+    with unittest.TestCase().assertRaises(ProductValidationError):
+        service.ensure_builtin('arbitrary-id')
+    assert builtin_template() == default_template()
+
+
+def test_new_presets_require_actual_product_details_and_authorization():
+    for kind, _ in BUILTIN_TYPES[1:]:
+        body = builtin_template(kind)
+        assert body['defaults'] == {'quantity': '1'}
+        with unittest.TestCase().assertRaises(ProductValidationError):
+            ProductTemplate(body).render({'game': 'Catalogue category', 'product_name': 'Category'})
+    ai = builtin_template('AI_SUBSCRIPTION')
+    values = dict(game='Category', product_name='Category', sale_name='Example service',
+        plan='Example plan', duration='1 month', availability='unspecified',
+        delivery_method='Permitted invitation', authorized_delivery='No permission')
+    with unittest.TestCase().assertRaises(ProductValidationError):
+        ProductTemplate(ai).render(values)

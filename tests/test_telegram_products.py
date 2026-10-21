@@ -14,7 +14,7 @@ from FunPayAPI.common.enums import SubCategoryTypes
 from funpayflow import telegram as ui, telegram_products as view
 from funpayflow.product_store import ProductStore
 from funpayflow.game_routes import RouteService
-from funpayflow.product_templates import TemplateService, default_template
+from funpayflow.product_templates import TemplateService, default_template, BUILTIN_TYPES
 from funpayflow.product_drafts import DraftService
 from funpayflow.state import ReviewReceiptStore
 
@@ -281,6 +281,153 @@ def test_quick_without_routes_uses_confirmed_catalog_and_cancel(context):
         ctx.client.account.method.assert_not_called()
         ctx.client.account.save_lot.assert_not_called()
 
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize('kind,label', BUILTIN_TYPES)
+def test_type_selector_confirmed_catalog_node_fields_preview_save_restart(context, kind, label):
+    from funpayflow.product_variants import VariantService
+    ctx = context
+    # Synthetic catalogue labels deliberately differ from the item sold.
+    ctx.nodes[0].category.name = 'A Service catalogue category'
+    ctx.nodes[0].name = 'Owner-selected section'
+
+    async def run():
+        cb = callback()
+        await view.products_callback(cb, 'prd:types', 1)
+        screen = str(cb.message.edit_text.call_args)
+        assert [screen.index(label) for _, label in BUILTIN_TYPES] == sorted(
+            screen.index(label) for _, label in BUILTIN_TYPES)
+        action = f"prd:preset:{view._flows[1]['type_token']}:{kind}"
+        await asyncio.gather(*(view.products_callback(callback(), action, 1) for _ in range(2)))
+        flow = view._flows[1]
+        assert flow['template_id'] == kind and flow['purpose'] == 'single'
+        state = flow['catalog_state']
+        await view.products_callback(cb, f"prd:rt:{state['token']}:game:200", 1)
+        state = flow['catalog_state']
+        assert state['view'] == 'confirm' and ctx.store.list_routes() == []
+        assert 'legacy game_name' in str(cb.message.edit_text.call_args)
+        await view.products_callback(cb, f"prd:rt:{state['token']}:confirm:0", 1)
+        route = ctx.store.list_routes()[0]
+        assert route['node_id'] == 100 and route['template_id'] == kind
+        assert flow['step'] == 'nodefields'
+        # Re-enter via saved route, including a real Variant and technical field value.
+        variant = VariantService(ctx.store, ctx.routes).save({
+            'template_id': kind, 'route_id': route['id'], 'display_name': 'Owner variant',
+            'node_values': {'fields[region]': 'EU'}, 'overrides': {'emoji': '⭐'}})
+        await view.products_callback(cb, 'prd:types', 1)
+        await view.products_callback(cb, f"prd:preset:{view._flows[1]['type_token']}:{kind}", 1)
+        await view.products_callback(cb, f"prd:route:{route['id']}", 1)
+        flow = view._flows[1]
+        await view.products_callback(cb, f"prd:vp:{flow['variant_picker']['token']}:pick:{variant['id']}", 1)
+        while flow.get('step') == 'nodefields':
+            await view.products_input(message('-'), 1)
+        values = dict(quantity='2', sale_name='Actual product', sale_platform='Owner platform',
+            availability='не указано / unspecified', delivery_method='Разрешённое приглашение / Permitted invitation',
+            ps_platform='PS5', sale_edition='Owner edition', product_form='Код / Code',
+            plan='Owner plan', duration='30 дней / 30 days',
+            authorized_delivery='Подтверждаю разрешение провайдера / I confirm provider permission', price='12.34')
+        for _ in range(15):
+            if flow.get('preview'):
+                break
+            field = flow['field']
+            if kind != 'GAME_KEY' and field == 'sale_name':
+                await view.products_input(message('-'), 1)
+                assert flow['field'] == 'sale_name'  # No default product inferred from category.
+            await view.products_input(message(values[field]), 1)
+        preview = flow['preview']
+        assert preview['variant_id'] == variant['id']
+        assert next(row for row in preview['node_fields'] if row['html_name'] == 'fields[region]')['value'] == 'EU'
+        assert preview['payload']['price'] == '12.34'
+        for lang in ('ru', 'en'):
+            title = preview['payload']['title_' + lang]
+            description = preview['payload']['description_' + lang]
+            assert title.startswith('⭐')
+            if kind != 'GAME_KEY':
+                assert 'Actual product' in title and 'Service catalogue category' not in title + description
+                assert values['delivery_method'] in description
+            if kind == 'AI_SUBSCRIPTION':
+                assert 'Owner plan' in title + description and '30 days' in title + description
+            elif kind == 'PLAYSTATION_GAME':
+                assert 'PS5' in title and 'Code' in description
+            elif kind == 'GIFT':
+                assert ('гифт' if lang == 'ru' else 'gift') in title
+        save = preview_action('prd:save')
+        await view.products_callback(cb, save, 1)
+        saved = ctx.store.list_drafts()[0]
+        view.discard_session(1); ui._interaction_state.clear()
+        reopened = ProductStore(ReviewReceiptStore(ctx.receipt.path), 1, 42)
+        assert reopened.get_draft(saved['id'])['payload'] == preview['payload']
+        await view.products_callback(cb, action, 1)  # Pre-restart type button.
+        assert 1 not in view._flows
+        await view.products_callback(cb, f"prd:open:{saved['id']}", 1)
+        assert view._flows[1]['preview']['payload'] == saved['payload']
+        template = ctx.templates.get(kind)
+        customized = ctx.templates.save(dict(template, name='Owner ' + kind,
+            display_name='Owner preset', default_emoji='🧩', description_en='Owner text'),
+            kind, template['revision'])
+        await view.products_callback(cb, 'prd:types', 1)
+        await view.products_callback(cb, f"prd:preset:{view._flows[1]['type_token']}:{kind}", 1)
+        assert view._flows[1]['template_id'] == customized['id']
+        assert ctx.templates.get(kind) == customized
+        assert ctx.store.get_draft(saved['id']) == saved
+        ctx.client.account.save_lot.assert_not_called()
+        assert all(call.args[0] == 'get' for call in ctx.client.account.method.call_args_list)
+
+    asyncio.run(run())
+
+
+def test_type_selector_invalid_stale_nonowner_and_scope_do_not_change_input(context):
+    ctx = context
+
+    async def run():
+        cb = callback()
+        await view.products_callback(cb, 'prd:types', 1)
+        old = view._flows[1]['type_token']
+        await view.products_callback(cb, 'prd:types', 1)
+        flow = view._flows[1]
+        token = flow['type_token']
+        ui._interaction_state[1] = pending = {'sentinel': True}
+        for action in (f'prd:preset:{old}:GIFT', f'prd:preset:{token}:arbitrary',
+                       f'prd:preset:{token}:GIFT:extra'):
+            await view.products_callback(cb, action, 1)
+            assert view._flows[1] is flow and ui._interaction_state[1] is pending
+        await view.products_callback(callback(), f'prd:preset:{token}:GIFT', 2)
+        assert 2 not in view._flows
+        ctx.client.account.id = 43
+        await view.products_callback(cb, f'prd:preset:{token}:GIFT', 1)
+        assert view._flows[1] is flow and ui._interaction_state[1] is pending
+        assert ProductStore(ctx.receipt, 1, 43).list_templates() == []
+        ctx.client.account.id = 42
+        assert [row['id'] for row in ctx.templates.list()] == ['GAME_KEY']
+        assert ctx.store.list_routes() == [] and ctx.store.list_drafts() == []
+        ctx.client.account.method.assert_not_called()
+    asyncio.run(run())
+
+
+def test_type_selector_leaving_screen_and_missing_safe_category(context):
+    ctx = context
+
+    async def run():
+        cb = callback()
+        await view.products_callback(cb, 'prd:types', 1)
+        old = f"prd:preset:{view._flows[1]['type_token']}:GIFT"
+        await view.products_callback(cb, 'prd:templates:0', 1)
+        await view.products_callback(cb, old, 1)
+        assert ctx.store.get_template('GIFT') is None
+        ctx.client.account.subcategories = []
+        await view.products_callback(cb, 'prd:types', 1)
+        await view.products_callback(cb, f"prd:preset:{view._flows[1]['type_token']}:AI_SUBSCRIPTION", 1)
+        assert 'Без подходящей подтверждённой COMMON-категории' in str(cb.message.edit_text.call_args)
+        flow = view._flows[1]
+        assert not flow.get('preview') and not flow.get('route_id')
+        await view.products_callback(cb, 'prd:save:invented', 1)
+        assert ctx.store.list_drafts() == [] and ctx.store.list_routes() == []
+        state = flow['catalog_state']
+        await view.products_callback(cb, f"prd:rt:{state['token']}:cancel:0", 1)
+        assert 1 not in view._flows
+        ctx.client.account.method.assert_not_called()
+        ctx.client.account.save_lot.assert_not_called()
     asyncio.run(run())
 
 
