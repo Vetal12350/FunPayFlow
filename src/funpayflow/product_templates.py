@@ -11,11 +11,17 @@ GAME_KEY = "GAME_KEY"
 GIFT = "GIFT"
 PLAYSTATION_GAME = "PLAYSTATION_GAME"
 AI_SUBSCRIPTION = "AI_SUBSCRIPTION"
+DLC_CONTENT = "DLC_CONTENT"
+GAME_CURRENCY = "GAME_CURRENCY"
+GAMING_SUBSCRIPTION = "GAMING_SUBSCRIPTION"
 BUILTIN_TYPES = (
     (GAME_KEY, '🔑 Игровой ключ'),
     (GIFT, '🎁 Гифт игры'),
     (PLAYSTATION_GAME, '🎮 Игра PlayStation'),
     (AI_SUBSCRIPTION, '🤖 Подписка / доступ к ИИ-сервису'),
+    (DLC_CONTENT, '🧩 DLC / дополнение'),
+    (GAME_CURRENCY, '💎 Внутриигровая валюта'),
+    (GAMING_SUBSCRIPTION, '🎟️ Игровая подписка / подарочная карта'),
 )
 VARIABLES = ("game", "platform", "region", "edition", "product_name", "quantity")
 TEXT_FIELDS = ("title_ru", "title_en", "description_ru", "description_en")
@@ -88,8 +94,37 @@ def builtin_template(kind=GAME_KEY):
             description_en='Subscription / service access: {{sale_name}}. Plan: {{plan}}. Duration: {{duration}}. Region / availability: {{availability}}. Delivery method: {{delivery_method}}. Owner confirmation: {{authorized_delivery}}. Only when actually available and permitted by the provider; resale permission is not assumed. No personal or shared accounts offered. Quantity: {{quantity}}.',
             validation_rules={'authorized_delivery': {'choices': [
                 'Подтверждаю разрешение провайдера / I confirm provider permission']}})
+    elif kind == DLC_CONTENT:
+        extra = ['sale_name', 'base_game', 'sale_platform', 'availability', 'sale_edition',
+                 'delivery_method', 'authorized_delivery']
+        body.update(display_name='DLC / дополнение', default_emoji='🧩',
+            title_ru='{{sale_name}} — DLC | {{sale_platform}}',
+            title_en='{{sale_name}} — DLC | {{sale_platform}}',
+            description_ru='Дополнение: {{sale_name}}. Требуется базовая игра {{base_game}}; базовая игра не включена. Платформа: {{sale_platform}}. Регион / доступность: {{availability}}. Издание дополнения: {{sale_edition}}. Способ передачи: {{delivery_method}}. Заявление владельца: {{authorized_delivery}}. Допустимость передачи не проверена автоматически. Количество: {{quantity}}.',
+            description_en='DLC: {{sale_name}}. Requires the base game {{base_game}}; base game not included. Platform: {{sale_platform}}. Region / availability: {{availability}}. DLC edition: {{sale_edition}}. Delivery method: {{delivery_method}}. Owner statement: {{authorized_delivery}}. Delivery permission has not been automatically verified. Quantity: {{quantity}}.')
+    elif kind == GAME_CURRENCY:
+        extra = ['sale_name', 'currency_name', 'denomination', 'availability',
+                 'delivery_method', 'authorized_delivery']
+        body.update(display_name='Внутриигровая валюта / In-game currency', default_emoji='💎',
+            title_ru='{{sale_name}} — {{currency_name}} | {{denomination}}',
+            title_en='{{sale_name}} — {{currency_name}} | {{denomination}}',
+            description_ru='Игра: {{sale_name}}. Внутриигровая валюта: {{currency_name}}. Объём на единицу товара: {{denomination}}. Регион / доступность: {{availability}}. Способ передачи: {{delivery_method}}. Заявление владельца: {{authorized_delivery}}. Разрешение передачи или пополнения не предполагается и не проверено автоматически; доставка не гарантируется этим шаблоном. Логин, пароль, токен и одноразовые коды покупателя не требуются. Количество единиц товара: {{quantity}}.',
+            description_en='Game: {{sale_name}}. In-game currency: {{currency_name}}. Amount per item: {{denomination}}. Region / availability: {{availability}}. Delivery method: {{delivery_method}}. Owner statement: {{authorized_delivery}}. Transfer or top-up permission is not assumed or automatically verified; this template does not guarantee delivery. No customer login, password, token or one-time codes required. Item quantity: {{quantity}}.')
+    elif kind == GAMING_SUBSCRIPTION:
+        extra = ['sale_name', 'gaming_product_type', 'term_or_value', 'sale_platform',
+                 'availability', 'delivery_method', 'authorized_delivery']
+        body.update(display_name='Игровая подписка / подарочная карта', default_emoji='🎟️',
+            title_ru='{{sale_name}} — {{gaming_product_type}} | {{term_or_value}}',
+            title_en='{{sale_name}} — {{gaming_product_type}} | {{term_or_value}}',
+            description_ru='Сервис / карта: {{sale_name}}. Тип товара: {{gaming_product_type}}. Срок подписки или номинал карты / кода: {{term_or_value}}. Платформа: {{sale_platform}}. Регион / доступность: {{availability}}. Способ передачи: {{delivery_method}}. Заявление владельца: {{authorized_delivery}}. Только при фактической доступности; разрешение провайдера не проверено автоматически. Передача чужого аккаунта не предлагается. Количество: {{quantity}}.',
+            description_en='Service / card: {{sale_name}}. Product type: {{gaming_product_type}}. Subscription duration or card / code face value: {{term_or_value}}. Platform: {{sale_platform}}. Region / availability: {{availability}}. Delivery method: {{delivery_method}}. Owner statement: {{authorized_delivery}}. Only when actually available; provider permission has not been automatically verified. No third-party account transfer offered. Quantity: {{quantity}}.',
+            validation_rules={'gaming_product_type': {'choices': [
+                'Подписка / Subscription', 'Подарочная карта / Gift card', 'Код / Code']}})
     else:
         raise ProductValidationError('Unknown built-in product type')
+    if kind in {DLC_CONTENT, GAME_CURRENCY, GAMING_SUBSCRIPTION}:
+        body['validation_rules']['authorized_delivery'] = {'choices': [
+            'Подтверждаю разрешение провайдера / I confirm provider permission']}
     body['allowed_variables'] = [*VARIABLES, *extra]
     return body
 

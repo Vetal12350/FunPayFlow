@@ -1,6 +1,8 @@
 # Текущее состояние: snapshot, не changelog
 
-Обновлено: **2026-10-19**. Перед новой задачей перепроверь Git; документ не заменяет текущий HEAD/status.
+Обновлено: **2026-10-21**. Перед новой задачей перепроверь Git; документ не заменяет текущий HEAD/status.
+
+- Source checkout от `bb0462c`: в тот же LOCAL DRAFT selector добавлены opt-in `DLC_CONTENT`, `GAME_CURRENCY`, `GAMING_SUBSCRIPTION`. Требуют фактические сведения о предложении и заявление владельца о разрешённой передаче; категория и Node Fields выбираются прежним явным flow. DLC не включает базовую игру, объём валюты отделён от quantity, срок / номинал подписки / карты вводится владельцем. Это не автоматическая проверка правил провайдера. Старые пресеты и их пользовательские правки сохраняются, schema/dependencies и production не меняются. Подробнее [PRODUCT_TEMPLATES](PRODUCT_TEMPLATES.md).
 
 - In-process NodeForm diagnosis без Telegram clicks: выбран предусмотренный задачей design-only fallback. Установленный Account.method не поддерживает per-call redirect control; HTTP под общим RLock может задержать polling/shutdown, transport timeout не ограничивает весь run. Runtime-hook/opt-in не добавлен, диагностика остаётся выключенной. [Дизайн, блокеры, offline evidence и acceptance/rollout plan](NODE_FORM_IN_PROCESS_DIAGNOSIS.md); live причина и результат не установлены.
 

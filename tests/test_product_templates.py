@@ -1,4 +1,5 @@
 import unittest
+import pytest
 
 from funpayflow.product_templates import (ProductTemplate, ProductValidationError, default_template,
     builtin_template, BUILTIN_TYPES, TemplateService)
@@ -92,7 +93,7 @@ def test_opt_in_presets_concurrent_initialization_and_customization(tmp_path):
             default_emoji='⭐', description_en='Owner text'), kind, body['revision'])
         reopened = TemplateService(ProductStore(ReviewReceiptStore(state.path), 1, 42))
         assert reopened.ensure_builtin(kind) == edited
-    assert len(service.list()) == 4
+    assert len(service.list()) == 7
     assert ProductStore(state, 2, 42).list_templates() == []
     assert ProductStore(state, 1, 43).list_templates() == []
     with unittest.TestCase().assertRaises(ProductValidationError):
@@ -112,3 +113,66 @@ def test_new_presets_require_actual_product_details_and_authorization():
         delivery_method='Permitted invitation', authorized_delivery='No permission')
     with unittest.TestCase().assertRaises(ProductValidationError):
         ProductTemplate(ai).render(values)
+
+
+@pytest.mark.parametrize('kind,details', [
+    ('DLC_CONTENT', dict(sale_name='Actual expansion', base_game='Required game',
+        sale_platform='Owner platform', sale_edition='Expansion edition')),
+    ('GAME_CURRENCY', dict(sale_name='Actual game', currency_name='Crystals',
+        denomination='500 crystals')),
+    ('GAMING_SUBSCRIPTION', dict(sale_name='Actual card', gaming_product_type='Подарочная карта / Gift card',
+        term_or_value='25 EUR', sale_platform='Owner platform')),
+])
+def test_second_wave_required_values_bilingual_and_permission(kind, details):
+    body = builtin_template(kind)
+    model = ProductTemplate(body)
+    values = dict(details, availability='EU', delivery_method='Permitted code delivery',
+        authorized_delivery='Подтверждаю разрешение провайдера / I confirm provider permission', quantity='2')
+    rendered = model.render(values)
+    assert body['defaults'] == {'quantity': '1'}
+    assert not body.get('node_bindings')
+    for language in ('ru', 'en'):
+        text = rendered['description_' + language]
+        assert all(value in text for value in values.values())
+        assert details['sale_name'] in rendered['title_' + language]
+    # Every extra variable is required by the actual texts, with no invented default.
+    for variable in values:
+        if variable == 'quantity':
+            continue
+        for invalid in (None, '', '   '):
+            missing = dict(values)
+            if invalid is None:
+                missing.pop(variable)
+            else:
+                missing[variable] = invalid
+            with pytest.raises(ProductValidationError):
+                model.render(missing)
+    with pytest.raises(ProductValidationError):
+        model.render(dict(values, authorized_delivery='Not confirmed'))
+    if kind == 'DLC_CONTENT':
+        assert 'базовая игра не включена' in rendered['description_ru']
+        assert 'base game not included' in rendered['description_en']
+    elif kind == 'GAME_CURRENCY':
+        assert 'does not guarantee delivery' in rendered['description_en']
+        assert 'No customer login, password, token or one-time codes' in rendered['description_en']
+    else:
+        with pytest.raises(ProductValidationError):
+            model.render(dict(values, gaming_product_type='Account transfer'))
+        assert 'No third-party account transfer' in rendered['description_en']
+
+
+@pytest.mark.parametrize('product_type,term', [
+    ('Подписка / Subscription', '30 days'),
+    ('Подарочная карта / Gift card', '25 EUR'),
+    ('Код / Code', '10 USD'),
+])
+def test_gaming_product_distinction_requires_explicit_term_or_face_value(product_type, term):
+    model = ProductTemplate(builtin_template('GAMING_SUBSCRIPTION'))
+    values = dict(sale_name='Owner named service or card', gaming_product_type=product_type,
+        term_or_value=term, sale_platform='Owner platform', availability='EU',
+        delivery_method='Permitted code delivery',
+        authorized_delivery='Подтверждаю разрешение провайдера / I confirm provider permission')
+    rendered = model.render(values)
+    for lang in ('ru', 'en'):
+        assert product_type in rendered['description_' + lang]
+        assert term in rendered['title_' + lang]

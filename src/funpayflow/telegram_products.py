@@ -24,7 +24,12 @@ _locks: dict[int, tuple] = {}
 _PAGE = 8
 _TITLES = {'platform': 'Platform', 'region': 'Region', 'edition': 'Edition',
            'quantity': 'Quantity', 'product_name': 'Product name', 'price': 'Price',
-           'sale_name': 'Название игры / сервиса / Game or service name',
+           'sale_name': 'Фактическое название игры / DLC / сервиса / карты · Actual offer name',
+           'base_game': 'Необходимая базовая игра (не включена) / Required base game (not included)',
+           'currency_name': 'Название внутриигровой валюты / In-game currency name',
+           'denomination': 'Объём валюты на единицу товара / Currency amount per item',
+           'gaming_product_type': 'Тип: подписка / подарочная карта / код · Product type',
+           'term_or_value': 'Укажите срок подписки или номинал карты / кода · Duration or face value',
            'sale_platform': 'Платформа / Platform', 'ps_platform': 'PlayStation',
            'sale_edition': 'Издание / Edition', 'product_form': 'Форма товара / Product form',
            'plan': 'Тариф / Plan', 'duration': 'Срок / Duration',
@@ -776,7 +781,8 @@ async def _products_callback(callback, action, user_id):
             _flows[user_id] = {'type_token': token, 'type_context': _catalog_context(routes, store, None)}
             await _show(callback, '🧩 <b>Тип товара · LOCAL DRAFT</b>\n'
                 'Далее явно выберите категорию FunPay и фактические параметры. '
-                'Не вводите данные доступа. Для ИИ допустим только способ передачи, разрешённый провайдером.',
+                'Не вводите логины, пароли, токены или одноразовые коды. '
+                'Указывайте только фактически разрешённую передачу; заявление владельца не является проверкой правил провайдера.',
                 _menu([[(label, f'prd:preset:{token}:{kind}')] for kind, label in BUILTIN_TYPES]
                       + [[('🔙 Лоты', 'products')]]))
         elif command in {'pick', 'quick', 'preset'}:
