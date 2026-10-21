@@ -42,7 +42,8 @@ class FakeLinux:
     def __init__(self):
         self.status = 'inactive'
         self.processes = []
-        self.readonly = True
+        self.readonly = False  # Supported v2 layout is a single writable ext4.
+        self.authorization = True
         self.calls = []
         self.metadata = {}
         self.available = 100 * 1024**3
@@ -62,13 +63,17 @@ class FakeLinux:
             assert path.is_absolute() and path not in (backup.DATA, backup.BACKUPS)
             self.validate(path, path.lstat(), True)
 
+    def authorized(self):
+        self.calls.append('authorized')
+        backup.require(self.authorization, 'maintenance_required')
+
     def quiescent(self, data):
         self.calls.append('quiescent')
         backup.require(self.status == 'inactive' and not self.processes, 'not_quiescent')
 
     def frozen(self, data):
         self.calls.append('frozen')
-        backup.require(self.readonly, 'source_not_frozen')
+        backup.require(not self.readonly, 'source_not_frozen')
 
     def space(self, path, needed):
         self.calls.append('space')
@@ -180,8 +185,8 @@ def test_quiescence_before_private_reads_or_snapshot(fixture, monkeypatch, statu
     assert 'lock' not in fixture[2].calls
 
 
-def test_source_must_be_frozen_before_private_read(fixture, monkeypatch):
-    fixture[2].readonly = False
+def test_unsupported_layout_before_private_read(fixture, monkeypatch):
+    fixture[2].readonly = True
     monkeypatch.setattr(backup, 'inventory', lambda *a: pytest.fail('private source read'))
     assert_failed(fixture, 'source_not_frozen')
     assert list(fixture[1].iterdir()) == []
@@ -191,6 +196,124 @@ def test_exclusive_lock_before_inventory(fixture, monkeypatch):
     fixture[2].busy = True
     monkeypatch.setattr(backup, 'inventory', lambda *a: pytest.fail('private source read'))
     assert_failed(fixture, 'busy')
+
+
+def test_rw_same_device_requires_coordinator_before_any_payload_or_artifact(fixture, monkeypatch):
+    assert fixture[0].stat().st_dev == fixture[1].stat().st_dev
+    fixture[2].authorization = False
+    monkeypatch.setattr(backup, 'inventory', lambda *a: pytest.fail('private source read'))
+    assert_failed(fixture, 'maintenance_required')
+    assert fixture[2].calls == ['authorized']
+    assert list(fixture[1].iterdir()) == []
+
+
+@pytest.mark.parametrize('phase', ['archive_restore', 'publish'])
+def test_coordinator_loss_during_snapshot(fixture, monkeypatch, phase):
+    target = backup if phase == 'archive_restore' else fixture[2]
+    original = getattr(target, phase)
+
+    def lose(*args):
+        original(*args)
+        fixture[2].authorization = False
+
+    monkeypatch.setattr(target, phase, lose)
+    result = run(fixture)
+    assert result['status'] == ('publication_unknown' if phase == 'publish'
+                                else 'maintenance_required')
+    assert not result['restore_verified']
+    if phase == 'publish':
+        assert (fixture[2].published[0] / 'data.tar').exists()
+        assert list(fixture[1].glob('.pending-*'))
+    else:
+        assert list(fixture[1].iterdir()) == []
+
+
+def test_attestation_cannot_change_or_extend_lease(monkeypatch):
+    evidence = iter([(200, b'one'), (200, b'two')])
+    monkeypatch.setattr(backup, 'maintenance_evidence', lambda: next(evidence))
+    linux = backup.Linux()
+    linux.authorized()
+    with pytest.raises(backup.Refused) as rejected:
+        linux.authorized()
+    assert rejected.value.code == 'maintenance_required'
+
+
+def test_linux_same_device_paths_and_rw_flags_are_simulated(monkeypatch):
+    # Exercise actual Linux methods rather than only the injected FakeLinux.
+    class FakePath(PurePosixPath):
+        def lstat(self):
+            return SimpleNamespace(st_dev=7)
+
+        stat = lstat
+
+    data, backups = FakePath('/root/FunPayFlow-data'), FakePath('/root/backups')
+    monkeypatch.setattr(backup, 'DATA', data)
+    monkeypatch.setattr(backup, 'BACKUPS', backups)
+    monkeypatch.setattr(backup, 'Path', FakePath)
+    monkeypatch.setattr(backup, 'protected', lambda *a: None)
+    monkeypatch.setattr(backup, 'secure_stat', lambda *a: None)
+    monkeypatch.setattr(backup, 'read_bounded', lambda *a:
+                        b'10 1 0:7 / / rw,relatime - ext4 /dev/fake rw,commit=30\n')
+    monkeypatch.setattr(backup, 'os', SimpleNamespace(
+        statvfs=lambda p: SimpleNamespace(f_flag=0), ST_RDONLY=1,
+        major=lambda dev: 0, minor=lambda dev: dev))
+    linux = backup.Linux()
+    linux.paths(data, backups)
+    linux.frozen(data)
+
+
+@pytest.mark.parametrize('fault', [None, 'file_limit', 'churn', 'hardlink', 'symlink', 'public'])
+def test_metadata_only_source_inode_walk(fixture, monkeypatch, fault):
+    data = fixture[0]
+    real_secure = backup.secure_stat
+
+    def synthetic_stat(s, directory):
+        real_secure(SimpleNamespace(st_uid=0, st_nlink=s.st_nlink,
+                    st_mode=(stat.S_IFLNK | 0o600 if fault == 'symlink' and not directory
+                             else stat.S_IFMT(s.st_mode) | (0o700 if directory else
+                                  0o644 if fault == 'public' else 0o600))), directory)
+
+    monkeypatch.setattr(backup, 'secure_stat', synthetic_stat)
+    monkeypatch.setattr(backup, 'consume', lambda *a: pytest.fail('payload read'))
+    if fault == 'file_limit':
+        monkeypatch.setattr(backup, 'MAX_ENTRIES', 1)
+    elif fault == 'hardlink':
+        os.link(data / 'progress.json', data / 'linked')
+    elif fault == 'churn':
+        original = backup.os.scandir
+
+        @contextmanager
+        def changing(path):
+            with original(path) as entries:
+                yield entries
+            if path == data:
+                (data / 'late-file').write_bytes(b'synthetic')
+
+        monkeypatch.setattr(backup.os, 'scandir', changing)
+    if fault:
+        with pytest.raises(backup.Refused):
+            backup.source_inodes(data)
+    else:
+        expected = {(p.stat().st_dev, p.stat().st_ino) for p in (data, *data.rglob('*'))}
+        assert backup.source_inodes(data) == expected
+
+
+def test_space_admission_accounts_for_wal_expansion(fixture, monkeypatch):
+    needed = []
+    monkeypatch.setattr(fixture[2], 'space', lambda path, count: needed.append(count))
+    assert run(fixture)['status'] == 'created'
+    assert needed[0] >= backup.MAX_FILE * 4 + backup.RESERVE
+
+
+def test_nested_persistent_settings_progress_and_history_preserved(fixture):
+    data = fixture[0]
+    (data / 'settings').mkdir()
+    (data / 'settings' / 'nested.json').write_bytes(b'{"synthetic_progress":2}')
+    (data / 'orders-history.json').write_bytes(b'[{"synthetic_order":1}]')
+    assert run(fixture)['status'] == 'created'
+    manifest = json.loads((fixture[2].published[0] / 'manifest.json').read_bytes())
+    for name in ('settings/nested.json', 'orders-history.json'):
+        assert manifest['entries'][name]['sha256'] == hashlib.sha256((data / name).read_bytes()).hexdigest()
 
 
 @pytest.mark.parametrize('missing', sorted(backup.REQUIRED))
@@ -363,7 +486,7 @@ def test_post_snapshot_rechecks(fixture, monkeypatch, change):
         elif change == 'service':
             fixture[2].status = 'active'
         else:
-            fixture[2].readonly = False
+            fixture[2].readonly = True
 
     monkeypatch.setattr(backup, 'archive_restore', changed)
     assert_failed(fixture)
@@ -481,7 +604,8 @@ def test_no_overwrite_or_retention_deletion(fixture, monkeypatch):
     (old / 'keep').write_bytes(b'old-backup-unchanged')
     assert_failed(fixture)
     assert (old / 'keep').read_bytes() == b'old-backup-unchanged'
-    assert list(fixture[1].iterdir()) == [old]
+    assert old in list(fixture[1].iterdir())
+    assert list(fixture[1].glob('.pending-*/bundle/data.tar'))
 
 
 def test_existing_pending_directory_never_reused(fixture, monkeypatch):
@@ -612,11 +736,16 @@ def test_trusted_installation_with_simulated_linux(monkeypatch, fault):
 
 
 @pytest.mark.parametrize('fault', [None, 'active', 'legacy_active', 'two_bots', 'unknown',
-                                 'writer', 'mapping', 'pid_changed', 'namespace'])
+                                 'writer', 'reader', 'mapping', 'readonly_mapping',
+                                 'unrelated_mapping', 'fd_path', 'mapped_path',
+                                 'cwd', 'pid_changed', 'namespace'])
 def test_linux_quiescence_apis_are_simulated(monkeypatch, fault):
     linux = backup.Linux()
-    metadata = SimpleNamespace(st_dev=7)
-    data = SimpleNamespace(stat=lambda: metadata)
+    metadata = SimpleNamespace(st_dev=7, st_ino=1 if fault in ('writer', 'reader') else 9)
+    data = PurePosixPath('/synthetic/data')
+    linux.evidence = (200,)
+    monkeypatch.setattr(linux, 'authorized', lambda: None)
+    monkeypatch.setattr(backup, 'source_inodes', lambda data: {(7, 1)})
     inactive = (b'LoadState=loaded\nActiveState=inactive\nSubState=dead\n'
                 b'MainPID=0\nControlPID=0\nJob=\n')
     probes = []
@@ -643,6 +772,10 @@ def test_linux_quiescence_apis_are_simulated(monkeypatch, fault):
         value = str(path).replace('\\', '/')
         if '/ns/' in value:
             return 'other' if fault == 'namespace' and '/self/' in value else 'namespace'
+        if fault == 'cwd' and value.endswith('/cwd'):
+            return '/synthetic/data'
+        if fault == 'fd_path' and value == 'synthetic-fd':
+            return '/synthetic/data/not-yet-in-inventory (deleted)'
         return '/usr/bin/synthetic-idle'
 
     @contextmanager
@@ -651,7 +784,7 @@ def test_linux_quiescence_apis_are_simulated(monkeypatch, fault):
 
     monkeypatch.setattr(backup, 'os', SimpleNamespace(
         readlink=readlink, stat=lambda *a, **kw: metadata, scandir=scandir,
-        getpid=lambda: 100, makedev=lambda a, b: b, fsencode=os.fsencode,
+        getpid=lambda: 100, makedev=lambda a, b: b, fsencode=os.fsencode, fsdecode=os.fsdecode,
         O_ACCMODE=3, O_RDONLY=0))
 
     def read(path, maximum):
@@ -667,11 +800,16 @@ def test_linux_quiescence_apis_are_simulated(monkeypatch, fault):
         if '/fdinfo/' in value:
             return b'flags:\t02\n' if fault == 'writer' else b'flags:\t00\n'
         if value.endswith('/maps'):
-            return b'0-1 rw-s 0000 00:07 1 /synthetic' if fault == 'mapping' else b''
+            if fault == 'unrelated_mapping':
+                return b'0-1 rw-s 0000 00:07 9 /var/log/synthetic'
+            if fault == 'mapped_path':
+                return b'0-1 rw-s 0000 00:07 9 /synthetic/data/new-file (deleted)'
+            return (b'0-1 r--s 0000 00:07 1 /synthetic' if fault == 'readonly_mapping'
+                    else b'0-1 rw-s 0000 00:07 1 /synthetic' if fault == 'mapping' else b'')
         raise AssertionError('unexpected fake API')
 
     monkeypatch.setattr(backup, 'read_bounded', read)
-    if fault is None:
+    if fault in (None, 'unrelated_mapping'):
         linux.quiescent(data)
         assert probes == list(backup.UNITS)
     else:
@@ -835,15 +973,18 @@ def test_process_aliases_and_unidentified_python_refuse(command):
         backup.process_safe(command)
 
 
-def test_readonly_mount_requires_filesystem_ro_not_bind_only():
-    good = b'10 1 8:2 / /root/FunPayFlow-data ro - ext4 /dev/fake ro\n'
+def test_single_rw_ext4_root_mount():
+    good = b'10 1 8:2 / / rw,relatime - ext4 /dev/fake rw,commit=30\n'
     backup.frozen_mount(good, '8:2')
-    bad = [good.replace(b'fake ro', b'fake rw'),
-           good.replace(b'data ro', b'data rw'),
-           good.replace(b'/ /root', b'/subdir /root'),
+    bad = [good.replace(b'fake rw', b'fake ro'),
+           good.replace(b'/ rw', b'/ ro'),
+           good.replace(b'/ / rw', b'/subdir / rw'),
            good.replace(b'ext4', b'nfs'),
+           good.replace(b'ext4', b'xfs'),
            good + b'11 1 8:2 / /alias rw - ext4 /dev/fake rw\n',
            good + b'11 10 8:3 / /root/FunPayFlow-data/nested ro - ext4 /dev/fake ro\n',
+           good + b'11 10 8:3 / /root/backups rw - ext4 /dev/other rw\n',
+           good + b'11 10 8:3 / /root rw - ext4 /dev/other rw\n',
            b'', b'invalid']
     for value in bad:
         with pytest.raises(backup.Refused):
@@ -858,6 +999,155 @@ def test_trust_permission_policy(kind, mode, uid, links):
     s = SimpleNamespace(st_mode=kind | mode, st_uid=uid, st_nlink=links)
     with pytest.raises(backup.Refused):
         backup.secure_stat(s, kind == stat.S_IFDIR, private=False)
+
+
+@pytest.mark.parametrize('fault', [
+    None, 'missing', 'untrusted_coordinator', 'untrusted_helper', 'parent', 'dead',
+    'namespace', 'exe', 'command', 'uid', 'gid', 'public', 'hardlink', 'symlink',
+    'fd_inode', 'lock_absent', 'lock_shared', 'lock_other_pid', 'lock_wrong_inode',
+    'unlocked', 'lock_replaced', 'changed', 'expired', 'long_lease', 'wrong_boot',
+    'wrong_pid', 'wrong_start', 'wrong_parent_start', 'wrong_digest', 'extra',
+    'duplicate', 'services_uninhibited', 'writers_not_quiescent', 'no_recovery',
+    'boolean_version', 'numeric_inhibition',
+])
+def test_live_coordinator_authorization_protocol(monkeypatch, fault):
+    # All /proc, descriptors, ownership, flock and time here are synthetic.
+    # No parent inspection, real process scan or real maintenance file is used.
+    base_os = backup.os
+    lock_stat = SimpleNamespace(st_dev=7, st_ino=42, st_uid=0, st_nlink=1,
+                               st_mode=stat.S_IFREG | 0o600, st_size=200,
+                               st_mtime_ns=1, st_ctime_ns=1)
+    lstat_calls = 0
+
+    class FakePath(PurePosixPath):
+        def resolve(self):
+            return self
+
+        def lstat(self):
+            nonlocal lstat_calls
+            values = dict(vars(lock_stat))
+            if str(self) == '/run/funpayflow-maintenance':
+                values['st_mode'] = stat.S_IFDIR | 0o700
+            if self.name == 'backup.json':
+                lstat_calls += 1
+                if fault == 'missing':
+                    raise FileNotFoundError
+                if fault == 'public':
+                    values['st_mode'] |= 0o004
+                if fault == 'hardlink':
+                    values['st_nlink'] = 2
+                if fault == 'symlink':
+                    values['st_mode'] = stat.S_IFLNK | 0o600
+                if fault == 'changed' and lstat_calls >= 3:
+                    values['st_mtime_ns'] += 1
+            return SimpleNamespace(**values)
+
+    paths = ('DATA', 'BACKUPS', 'INSTALLED', 'RECEIPT', 'COORDINATOR',
+             'COORDINATOR_RECEIPT', 'MAINTENANCE', 'AUTHORIZATION', 'MAINTENANCE_LOCK')
+    for name in paths:
+        monkeypatch.setattr(backup, name, FakePath(getattr(backup, name).as_posix()))
+    monkeypatch.setattr(backup, 'Path', FakePath)
+    monkeypatch.setattr(backup, 'protected', lambda *a, **kw: None)
+
+    def pin(script, receipt):
+        if (fault == 'untrusted_coordinator' and script == backup.COORDINATOR
+                or fault == 'untrusted_helper' and script == backup.INSTALLED):
+            raise backup.Refused()
+        return 'a' * 64 if script == backup.INSTALLED else 'b' * 64
+
+    monkeypatch.setattr(backup, 'pinned_digest', pin)
+    monkeypatch.setattr(backup, 'sys', SimpleNamespace(executable='/usr/bin/python3.13'))
+    now = 10**10
+    boot = '11111111-1111-1111-1111-111111111111'
+    evidence = dict(version=1, helper_pid=101, helper_start=300,
+                    coordinator_pid=100, coordinator_start=200,
+                    helper_sha256='a' * 64, coordinator_sha256='b' * 64,
+                    boot_id=boot, expires_boottime_ns=now + backup.SECONDS * 10**9,
+                    units=list(backup.UNITS), data=str(backup.DATA), backups=str(backup.BACKUPS),
+                    services_inhibited=True, writers_quiescent=True, recovery_armed=True)
+    changes = {
+        'expired': ('expires_boottime_ns', now),
+        'long_lease': ('expires_boottime_ns', now + 1000 * 10**9),
+        'wrong_boot': ('boot_id', 'old-boot'), 'wrong_pid': ('helper_pid', 102),
+        'wrong_start': ('helper_start', 301),
+        'wrong_parent_start': ('coordinator_start', 201),
+        'wrong_digest': ('helper_sha256', 'c' * 64), 'extra': ('extra', True),
+        'services_uninhibited': ('services_inhibited', False),
+        'writers_not_quiescent': ('writers_quiescent', False),
+        'no_recovery': ('recovery_armed', False),
+        'boolean_version': ('version', True),
+        'numeric_inhibition': ('services_inhibited', 1),
+    }
+    if fault in changes:
+        key, value = changes[fault]
+        evidence[key] = value
+    raw = json.dumps(evidence, sort_keys=True, separators=(',', ':')).encode()
+    if fault == 'duplicate':
+        raw = b'{"version":0,' + raw[1:]
+
+    def proc_stat(pid, parent, start):
+        return str(pid).encode() + b' (synthetic name) ' + b' '.join(
+            [b'Z' if fault == 'dead' else b'S', str(parent).encode()]
+            + [b'0'] * 17 + [str(start).encode()])
+
+    lock = b'lock:\t1: FLOCK ADVISORY WRITE 100 00:07:42 0 EOF\n'
+    for kind, old, new in [('lock_shared', b'WRITE', b'READ'),
+                           ('lock_other_pid', b'100', b'999'),
+                           ('lock_wrong_inode', b':42', b':43')]:
+        if fault == kind:
+            lock = lock.replace(old, new)
+
+    def read(path, maximum):
+        value = str(path)
+        if value == '/proc/101/stat':
+            return proc_stat(101, 99 if fault == 'parent' else 100, 300)
+        if value == '/proc/100/stat':
+            return proc_stat(100, 1, 200)
+        if value == '/proc/100/cmdline':
+            return (b'forbidden' if fault == 'command' else
+                    b'/usr/bin/python3.13\0-I\0-S\0' + bytes(backup.COORDINATOR)
+                    + b'\0maintain-backup\0')
+        if value == '/proc/100/status':
+            return (b'Uid:\t0\t0\t0\t1000\n' if fault == 'uid' else b'Uid:\t0\t0\t0\t0\n') + (
+                b'Gid:\t0\t0\t0\t1000\n' if fault == 'gid' else b'Gid:\t0\t0\t0\t0\n')
+        if value == '/proc/self/fdinfo/3':
+            return b'' if fault == 'lock_absent' else lock
+        if value == str(backup.AUTHORIZATION):
+            return raw
+        if value == '/proc/sys/kernel/random/boot_id':
+            return boot.encode()
+        raise AssertionError('unexpected synthetic read')
+
+    def readlink(path):
+        if str(path).endswith('/exe'):
+            return '/untrusted/python' if fault == 'exe' else '/usr/bin/python3.13'
+        return 'other' if fault == 'namespace' and '/100/' in str(path) else 'same'
+
+    def fstat(fd):
+        if fault == 'fd_inode' and fd == 3 or fault == 'lock_replaced' and fd == 4:
+            return SimpleNamespace(**(vars(lock_stat) | {'st_ino': 43}))
+        return lock_stat
+
+    def flock(fd, flags):
+        assert fd == 4 and flags == 6
+        if fault != 'unlocked':
+            raise BlockingIOError
+
+    monkeypatch.setitem(sys.modules, 'fcntl', SimpleNamespace(flock=flock, LOCK_EX=2, LOCK_NB=4))
+    monkeypatch.setattr(backup, 'read_bounded', read)
+    monkeypatch.setattr(backup, 'time', SimpleNamespace(clock_gettime_ns=lambda clock: now,
+                                                      CLOCK_BOOTTIME=7))
+    monkeypatch.setattr(backup, 'os', SimpleNamespace(
+        name=base_os.name, getpid=lambda: 101, getppid=lambda: 100, fstat=fstat,
+        readlink=readlink, fsdecode=os.fsdecode, major=lambda dev: 0, minor=lambda dev: dev,
+        open=lambda *a: 4, close=lambda fd: None, O_RDONLY=0, O_NOFOLLOW=1, O_NONBLOCK=2))
+    if fault is None:
+        result = backup.maintenance_evidence()
+        assert result[:2] == (100, raw)
+    else:
+        with pytest.raises(backup.Refused) as rejected:
+            backup.maintenance_evidence()
+        assert rejected.value.code == 'maintenance_required'
 
 
 def test_no_import_side_effects_or_network_bot_gui():
@@ -876,3 +1166,11 @@ def test_no_import_side_effects_or_network_bot_gui():
                                        'restart', 'reload', 'start', 'stop'}
                    for n in ast.walk(tree))
     spec.loader.exec_module(importlib.util.module_from_spec(spec))
+    evidence = ast.parse(SCRIPT.read_text(encoding='utf-8'))
+    # Only the destination backup lock may be created by the helper. The
+    # coordinator protocol has no write, mkdir, token generation or command run.
+    function = next(n for n in evidence.body if isinstance(n, ast.FunctionDef)
+                    and n.name == 'maintenance_evidence')
+    assert not any(isinstance(n, ast.Attribute) and n.attr in
+                   {'write', 'write_bytes', 'mkdir', 'O_CREAT', 'Popen', 'run', 'uuid4'}
+                   for n in ast.walk(function))
