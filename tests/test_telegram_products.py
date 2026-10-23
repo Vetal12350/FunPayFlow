@@ -92,6 +92,128 @@ def database_snapshot(ctx):
         return '\n'.join(db.iterdump())
 
 
+def test_compact_menus_and_legacy_entries(context):
+    ctx = context
+
+    async def run():
+        cb = callback()
+        for action, expected in [
+            ('products', [
+                ('➕ Создать товар', 'prd:types'),
+                ('📝 Мои черновики', 'prd:drafts:0'),
+                ('⚙️ Дополнительно', 'prd:advanced'),
+                ('🔙 Главное меню', 'menu_main'),
+            ]),
+            ('prd:advanced', [
+                ('🗺 Категории и маршруты', 'prd:choose:routes:0'),
+                ('🧩 Шаблоны оформления', 'prd:templates:0'),
+                ('📚 Массовое создание черновиков', 'prd:choose:bulk:0'),
+                ('➕ Расширенное создание', 'prd:choose:single:0'),
+                ('📝 Из существующего лота', 'lot_templates'),
+                ('🔙 Лоты', 'products'),
+            ]),
+        ]:
+            await view.products_callback(cb, action, 1)
+            shown = cb.message.edit_text.call_args
+            rows = shown.kwargs['reply_markup'].inline_keyboard
+            assert [[(b.text, b.callback_data) for b in row] for row in rows] == [
+                [button] for button in expected]
+            assert 'локальные черновики' in shown.args[0]
+            assert 'публикация funpay пока отключена' in shown.args[0].lower()
+            assert not any(word in shown.args[0] for word in ('Template', 'Route', 'variables'))
+        for action, title in [('prd:drafts:0', 'drafts'),
+                              ('prd:templates:0', 'Product Templates'),
+                              ('prd:choose:single:0', 'Выберите Product Template'),
+                              ('prd:choose:bulk:0', 'Выберите Product Template'),
+                              ('prd:choose:routes:0', 'Выберите Product Template')]:
+            await view.products_callback(cb, action, 1)
+            assert title in cb.message.edit_text.call_args.args[0]
+        assert not await view.products_callback(cb, 'lot_templates', 1)  # Existing lots handler owns it.
+        await view.products_callback(cb, 'prd:types', 1)
+        rows = cb.message.edit_text.call_args.kwargs['reply_markup'].inline_keyboard
+        assert len(rows) == 8 and rows[0][0].callback_data.endswith(':GAME_KEY')
+        ctx.client.account.method.assert_not_called()
+        ctx.client.account.get_user.assert_not_called()
+        ctx.client.account.save_lot.assert_not_called()
+        assert ctx.store.list_drafts() == []
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize('navigation', ['prd:advanced', 'products', 'prd:home'])
+def test_menu_navigation_abandons_route_form_and_type_tokens(context, navigation):
+    ctx = context
+    route = seed_route(ctx)
+
+    async def run():
+        cb, action = await route_form_button(ctx, route)
+        before = database_snapshot(ctx)
+        await view.products_callback(cb, navigation, 1)
+        assert 1 not in view._flows and 1 not in ui._interaction_state
+        await view.products_callback(cb, action, 1)
+        assert 'устарел' in str(cb.message.answer.call_args)
+        await view.products_callback(cb, 'prd:types', 1)
+        preset = f"prd:preset:{view._flows[1]['type_token']}:GAME_KEY"
+        await view.products_callback(cb, navigation, 1)
+        await view.products_callback(cb, preset, 1)
+        assert 1 not in view._flows
+        assert database_snapshot(ctx) == before
+        ctx.client.account.method.assert_not_called()
+        ctx.client.account.save_lot.assert_not_called()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize('bulk', [False, True])
+def test_advanced_abandons_draft_confirmation(context, bulk):
+    ctx = context
+    route = seed_route(ctx)
+
+    async def run():
+        if bulk:
+            cb = await pick(ctx, 'bulk')
+            preview = ctx.drafts.preview_bulk(ctx.template['id'], 'Elden Ring | 10', {})
+            batch = ctx.drafts.stage(preview['previews'])
+            view._flows[1]['batch_token'] = batch['token']
+            action = 'prd:confirm:' + batch['token']
+        else:
+            cb = await fill_variables(ctx, route)
+            await view.products_input(message('10'), 1)
+            action = preview_action('prd:save')
+        before = database_snapshot(ctx)
+        ctx.client.account.method.reset_mock()
+        await view.products_callback(cb, 'prd:advanced', 1)
+        assert 1 not in view._flows and 1 not in ui._interaction_state
+        assert not await view.products_input(message('20'), 1)
+        await view.products_callback(cb, 'products', 1)
+        cb.message.answer.reset_mock()
+        await view.products_callback(cb, action, 1)
+        cb.message.answer.assert_called_once()
+        assert 'Ничего не опубликовано' in cb.message.answer.call_args.args[0]
+        assert database_snapshot(ctx) == before and ctx.store.list_drafts() == []
+        ctx.client.account.method.assert_not_called()
+        ctx.client.account.save_lot.assert_not_called()
+
+    asyncio.run(run())
+
+
+def test_advanced_rejects_nonowner_without_discarding_owner_input(context):
+    async def run():
+        cb = await pick(context, 'bulk')
+        flow = view._flows[1]
+        pending = ui._interaction_state[1]
+        for caller, target in [(2, 2), (2, 1)]:
+            cb.from_user.id = caller
+            await view.products_callback(cb, 'prd:advanced', target)
+            assert cb.answer.call_args.kwargs.get('show_alert')
+            assert view._flows[1] is flow and ui._interaction_state[1] is pending
+            assert 2 not in view._flows
+        context.client.account.method.assert_not_called()
+        context.client.account.save_lot.assert_not_called()
+
+    asyncio.run(run())
+
+
 def test_route_form_explicit_get_sanitized_metadata_and_no_mutations(context):
     ctx = context
     route = seed_route(ctx, 1)
@@ -447,7 +569,7 @@ def test_quick_entry_saved_routes_custom_template_and_cancel(context):
     async def run():
         cb = callback()
         await view.products_callback(cb, 'products', 1)
-        assert '⚡ Быстрый черновик' in str(cb.message.edit_text.call_args)
+        assert 'prd:quick' not in str(cb.message.edit_text.call_args)
         await view.products_callback(cb, 'prd:quick', 1)
         shown = str(cb.message.edit_text.call_args)
         assert all(route['game_name'] in shown for route in routes)
@@ -782,7 +904,8 @@ def test_global_cancel_back_stale_confirmation_and_owner_guard(context):
         await pick(ctx, 'routes')
         await ui.callback_handler(callback('menu_main'))
         assert 1 not in view._flows
-        assert 'lot_templates' in str(view._home()[1])
+        await view.products_callback(cb, 'prd:advanced', 1)
+        assert 'lot_templates' in str(cb.message.edit_text.call_args)
 
     asyncio.run(run())
 
