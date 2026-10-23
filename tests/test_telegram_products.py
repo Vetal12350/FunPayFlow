@@ -223,6 +223,8 @@ def test_route_form_explicit_get_sanitized_metadata_and_no_mutations(context):
     def response(*args, **kwargs):
         assert ctx.client._account_lock._is_owned()
         result = fake_get(*args, **kwargs)
+        result.content = result.content.replace(b'class="form-offer-editor"',
+            b'class="form-offer-editor" action="/lots/offerSave" method="post"')
         result.content = result.content.replace(b'Global', canary.encode())
         result.content = result.content.replace(b'</form>',
             f'<input type="hidden" name="csrf_token" value="{canary}"></form>'.encode())
@@ -240,6 +242,11 @@ def test_route_form_explicit_get_sanitized_metadata_and_no_mutations(context):
         shown = str(cb.message.answer.call_args_list)
         assert 'Каталог 201 · node 101' in shown and 'доступна' in shown
         assert 'SELECT-полей: 4 (метаданные)' in shown
+        assert 'ответ этого GET (свежесть не доказана)' in shown
+        assert 'кандидат NEW; создание НЕ доказано' in shown
+        assert 'CSRF: признак есть; свежесть и авторизация НЕ доказаны' in shown
+        assert 'Ручная выдача: НЕ проверена' in shown
+        assert 'Контракт отправки: НЕ проверен' in shown and 'ID результата: НЕ проверен' in shown
         assert 'публикация НЕ проверена' in shown
         assert 'редиректам' in shown and '900' in shown
         for forbidden in (canary, 'fields[', 'Steam', 'csrf_token', 'https://', 'Traceback'):
@@ -388,10 +395,15 @@ def test_route_form_cache_reuse_and_expiry(context, monkeypatch):
     async def run():
         cb, action = await route_form_button(ctx, route)
         await view.products_callback(cb, action, 1)
+        assert 'ответ этого GET' in cb.message.answer.call_args.args[0]
         now[0] += 899
         cb, action = await route_form_button(ctx, route)
         await view.products_callback(cb, action, 1)
         assert ctx.client.account.method.call_count == 1
+        shown = cb.message.answer.call_args.args[0]
+        assert 'кеш до 900 с; текущая структура неизвестна' in shown
+        assert 'Контекст NEW: неизвестен' in shown and 'CSRF: неизвестно / неоднозначно' in shown
+        assert 'ответ этого GET' not in shown
         now[0] += 2
         cb, action = await route_form_button(ctx, route)
         ctx.client.account.method.side_effect = RuntimeError('Synthetic failure')
@@ -399,6 +411,49 @@ def test_route_form_cache_reuse_and_expiry(context, monkeypatch):
         assert ctx.client.account.method.call_count == 2
         assert 'не удалось прочитать' in str(cb.message.answer.call_args)
     asyncio.run(run())
+
+
+@pytest.mark.parametrize('change', ['account', 'route', 'template', 'owner', 'navigation'])
+def test_route_form_revalidates_after_response_before_showing_evidence(context, monkeypatch, change):
+    ctx = context
+    route = seed_route(ctx)
+    fake_get = ctx.client.account.method.side_effect
+
+    def response(*args, **kwargs):
+        result = fake_get(*args, **kwargs)
+        if change == 'account':
+            ctx.client.account.id = 43
+        elif change == 'route':
+            ctx.store.save_route(dict(route, game_aliases=['Changed']), expected_revision=route['revision'])
+        elif change == 'template':
+            ctx.templates.save(dict(ctx.template, display_name='Changed'), ctx.template['id'], ctx.template['revision'])
+        elif change == 'owner':
+            monkeypatch.setattr(ui, '_owner_id', lambda user_id: False)
+        else:
+            view._flows.clear()
+        return result
+
+    ctx.client.account.method.side_effect = response
+
+    async def run():
+        cb, action = await route_form_button(ctx, route)
+        await view.products_callback(cb, action, 1)
+        shown = cb.message.answer.call_args.args[0]
+        assert 'устарел' in shown and 'Источник:' not in shown
+        ctx.client.account.method.assert_called_once()
+        ctx.client.account.save_lot.assert_not_called()
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize('bad', [
+    {'source': 'SYNTHETIC_PRIVATE_VALUE'},
+    dict(view.safe_form_evidence(), csrf_input_presence='SYNTHETIC_PRIVATE_VALUE'),
+    dict(view.safe_form_evidence(), hidden_name='SYNTHETIC_PRIVATE_VALUE'),
+])
+def test_route_form_ui_revalidates_evidence_and_never_interpolates_unknown_values(bad):
+    shown = view._route_form_evidence_text(bad)
+    assert 'SYNTHETIC_PRIVATE' not in shown and 'hidden_name' not in shown
+    assert 'Источник: неизвестен' in shown and 'Контекст NEW: неизвестен' in shown
 
 
 @pytest.mark.parametrize('kind', [kind for kind, _ in BUILTIN_TYPES if kind != 'GAME_KEY'])

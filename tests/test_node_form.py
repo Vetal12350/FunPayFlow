@@ -1,6 +1,7 @@
 """Offline synthetic form parsing, GET-only contract, and scoped cache tests."""
 
 import json
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import threading
 from types import SimpleNamespace
@@ -9,7 +10,7 @@ import pytest
 from bs4 import BeautifulSoup
 from requests.exceptions import Timeout
 
-from funpayflow.node_form import NodeFormError, NodeFormService, parse_node_form
+from funpayflow.node_form import NodeFormError, NodeFormService, parse_node_form, safe_form_evidence
 
 
 FIXTURES = Path(__file__).parent / "fixtures" / "node_forms"
@@ -501,3 +502,208 @@ def test_visible_service_selects_are_never_retained(name):
     assert actual['fields'] == original['fields']
     assert actual['fingerprint'] == original['fingerprint']
     assert 'SYNTHETIC_PRIVATE' not in json.dumps(actual)
+
+
+def evidence_form(extra='', offer='0'):
+    return form().replace('class="form-offer-editor"',
+        'class="form-offer-editor" action="/lots/offerSave" method="post"').replace(
+        '</form>', f'<input type="hidden" name="offer_id" value="{offer}">{extra}</form>')
+
+
+@pytest.mark.parametrize('offer', ['', '0'])
+@pytest.mark.parametrize('csrf', [False, True])
+def test_transient_form_evidence_single_get_and_no_hidden_cache_data(service, monkeypatch, offer, csrf):
+    private = 'SYNTHETIC_PRIVATE_VALUE'
+    extra = f'<input type="hidden" name="csrf_token" value="{private}">' if csrf else ''
+    html = ('<body data-app-data=\'{"userId":10,"csrf-token":"SYNTHETIC_APP_PRIVATE"}\'>'
+            + evidence_form(extra, offer) + '</body>')
+    service.client.account.response.content = html.encode()
+    logs = []
+    monkeypatch.setattr('funpayflow.node_form.logger.warning', logs.append)
+    schema, evidence = service.get_with_evidence(976)
+    assert evidence == dict(source='response', controls='recognized', new_form_context='candidate',
+        csrf_input_presence='present' if csrf else 'absent', manual_delivery='unverified',
+        submit_contract='unverified', response_id='unverified')
+    ordinary = parse_node_form(html, 976)
+    assert schema.keys() == ordinary.keys()
+    assert schema['fields'] == ordinary['fields'] and schema['fingerprint'] == ordinary['fingerprint']
+    assert service.get(976) == schema
+    cached_schema, cached = service.get_with_evidence(976)
+    assert cached_schema == schema and cached == dict(safe_form_evidence(), source='cache')
+    evidence['new_form_context'] = private
+    assert service.get_with_evidence(976)[1] == cached
+    entry = next(iter(service.client._node_form_cache.values()))
+    assert set(entry) == {'account', 'expires', 'schema'}
+    retained = json.dumps([schema, entry['schema'], cached, logs])
+    for forbidden in (private, 'SYNTHETIC_APP_PRIVATE', 'csrf_token', 'offer_id', 'controls', 'new_form_context'):
+        assert forbidden not in json.dumps([schema, entry['schema'], logs])
+    assert private not in retained
+    assert len(service.client.account.calls) == 1 and logs == []
+    service.test_clock[0] += 899
+    assert service.get_with_evidence(976)[1] == cached
+    service.test_clock[0] += 1
+    assert service.get_with_evidence(976)[1]['source'] == 'response'
+    assert len(service.client.account.calls) == 2
+
+
+def test_evidence_does_not_refresh_an_ordinary_cached_schema(service):
+    first = service.get(976)
+    schema, evidence = service.get_with_evidence(976)
+    assert schema == first and evidence == dict(safe_form_evidence(), source='cache')
+    assert len(service.client.account.calls) == 1
+
+
+@pytest.mark.parametrize('extra', [
+    '<input type="hidden" name="SYNTHETIC_PRIVATE_NAME" value="SYNTHETIC_PRIVATE_VALUE">',
+    '<input type="hidden" name="csrf_token" value="x"><input type="hidden" name="csrf_token" value="y">',
+    '<input type="hidden" name="token" value="SYNTHETIC_PRIVATE_VALUE">',
+    '<input type="hidden" value="SYNTHETIC_PRIVATE_VALUE">',
+    '<input type="hidden" name="csrf_token">',
+    '<input type="text" name="csrf_token" value="x">',
+    '<input type="hidden" name="node" value="976">',
+    '<input type="hidden" name="offer" value="0">',
+    '<input type="hidden" name="csrf_token" value="x" disabled>',
+    '<input type="hidden" name="csrf_token" value="x" form="other">',
+    '<input type="hidden" name="csrf_token" name="csrf_token" value="x">',
+    '<button formaction="https://example.invalid/SYNTHETIC_PRIVATE_VALUE">Send</button>',
+    '<script>SYNTHETIC_PRIVATE_VALUE</script>',
+    '<template><input type="hidden" name="csrf_token" value="x"></template>',
+    '<input name="price" onclick="SYNTHETIC_PRIVATE_VALUE">',
+    '<input name="price"/><input name="price">',
+    '<fieldset><input name="price"></div>',
+    '<object name="SYNTHETIC_PRIVATE_NAME"></object>',
+])
+def test_unknown_duplicate_malformed_controls_fail_closed_without_changing_schema(service, extra):
+    html = evidence_form(extra)
+    ordinary = parse_node_form(html, 976)
+    service.client.account.response.content = html.encode()
+    schema, evidence = service.get_with_evidence(976)
+    assert evidence == dict(safe_form_evidence(), source='response')
+    assert schema['fields'] == ordinary['fields'] and schema['fingerprint'] == ordinary['fingerprint']
+    assert 'SYNTHETIC_PRIVATE' not in json.dumps([schema, evidence])
+    assert len(service.client.account.calls) == 1
+
+
+@pytest.mark.parametrize('old,new', [
+    (' action="/lots/offerSave"', ''), (' method="post"', ''),
+    ('name="offer_id"', 'name="offer_id_missing"'),
+    ('<input type="hidden" name="offer_id" value="0">', ''),
+    ('<input type="hidden" name="node_id" value="976">', ''),
+    ('</form>', ''), ('method="post"', 'method="get"'),
+    ('action="/lots/offerSave"', 'action="http://funpay.com/lots/offerSave"'),
+    ('action="/lots/offerSave"', 'action="lots/offerSave"'),
+    ('action="/lots/offerSave"', 'action="https:/lots/offerSave"'),
+])
+def test_missing_or_ambiguous_new_identity_is_unknown(service, old, new):
+    service.client.account.response.content = evidence_form().replace(old, new).encode()
+    _, evidence = service.get_with_evidence(976)
+    assert evidence['new_form_context'] == 'unknown'
+
+
+@pytest.mark.parametrize('extra', ['', '<input type="checkbox" name="auto_delivery">',
+                                 '<input type="checkbox" name="auto_delivery" checked>'])
+def test_delivery_presence_never_proves_manual_mode(service, extra):
+    service.client.account.response.content = evidence_form(extra).encode()
+    _, evidence = service.get_with_evidence(976)
+    assert evidence['manual_delivery'] == evidence['submit_contract'] == evidence['response_id'] == 'unverified'
+
+
+@pytest.mark.parametrize('failure,reason', [
+    ('edit', 'OFFER_CONTEXT'), ('duplicate_offer', 'OFFER_CONTEXT'),
+    ('node', 'NODE_CONTEXT'), ('user', 'APP_USER_SCOPE'), ('login', 'LOGIN_PAGE'),
+    ('url_auth', 'URL_AUTH'), ('redirect', 'HTTP_REDIRECT'), ('url_node', 'URL_NODE'),
+    ('url_offer', 'URL_OFFER'), ('action', 'FORM_ACTION'), ('transport', 'REQUEST_TRANSPORT'),
+])
+def test_evidence_preserves_existing_rejections_and_safe_errors(service, monkeypatch, failure, reason):
+    private = 'SYNTHETIC_PRIVATE_VALUE'
+    response = service.client.account.response
+    html = evidence_form(f'<input type="hidden" name="csrf_token" value="{private}">')
+    if failure == 'edit':
+        html = html.replace('name="offer_id" value="0"', 'name="offer_id" value="123"')
+    elif failure == 'duplicate_offer':
+        html = html.replace('</form>', '<input name="offer_id" value="0"></form>')
+    elif failure == 'node':
+        html = html.replace('value="976"', 'value="986"')
+    elif failure == 'user':
+        html = '<body data-app-data=\'{"userId":11}\'>' + html + '</body>'
+    elif failure == 'login':
+        html += '<input type="password">'
+    elif failure == 'url_auth':
+        response.url = 'https://funpay.com/account/login?' + private
+    elif failure == 'redirect':
+        response.status_code = 302
+    elif failure == 'url_node':
+        response.url = 'https://funpay.com/lots/offerEdit?node=986'
+    elif failure == 'url_offer':
+        response.url += '&offer=' + private
+    elif failure == 'action':
+        html = html.replace('/lots/offerSave', 'https://example.invalid/' + private)
+    else:
+        service.client.account.failure = Timeout(private)
+    response.content = html.encode()
+    logs = []
+    monkeypatch.setattr('funpayflow.node_form.logger.warning', logs.append)
+    with pytest.raises(NodeFormError) as exc:
+        service.get_with_evidence(976)
+    assert exc.value.reason == reason
+    assert exc.value.__suppress_context__ is True
+    assert private not in str(exc.value) + repr(exc.value) + json.dumps(exc.value.diagnostic) + str(logs)
+    assert service.client._node_form_cache == {} and len(service.client.account.calls) == 1
+
+
+@pytest.mark.parametrize('url', [None, 'http://funpay.com/lots/offerEdit?node=976',
+    'https://funpay.com/lots/offerEdit?node=976&private=SYNTHETIC_PRIVATE_VALUE'])
+def test_evidence_stricter_url_context_does_not_change_ordinary_parser(service, url):
+    service.client.account.response.url = url
+    service.client.account.response.content = evidence_form().encode()
+    schema, evidence = service.get_with_evidence(976)
+    assert schema['fields'] and evidence == dict(safe_form_evidence(), source='response')
+
+
+@pytest.mark.parametrize('invalid', [None, [], {'source': 'response'},
+    dict(safe_form_evidence(), controls=True), dict(safe_form_evidence(), response_id='SYNTHETIC_PRIVATE_VALUE'),
+    dict(safe_form_evidence(), secret='SYNTHETIC_PRIVATE_VALUE')])
+def test_form_evidence_is_a_strict_fixed_enum_contract(invalid):
+    assert safe_form_evidence(invalid) == safe_form_evidence()
+
+
+def test_form_evidence_cannot_upgrade_cache_or_unknown_controls():
+    for update in ({'source': 'cache', 'controls': 'recognized'}, {'source': 'response'}):
+        value = dict(safe_form_evidence(), new_form_context='candidate', csrf_input_presence='present', **update)
+        clean = safe_form_evidence(value)
+        assert clean['new_form_context'] == 'unknown' and clean['csrf_input_presence'] == 'ambiguous'
+
+
+def test_concurrent_evidence_calls_share_one_account_get(service):
+    service.client.account.response.content = evidence_form().encode()
+    barrier = threading.Barrier(2)
+    method = service.client.account.method
+
+    def locked_get(*args, **kwargs):
+        assert service.client._account_lock._is_owned()
+        return method(*args, **kwargs)
+
+    service.client.account.method = locked_get
+
+    def read():
+        barrier.wait(timeout=5)
+        return NodeFormService(service.client, service.store, clock=service.clock).get_with_evidence(976)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        pending = [pool.submit(read) for _ in range(2)]
+        results = [future.result(timeout=5) for future in pending]
+    assert results[0][0] == results[1][0]
+    assert {result[1]['source'] for result in results} == {'response', 'cache'}
+    assert service.client.account.calls == [
+        (('get', 'lots/offerEdit?node=976', {'accept-language': 'ru'}, {}), {'raise_not_200': True})]
+
+
+def test_failed_evidence_read_after_expiry_does_not_fall_back_or_retry(service):
+    schema = service.get(976)
+    service.test_clock[0] += 900
+    service.client.account.failure = Timeout('SYNTHETIC_PRIVATE')
+    with pytest.raises(NodeFormError):
+        service.get_with_evidence(976)
+    assert len(service.client.account.calls) == 2 and not service.client._node_form_cache
+    service.client.account.failure = None
+    assert service.get(976)['generation'] != schema['generation']

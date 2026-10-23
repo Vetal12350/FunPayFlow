@@ -13,7 +13,7 @@ from .product_store import ProductStore
 from .product_templates import TemplateService, default_template, validate_overrides, validate_variable_value, BUILTIN_TYPES
 from .product_drafts import validate_price
 from .node_products import NodeDraftService, LEGACY_NODE_VARIABLES, LEGACY_WARNING, STALE_WARNING, NodeSelectionError, NodeVariantConflictError, VARIANT_WARNING
-from .node_form import NodeFormError, NodeFormService
+from .node_form import NodeFormError, NodeFormService, safe_form_evidence
 from . import telegram_node_fields as node_ui
 from .product_variants import VariantService
 from .state import StateError
@@ -348,13 +348,14 @@ async def _check_route_form(callback, user_id, parts, store, templates, routes):
         # Validate again after acquiring the same lock used by all Account work.
         with routes.client._account_lock:
             current()
-            schema = NodeFormService(routes.client, store).get(state['route']['node_id'])
+            schema, evidence = NodeFormService(routes.client, store).get_with_evidence(state['route']['node_id'])
             current()
-            return min(100, len(schema['fields']))
+            return min(100, len(schema['fields'])), safe_form_evidence(evidence)
 
     try:
-        count = await asyncio.to_thread(read)
+        count, evidence = await asyncio.to_thread(read)
         status = f'доступна\nВидимых SELECT-полей: {count} (метаданные).'
+        status += '\n' + _route_form_evidence_text(evidence)
     except NodeFormError as cause:
         status = 'не удалось прочитать\n' + node_ui.safe_error_text(cause)
     except (ValueError, KeyError, IndexError, StateError, sqlite3.Error):
@@ -367,6 +368,23 @@ async def _check_route_form(callback, user_id, parts, store, templates, routes):
         'get может вернуть кеш до 900 с; клиент следует редиректам. '
         'Это не гарантированно одна ограниченная HTTP-транзакция.',
         reply_markup=_menu([[('🔙 Маршрут', f"prd:route:{row['id']}")], [('Лоты', 'products')]]))
+
+
+def _route_form_evidence_text(evidence):
+    evidence = safe_form_evidence(evidence)
+    source = {'response': 'ответ этого GET (свежесть не доказана)',
+              'cache': 'кеш до 900 с; текущая структура неизвестна',
+              'unknown': 'неизвестен'}[evidence['source']]
+    controls = {'recognized': 'распознана ограниченная структура',
+                'unknown': 'неизвестна / неоднозначна'}[evidence['controls']]
+    context = {'candidate': 'кандидат NEW; создание НЕ доказано',
+               'unknown': 'неизвестен'}[evidence['new_form_context']]
+    csrf = {'present': 'признак есть', 'absent': 'распознаваемый признак отсутствует',
+            'ambiguous': 'неизвестно / неоднозначно'}[evidence['csrf_input_presence']]
+    return (f'Источник: {source}.\nСтруктура: {controls}.\nКонтекст NEW: {context}.\n'
+            f'CSRF: {csrf}; свежесть и авторизация НЕ доказаны.\n'
+            'Ручная выдача: НЕ проверена.\nКонтракт отправки: НЕ проверен.\n'
+            'ID результата: НЕ проверен.')
 
 
 def _preview_screen(flow):
