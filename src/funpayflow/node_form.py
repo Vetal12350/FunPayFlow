@@ -7,6 +7,7 @@ the parser, and unsuccessful refreshes invalidate the previous generation.
 from collections import OrderedDict
 from copy import deepcopy
 import hashlib
+from html.parser import HTMLParser
 import json
 import re
 import time
@@ -54,6 +55,133 @@ _URL_CATEGORIES = frozenset({'missing', 'invalid', 'external', 'auth', 'other', 
 _UNSUPPORTED_NAME_SHAPES = frozenset({
     'service_like', 'fields_deep', 'fields_format', 'plain', 'other_namespace', 'other_format'
 })
+_FORM_EVIDENCE = {
+    'source': ('unknown', 'response', 'cache'),
+    'controls': ('unknown', 'recognized'),
+    'new_form_context': ('unknown', 'candidate'),
+    'csrf_input_presence': ('ambiguous', 'present', 'absent'),
+    'manual_delivery': ('unverified',),
+    'submit_contract': ('unverified',),
+    'response_id': ('unverified',),
+}
+
+
+def safe_form_evidence(value=None):
+    """Fixed enums only, revalidated at the UI boundary; never schema metadata."""
+    unknown = {key: choices[0] for key, choices in _FORM_EVIDENCE.items()}
+    if (type(value) is not dict or value.keys() != _FORM_EVIDENCE.keys()
+            or any(type(value[key]) is not str or value[key] not in choices
+                   for key, choices in _FORM_EVIDENCE.items())):
+        return unknown
+    clean = dict(value)
+    if clean['source'] != 'response' or clean['controls'] != 'recognized':
+        clean.update(controls='unknown', new_form_context='unknown', csrf_input_presence='ambiguous')
+    return clean
+
+
+class _EvidenceMarkup(HTMLParser):
+    """Reject repaired/ambiguous markup for evidence, without changing _parse.
+
+    Even legal omitted end tags are unknown in this deliberately narrow path.
+    Only tag names are stacked, never attribute names/values or response text.
+    """
+    _void = frozenset('area base br col embed hr img input link meta param source track wbr'.split())
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.valid, self.stack = True, []
+
+    def handle_starttag(self, tag, attrs):
+        names = [name for name, _ in attrs]
+        if len(names) != len(set(names)):
+            self.valid = False
+        if tag not in self._void:
+            self.stack.append(tag)
+
+    def handle_startendtag(self, tag, attrs):
+        self.handle_starttag(tag, attrs)
+        if tag not in self._void:
+            self.valid = False  # HTML does not self-close ordinary elements.
+
+    def handle_endtag(self, tag):
+        if not self.stack or self.stack[-1] != tag:
+            self.valid = False
+        else:
+            self.stack.pop()
+
+    def handle_data(self, data):
+        if '<' in data:
+            self.valid = False
+
+
+def _form_evidence(html, soup, form, schema):
+    """Conservative structural observation, never a write/authentication verdict.
+
+    The ordinary parser has already validated the response. This narrower
+    allowlist deliberately reports unknown for controls it does not understand.
+    Hidden values/names and the DOM remain local to parsing, including failures.
+    """
+    result = safe_form_evidence()
+    result['source'] = 'response'
+    markup = _EvidenceMarkup()
+    markup.feed(html)
+    markup.close()
+    if (not markup.valid or markup.stack or form.find_parent('form') or form.find('form')
+            or form.select_one('script, template, noscript, iframe, object, output, keygen')
+            or soup.find('base')
+            or any(tag.has_attr('form') for tag in soup.find_all(['input', 'select', 'textarea', 'button']))
+            or any(key.startswith('on') for tag in [form, *form.find_all(True)] for key in tag.attrs)):
+        return result
+    inputs = {
+        'node_id': {'hidden'}, 'node': {'hidden'},
+        'offer_id': {'hidden'}, 'offer': {'hidden'},
+        'csrf_token': {'hidden'},
+        'price': {'text', 'number'}, 'amount': {'text', 'number'},
+        'active': {'checkbox'}, 'auto_delivery': {'checkbox'},
+        'deactivate_after_sale': {'checkbox'},
+    }
+    texts = {f'fields[{field}][{locale}]' for field in ('summary', 'desc', 'payment_msg')
+             for locale in ('ru', 'en')}
+    selects = {field['html_name'] for field in schema['fields']}
+    controls = {}
+    for control in form.find_all(['input', 'select', 'textarea', 'button']):
+        name = control.get('name')
+        if (control.find_parent(['input', 'select', 'textarea', 'button'])
+                or any(key in control.attrs for key in ('formaction', 'formmethod', 'formenctype', 'formtarget'))
+                or _hidden(control) or _disabled(control)):
+            return result
+        if control.name == 'button' and name is None and control.get('type', 'submit') in {'button', 'submit'}:
+            continue
+        if type(name) is not str or not name or name in controls:
+            return result
+        controls[name] = control
+        if control.name == 'select' and name in selects and is_safe_node_binding_name(name):
+            continue
+        if control.name == 'textarea' and name in texts:
+            continue
+        if control.name == 'input':
+            kind = control.get('type', 'text')
+            if name in texts and kind == 'text':
+                continue
+            if (name in inputs and kind in inputs[name]
+                    and (kind != 'hidden' or type(control.get('value')) is str)):
+                continue
+        return result
+    nodes = [controls[key] for key in ('node_id', 'node') if key in controls]
+    offers = [controls[key] for key in ('offer_id', 'offer') if key in controls]
+    if len(nodes) > 1 or len(offers) > 1:
+        return result
+    result.update(controls='recognized', csrf_input_presence=(
+        'present' if 'csrf_token' in controls else 'absent'))
+    # Matching action + empty/zero identity only suggest NEW, never prove it.
+    action = urlsplit(form.get('action', ''))
+    if (len(nodes) == len(offers) == 1 and form.get('method', '').lower() == 'post'
+            and action.path in {'/lots/offerSave', '/en/lots/offerSave', '/uk/lots/offerSave'}
+            and (not action.netloc or action.netloc == 'funpay.com')
+            and (not action.scheme or (action.scheme == 'https' and action.netloc == 'funpay.com'))
+            and not action.query and not action.fragment):
+        result['new_form_context'] = 'candidate'
+    return safe_form_evidence(result)
 
 
 def _safe_facts(facts):
@@ -187,7 +315,7 @@ def _unsupported_name_shape(name):
     return 'other_format'
 
 
-def _parse_impl(html, node_id, account_id, facts):
+def _parse_impl(html, node_id, account_id, facts, evidence=None):
     if not _positive(node_id) or not isinstance(html, str) or not 0 < len(html) <= _MAX_HTML:
         raise NodeFormError("PARSER_INPUT")
     soup = BeautifulSoup(html, "html.parser")
@@ -327,14 +455,17 @@ def _parse_impl(html, node_id, account_id, facts):
                           for option in field["options"]]) for field in fields]
     fingerprint = hashlib.sha256(json.dumps(safe, ensure_ascii=False, sort_keys=True,
                                            separators=(",", ":")).encode("utf-8")).hexdigest()
-    return dict(node_id=node_id, fields=fields, fetched_at=time.time(), fingerprint=fingerprint,
-                generation=uuid.uuid4().hex[:12])
+    schema = dict(node_id=node_id, fields=fields, fetched_at=time.time(), fingerprint=fingerprint,
+                  generation=uuid.uuid4().hex[:12])
+    if evidence is not None:
+        evidence.update(_form_evidence(html, soup, form, schema))
+    return schema
 
 
-def _parse(html, node_id, account_id=None):
+def _parse(html, node_id, account_id=None, *, evidence=None):
     facts = {}
     try:
-        return _parse_impl(html, node_id, account_id, facts)
+        return _parse_impl(html, node_id, account_id, facts, evidence)
     except NodeFormError as error:
         raise NodeFormError(error.reason, **{**facts, **error.facts}) from None
     except Exception:
@@ -352,8 +483,19 @@ class NodeFormService:
         self.clock = clock or time.monotonic
 
     def get(self, node_id, force=False):
+        return self._read(node_id, force=force)
+
+    def get_with_evidence(self, node_id):
+        """Same cached GET, plus transient enums; no force, retry or extra read.
+
+        Cache hits intentionally carry no structural evidence. A response means
+        obtained by this call, not proof of freshness, NEW or a bounded request.
+        """
+        return self._read(node_id, include_evidence=True)
+
+    def _read(self, node_id, force=False, include_evidence=False):
         try:
-            return self._get(node_id, force=force)
+            return self._get(node_id, force=force, include_evidence=include_evidence)
         except NodeFormError as error:
             logger.warning('NodeForm failure ' + json.dumps(error.diagnostic, sort_keys=True))
             raise NodeFormError(error.reason, **error.facts) from None
@@ -361,7 +503,7 @@ class NodeFormService:
             logger.warning('NodeForm failure ' + json.dumps({'reason': 'UNEXPECTED'}))
             raise NodeFormError('UNEXPECTED') from None
 
-    def _get(self, node_id, force=False):
+    def _get(self, node_id, force=False, include_evidence=False):
         if not _positive(node_id) or self.locale not in {"ru", "en", "uk"}:
             raise NodeFormError('REQUEST_INVALID')
         with self.client._account_lock:
@@ -378,6 +520,8 @@ class NodeFormService:
             entry = cache.get(key)
             if not force and entry is not None and entry["account"] is account and now < entry["expires"]:
                 cache.move_to_end(key)
+                if include_evidence:
+                    return deepcopy(entry['schema']), dict(safe_form_evidence(), source='cache')
                 return deepcopy(entry["schema"])
             # Invalidate before dispatch so failed refresh can never expose old context.
             cache.pop(key, None)
@@ -420,7 +564,12 @@ class NodeFormService:
                     html = content.decode('utf-8')
                 except UnicodeError:
                     raise NodeFormError('CONTENT_ENCODING') from None
-                schema = _parse(html, node_id, account_id=account.id)
+                evidence = {} if include_evidence else None
+                schema = _parse(html, node_id, account_id=account.id, evidence=evidence)
+                if include_evidence and (not final_url or url.scheme != 'https'
+                        or url.netloc not in {'funpay.com', 'www.funpay.com'} or url.fragment
+                        or parse_qs(url.query, keep_blank_values=True) != {'node': [str(node_id)]}):
+                    evidence = dict(safe_form_evidence(), source='response')
             except NodeFormError as error:
                 raise NodeFormError(error.reason, **{**facts, **error.facts}) from None
             except RequestFailedError as error:
@@ -434,4 +583,6 @@ class NodeFormService:
             cache.move_to_end(key)
             while len(cache) > _MAX_SCOPES:
                 cache.popitem(last=False)
+            if include_evidence:
+                return deepcopy(schema), safe_form_evidence(evidence)
             return deepcopy(schema)
