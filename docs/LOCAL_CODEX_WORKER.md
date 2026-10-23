@@ -4,6 +4,14 @@ Worker связывает задачи из ChatGPT и GitHub Issues с лока
 он готовит изменения в отдельном source checkout и создаёт Pull Request (PR).
 Работа выполняется на включённом Windows-компьютере владельца.
 
+Linux-переносимость исходников, ограничения `/proc` и проект размещения описаны в
+[LINUX_CODEX_WORKER](LINUX_CODEX_WORKER.md). Это не установка и не разрешение запуска
+на общем production VPS. Рекомендуется отдельная VM/VPS; проверка host isolation и
+отделение GitHub credentials от model subprocess остаются блокерами реальной установки.
+Удаление ключей из environment и `workspace-write` сами по себе не запрещают чтение
+credentials того же OS account. Независимый broker в текущем worker не реализован.
+Windows launcher/Control Center остаются прежними; remote heartbeat transport отсутствует.
+
 ## Разовая подготовка
 
 Нужны Git, GitHub CLI (`gh`), Codex CLI, `uv` и Python 3.13.

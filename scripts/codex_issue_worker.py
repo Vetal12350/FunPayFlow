@@ -8,7 +8,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 import shutil
 import subprocess
@@ -85,6 +85,144 @@ PHASES = frozenset({"waiting", "claimed", "clone", "dependencies", "codex_runnin
                     "branch_pr", "pr_created", "blocked", "unavailable", "stopped"})
 STATUS_VERSION = 1
 WINDOWS = os.name == "nt"
+PROC_ROOT = Path("/proc")
+PROC_MAX_ENTRIES = 8192
+PROC_MAX_BYTES = 65536
+PROC_SCAN_SECONDS = 5
+LINUX_INVENTORY_ERROR = "Linux worker inventory unavailable or ambiguous; startup blocked"
+
+
+def _proc_read(path: Path) -> bytes:
+    with path.open("rb") as stream:
+        raw = stream.read(PROC_MAX_BYTES + 1)
+    if len(raw) > PROC_MAX_BYTES:
+        raise ValueError
+    return raw
+
+
+def _proc_identity(path: Path, pid: int) -> tuple[int, int]:
+    """Detect exit/reuse/UID changes during a read; never retry an uncertain PID."""
+    uid = path.stat().st_uid
+    raw = _proc_read(path / "stat").decode("utf-8", errors="strict")
+    prefix, sep, tail = raw.rpartition(") ")
+    fields = tail.split()
+    if (not sep or not prefix.startswith(f"{pid} (") or len(fields) < 20
+            or fields[0] not in {"R", "S", "D", "Z", "T", "t", "X", "I", "P"}
+            or not fields[19].isdecimal()):
+        raise ValueError
+    return uid, int(fields[19])
+
+
+def _linux_worker_argv(path: Path) -> bool:
+    """Recognize direct Python scripts, including copies and symlinks.
+
+    Python -c/-m/stdin and explicit worker runner wrappers are ambiguous: do not
+    guess their quoting or execute them. This is not adversarial code detection.
+    """
+    # Path resolution below is only meaningful in our own filesystem view.
+    # Do not guess across chroots or another mount namespace.
+    for link in ("root", "ns/mnt"):
+        if path.joinpath(link).readlink() != PROC_ROOT.joinpath("self", link).readlink():
+            raise ValueError
+    executable = path.joinpath("exe").readlink().as_posix()
+    if not executable.startswith("/") or executable.endswith(" (deleted)"):
+        raise ValueError
+    raw = _proc_read(path / "cmdline")
+    if not raw or not raw.endswith(b"\0"):
+        raise ValueError
+    argv = raw[:-1].decode("utf-8", errors="strict").split("\0")
+    if not argv[0] or len(argv) > 256:
+        raise ValueError
+    python = r"python(?:[23](?:\.[0-9]+)*)?"
+    is_python = re.fullmatch(python, PurePosixPath(executable).name) is not None
+    if not is_python:
+        if (re.fullmatch(python, PurePosixPath(argv[0]).name)
+                or any("codex_issue_worker" in arg for arg in argv)):
+            raise ValueError
+        return False
+    if not re.fullmatch(python, PurePosixPath(argv[0]).name):
+        raise ValueError
+    index = 1
+    # Deliberately small, audited set. Unknown interpreter options fail closed.
+    while index < len(argv) and argv[index] in {"-B", "-E", "-I", "-s", "-S", "-u", "-O", "-OO"}:
+        index += 1
+    if index < len(argv) and argv[index] == "--":
+        index += 1
+    if index == len(argv) or not argv[index] or argv[index].startswith("-"):
+        raise ValueError
+    script = PurePosixPath(argv[index])
+    # Resolve in the observed process's filesystem/cwd, never our own cwd.
+    target = (path / "root" / str(script).lstrip("/") if script.is_absolute()
+              else path / "cwd" / str(script))
+    resolved = target.resolve(strict=True)
+    if not resolved.is_file():
+        raise ValueError
+    return script.name == "codex_issue_worker.py" or resolved.name == "codex_issue_worker.py"
+
+
+def linux_other_workers() -> bool:
+    """Bounded same-UID procfs inventory, secondary to the kernel flock.
+
+    A complete trusted procfs view in this PID/mount namespace is a prerequisite,
+    not proof of host-wide exclusion. No argv, paths or OS errors leave here.
+    """
+    try:
+        uid, pid = os.geteuid(), os.getpid()
+        if uid != os.getuid():
+            raise ValueError
+        if PROC_ROOT.joinpath("self").readlink().as_posix() != str(pid):
+            raise ValueError
+        # Refuse missing, bind-mounted/subset or visibility-restricted procfs.
+        mounts = _proc_read(PROC_ROOT / "self" / "mountinfo").decode("utf-8", errors="strict")
+        proc_mounts = []
+        for line in mounts.splitlines():
+            before, sep, after = line.partition(" - ")
+            fields, fs = before.split(), after.split()
+            if len(fields) < 6 or not sep or len(fs) < 3:
+                raise ValueError
+            if fields[4] == "/proc":
+                proc_mounts.append((fields, fs))
+            elif fields[4].startswith("/proc/") and fields[4][6:7].isdigit():
+                raise ValueError
+        if len(proc_mounts) != 1:
+            raise ValueError
+        fields, fs = proc_mounts[0]
+        if fields[3] != "/" or fs[0] != "proc":
+            raise ValueError
+        options = (fields[5] + "," + fs[2]).split(",")
+        if any(option.startswith(("hidepid=", "subset=")) and option not in
+               {"hidepid=0", "hidepid=off"} for option in options):
+            raise ValueError
+        deadline = time.monotonic() + PROC_SCAN_SECONDS
+        found = seen_self = False
+        with os.scandir(PROC_ROOT) as entries:
+            for count, entry in enumerate(entries, 1):
+                if count > PROC_MAX_ENTRIES or time.monotonic() > deadline:
+                    raise ValueError
+                if not re.fullmatch(r"[1-9][0-9]*", entry.name):
+                    continue
+                if not entry.is_dir(follow_symlinks=False):
+                    raise ValueError
+                path = PROC_ROOT / entry.name
+                if path.stat().st_uid != uid:
+                    continue  # Never read another UID's executable/argv.
+                identity = _proc_identity(path, int(entry.name))
+                if identity[0] != uid:
+                    raise ValueError
+                matches = _linux_worker_argv(path)
+                if _proc_identity(path, int(entry.name)) != identity:
+                    raise ValueError
+                if int(entry.name) == pid:
+                    if not matches:
+                        raise ValueError
+                    seen_self = True
+                else:
+                    found |= matches  # No parent exception on Linux.
+        if not seen_self or time.monotonic() > deadline:
+            raise ValueError
+        return found
+    except (OSError, ValueError, UnicodeError, RuntimeError):
+        raise WorkerError(LINUX_INVENTORY_ERROR) from None
 
 
 def pr_url(value: object) -> str:
@@ -138,7 +276,9 @@ def other_workers() -> bool:
     The kernel-held instance lock still rejects genuinely concurrent workers.
     """
     if not WINDOWS:
-        raise WorkerError("Windows process inventory required")
+        if sys.platform == "linux":
+            return linux_other_workers()
+        raise WorkerError("Unsupported worker process inventory platform")
     script = (
         "$ErrorActionPreference='Stop'; "
         f"$selfId={os.getpid()}; $parentId={os.getppid()}; "
@@ -157,6 +297,24 @@ def other_workers() -> bool:
     if not value.isdecimal():
         raise WorkerError("Process inventory unavailable")
     return int(value) != 0
+
+
+@contextmanager
+def stop_on_sigterm():
+    """Let Linux service stop unwind the owned Codex session and release flock."""
+    if sys.platform != "linux":
+        yield
+        return
+    import signal
+
+    def stop(signum, frame):
+        raise KeyboardInterrupt
+
+    previous = signal.signal(signal.SIGTERM, stop)
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGTERM, previous)
 
 
 class LiveStatus:
@@ -261,7 +419,9 @@ def run_codex(command: list[str], checkout: Path, task: dict) -> None:
                     import signal
                     try:
                         os.killpg(child.pid, signal.SIGKILL)
-                    except ProcessLookupError:
+                    except OSError:
+                        # Even if group cleanup is denied, reap our direct child.
+                        # The interrupted job remains blocked; never proceed to push.
                         pass
                 child.kill()
                 child.wait(timeout=10)
@@ -345,6 +505,12 @@ def changed_paths(checkout: Path) -> list[str]:
 
 
 def codex_environment() -> dict[str, str]:
+    """Reduce inherited secrets; this is NOT a credential isolation boundary.
+
+    Same-account files, gh credential helpers and host filesystem access remain
+    available unless independently denied by OS isolation / a separate broker.
+    workspace-write alone does not establish that separation.
+    """
     env = dict(os.environ)
     # Codex uses its own existing ChatGPT login; never forward generic API keys,
     # deployment credentials or GitHub tokens into the model-directed process.
@@ -555,15 +721,16 @@ def process_once(root: Path, status: LiveStatus | None = None) -> bool:
            "Local Codex completed its offline work. PR: " + url)
         gh("issue", "close", key, "--reason", "completed")
         print(f"Issue #{number}: PR created: {url}", flush=True)
-    except WorkerError as exc:
-        state[key] = {"status": "blocked", "reason": str(exc)}
+    except (WorkerError, OSError) as exc:
+        reason = str(exc) if isinstance(exc, WorkerError) else "Local worker I/O failed; task blocked"
+        state[key] = {"status": "blocked", "reason": reason}
         state_write(state_file, state)
         if status:
             status.publish("blocked", number)
-        print(f"Issue #{number}: blocked: {exc}", flush=True)
+        print(f"Issue #{number}: blocked: {reason}", flush=True)
         try:
             gh("issue", "comment", key, "--body",
-               "Local Codex worker stopped safely before completion: " + str(exc)
+               "Local Codex worker stopped safely before completion: " + reason
                + ". No production changes. Review on the local PC.")
         except WorkerError:
             pass
@@ -574,7 +741,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Owner-only offline Codex task worker")
     parser.add_argument("--check", action="store_true", help="Verify tools and ChatGPT login")
     parser.add_argument("--once", action="store_true", help="Process at most one issue")
-    parser.add_argument("--watch", action="store_true", help="Poll continuously while PC is on")
+    parser.add_argument("--watch", action="store_true", help="Poll continuously while host is on")
     parser.add_argument("--interval", type=int, default=90)
     args = parser.parse_args()
     if sum((args.check, args.once, args.watch)) != 1:
@@ -588,7 +755,7 @@ def main() -> int:
             return 0
         root = home()
         root.mkdir(parents=True, exist_ok=True)
-        with instance_lock(root):
+        with instance_lock(root), stop_on_sigterm():
             if other_workers():
                 raise WorkerError("Existing worker detected; refusing duplicate")
             with LiveStatus(root) as status:
@@ -607,6 +774,11 @@ def main() -> int:
     except WorkerError as error:
         print(f"Setup failed: {error}", file=sys.stderr)
         return 1
+    except OSError:
+        print("Local worker I/O unavailable; stopped safely", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        return 130
     return 0
 
 

@@ -604,3 +604,356 @@ def test_known_pytest_scratch_ignored_only_in_local_checkout(tmp_path):
 def test_known_pytest_scratch_refuses_untrusted_git_metadata(tmp_path):
     with pytest.raises(worker.WorkerError, match="metadata unavailable"):
         worker.ignore_known_pytest_scratch(tmp_path)
+
+
+@pytest.fixture
+def linux_proc(tmp_path, monkeypatch):
+    """Synthetic procfs only, including UID stat and symlink metadata on Windows."""
+    root = tmp_path / "proc"
+    root.mkdir()
+    (root / "self").mkdir()
+    (root / "self" / "mountinfo").write_text("1 0 0:1 / /proc rw - proc proc rw\n")
+    owners, executables = {}, {}
+    original_stat = Path.stat
+    original_readlink = Path.readlink
+
+    def stat(path, *args, **kwargs):
+        result = original_stat(path, *args, **kwargs)
+        if path in owners:
+            return SimpleNamespace(st_uid=owners[path])
+        return result
+
+    def readlink(path):
+        if path == root / "self":
+            return worker.PurePosixPath("100")
+        if path.name == "root" and path.parent.parent == root:
+            return worker.PurePosixPath("/")
+        if path.name == "mnt" and path.parent.name == "ns" and path.parent.parent.parent == root:
+            return worker.PurePosixPath("mnt:[44]")
+        if path.name == "exe" and path.parent in executables:
+            return worker.PurePosixPath(executables[path.parent])
+        return original_readlink(path)
+
+    def add(pid, argv=None, uid=1000, executable="/usr/bin/python3.13"):
+        path = root / str(pid)
+        path.mkdir()
+        owners[path] = uid
+        executables[path] = executable
+        (path / "stat").write_text(f"{pid} (synthetic name) S " + "0 " * 18 + "123\n")
+        argv = argv if argv is not None else ["python3", "scripts/codex_issue_worker.py", "--watch"]
+        (path / "cmdline").write_bytes(b"\0".join(arg.encode() for arg in argv) + b"\0")
+        for base in (path / "cwd" / "scripts", path / "root" / "opt" / "copy"):
+            base.mkdir(parents=True)
+            (base / "codex_issue_worker.py").write_text("# synthetic, never executed")
+            (base / "unrelated.py").write_text("# synthetic, never executed")
+        return path
+
+    monkeypatch.setattr(worker, "os", SimpleNamespace(**{
+        **vars(worker.os), "name": "posix", "geteuid": lambda: 1000,
+        "getuid": lambda: 1000, "getpid": lambda: 100, "getppid": lambda: 99}))
+    monkeypatch.setattr(worker, "sys", SimpleNamespace(**{**vars(worker.sys), "platform": "linux"}))
+    monkeypatch.setattr(worker, "WINDOWS", False)
+    monkeypatch.setattr(worker, "PROC_ROOT", root)
+    monkeypatch.setattr(Path, "stat", stat)
+    monkeypatch.setattr(Path, "readlink", readlink)
+    monkeypatch.setattr(worker, "run", lambda *a, **kw: pytest.fail("inventory must not spawn commands"))
+    add(100)
+    return SimpleNamespace(root=root, add=add, owners=owners)
+
+
+def test_linux_inventory_self_duplicate_copy_and_parent(linux_proc):
+    assert worker.other_workers() is False
+    linux_proc.add(99, ["python3.13", "-B", "--", "/opt/copy/codex_issue_worker.py", "--once"])
+    # Unlike the Windows redirector, a Linux parent is not exempted.
+    assert worker.other_workers() is True
+
+
+def test_linux_inventory_unrelated_script_argument_and_different_uid(linux_proc):
+    linux_proc.add(101, ["python3", "scripts/unrelated.py", "codex_issue_worker.py"])
+    linux_proc.add(103, ["sleep", "90"], executable="/usr/bin/sleep")
+    foreign = linux_proc.add(102, uid=2000)
+    (foreign / "cmdline").unlink()
+    (foreign / "stat").unlink()
+    assert worker.other_workers() is False
+
+
+def test_linux_inventory_resolves_script_symlink(linux_proc, monkeypatch):
+    path = linux_proc.add(101, ["python3", "scripts/alias.py"])
+    original = Path.resolve
+    def resolve(value, *args, **kwargs):
+        if value == path / "cwd" / "scripts" / "alias.py":
+            return path / "cwd" / "scripts" / "codex_issue_worker.py"
+        return original(value, *args, **kwargs)
+    monkeypatch.setattr(Path, "resolve", resolve)
+    assert worker.other_workers() is True
+
+
+@pytest.mark.parametrize("link,target", [("root", "/different-root"), ("ns/mnt", "mnt:[45]")])
+def test_linux_inventory_foreign_filesystem_view_blocks(linux_proc, monkeypatch, link, target):
+    path = linux_proc.add(101)
+    original = Path.readlink
+    monkeypatch.setattr(Path, "readlink", lambda value:
+                        worker.PurePosixPath(target) if value == path / link else original(value))
+    with pytest.raises(worker.WorkerError, match=worker.LINUX_INVENTORY_ERROR):
+        worker.other_workers()
+
+
+@pytest.mark.parametrize("argv,executable", [
+    (["python3", "-m", "scripts.codex_issue_worker"], "/usr/bin/python3"),
+    (["python3", "-c", "import runpy; runpy.run_path('codex_issue_worker.py')"], "/usr/bin/python3"),
+    (["python3", "-"], "/usr/bin/python3"),
+    (["python3", "-X", "dev", "scripts/codex_issue_worker.py"], "/usr/bin/python3"),
+    (["uv", "run", "python", "scripts/codex_issue_worker.py"], "/usr/bin/uv"),
+    (["bash", "-c", "python scripts/codex_issue_worker.py"], "/usr/bin/bash"),
+    (["runner", "scripts/codex_issue_worker.py"], "/usr/bin/runner"),
+    (["python3", "scripts/unrelated.py"], "/usr/bin/renamed-interpreter"),
+    (["runner", "scripts/unrelated.py"], "/usr/bin/python3"),
+    (["python3", "scripts/codex_issue_worker.py"], "/usr/bin/python3 (deleted)"),
+    (["python3", "scripts/missing.py"], "/usr/bin/python3"),
+])
+def test_linux_inventory_ambiguous_wrappers_block(linux_proc, argv, executable):
+    linux_proc.add(101, argv, executable=executable)
+    with pytest.raises(worker.WorkerError) as error:
+        worker.other_workers()
+    assert str(error.value) == worker.LINUX_INVENTORY_ERROR
+
+
+@pytest.mark.parametrize("raw", [b"", b"\0", b"python3", b"python3\0\0", b"\xff\0",
+                                    b"x" * 65537, b"x\0" * 257],
+                         ids=["empty", "null", "unterminated", "empty-script", "encoding", "oversized", "argc"])
+def test_linux_inventory_malformed_cmdline(linux_proc, raw):
+    path = linux_proc.add(101)
+    (path / "cmdline").write_bytes(raw)
+    with pytest.raises(worker.WorkerError, match=worker.LINUX_INVENTORY_ERROR):
+        worker.other_workers()
+
+
+@pytest.mark.parametrize("file", ["cmdline", "stat", "exe"])
+def test_linux_inventory_denied_reads_are_generic(linux_proc, monkeypatch, file):
+    path = linux_proc.add(101)
+    original_read, original_link = worker._proc_read, Path.readlink
+    def deny_read(value):
+        if value == path / file:
+            raise PermissionError("synthetic-private-marker")
+        return original_read(value)
+    def deny_link(value):
+        if value == path / file:
+            raise PermissionError("synthetic-private-marker")
+        return original_link(value)
+    monkeypatch.setattr(worker, "_proc_read", deny_read)
+    monkeypatch.setattr(Path, "readlink", deny_link)
+    with pytest.raises(worker.WorkerError) as error:
+        worker.other_workers()
+    assert str(error.value) == worker.LINUX_INVENTORY_ERROR
+    assert error.value.__suppress_context__
+
+
+@pytest.mark.parametrize("mode", ["deleted", "reused", "uid_changed", "malformed"])
+def test_linux_inventory_pid_races_fail_closed(linux_proc, monkeypatch, mode):
+    path = linux_proc.add(101)
+    original = worker._linux_worker_argv
+    def race(value):
+        result = original(value)
+        if value == path:
+            if mode == "deleted":
+                (path / "stat").unlink()
+            elif mode == "uid_changed":
+                linux_proc.owners[path] = 2000
+            else:
+                (path / "stat").write_text(
+                    "broken" if mode == "malformed" else "101 (new) S " + "0 " * 18 + "456\n")
+        return result
+    monkeypatch.setattr(worker, "_linux_worker_argv", race)
+    with pytest.raises(worker.WorkerError, match=worker.LINUX_INVENTORY_ERROR):
+        worker.other_workers()
+
+
+@pytest.mark.parametrize("mount", ["", "broken", "1 0 0:1 / /proc rw - ext4 disk rw\n",
+    "1 0 0:1 /subset /proc rw - proc proc rw\n",
+    "1 0 0:1 / /proc rw - proc proc rw,hidepid=2\n",
+    "1 0 0:1 / /proc rw - proc proc rw,subset=pid\n"])
+def test_linux_inventory_incomplete_proc_mount(linux_proc, mount):
+    (linux_proc.root / "self" / "mountinfo").write_text(mount)
+    with pytest.raises(worker.WorkerError, match=worker.LINUX_INVENTORY_ERROR):
+        worker.other_workers()
+
+
+def test_linux_inventory_missing_self_and_proc(linux_proc, monkeypatch):
+    linux_proc.owners[linux_proc.root / "100"] = 2000
+    with pytest.raises(worker.WorkerError, match=worker.LINUX_INVENTORY_ERROR):
+        worker.other_workers()
+    monkeypatch.setattr(worker, "PROC_ROOT", linux_proc.root / "missing")
+    with pytest.raises(worker.WorkerError, match=worker.LINUX_INVENTORY_ERROR):
+        worker.other_workers()
+
+
+def test_linux_inventory_strict_entry_and_time_bounds(linux_proc, monkeypatch):
+    monkeypatch.setattr(worker, "PROC_MAX_ENTRIES", 1)
+    with pytest.raises(worker.WorkerError, match=worker.LINUX_INVENTORY_ERROR):
+        worker.other_workers()
+    monkeypatch.setattr(worker, "PROC_MAX_ENTRIES", 8192)
+    ticks = iter([0, 6, 12, 18])
+    monkeypatch.setattr(worker.time, "monotonic", lambda: next(ticks))
+    with pytest.raises(worker.WorkerError, match=worker.LINUX_INVENTORY_ERROR):
+        worker.other_workers()
+
+
+def test_linux_inventory_denied_enumeration(linux_proc, monkeypatch):
+    def denied(*args):
+        raise PermissionError("synthetic-private-marker")
+    monkeypatch.setattr(worker.os, "scandir", denied)
+    with pytest.raises(worker.WorkerError, match=worker.LINUX_INVENTORY_ERROR):
+        worker.other_workers()
+
+
+def test_linux_inventory_mixed_identity_blocks(linux_proc, monkeypatch):
+    monkeypatch.setattr(worker.os, "getuid", lambda: 2000)
+    with pytest.raises(worker.WorkerError, match=worker.LINUX_INVENTORY_ERROR):
+        worker.other_workers()
+
+
+@pytest.mark.parametrize("platform", ["darwin", "freebsd", "unknown"])
+def test_inventory_unsupported_platform_is_fixed_blocker(monkeypatch, platform):
+    monkeypatch.setattr(worker, "WINDOWS", False)
+    monkeypatch.setattr(worker, "sys", SimpleNamespace(platform=platform))
+    with pytest.raises(worker.WorkerError, match="^Unsupported worker process inventory platform$"):
+        worker.other_workers()
+
+
+@pytest.mark.parametrize("interruption", ["timeout", "interrupt"])
+@pytest.mark.parametrize("group_error", [None, ProcessLookupError, PermissionError])
+def test_linux_codex_owned_session_cleanup_and_sanitization(monkeypatch, tmp_path, interruption, group_error):
+    import signal
+    monkeypatch.setattr(signal, "SIGKILL", 9, raising=False)
+    calls = []
+    class Child:
+        pid = 123456
+        returncode = 0
+        waits = 0
+        def wait(self, timeout):
+            self.waits += 1
+            if self.waits == 1:
+                if interruption == "interrupt":
+                    raise KeyboardInterrupt
+                raise worker.subprocess.TimeoutExpired("synthetic-private-marker", 1200)
+            assert timeout == 10
+        def kill(self):
+            calls.append("kill")
+    def killpg(*args):
+        calls.append(args)
+        if group_error:
+            raise group_error("synthetic-private-marker")
+    monkeypatch.setattr(worker, "os", SimpleNamespace(**{
+        **vars(worker.os), "name": "posix", "killpg": killpg}))
+    monkeypatch.setenv("GH_TOKEN", "synthetic-private-marker")
+    def popen(argv, **kw):
+        assert argv[0] == "codex"
+        assert kw["shell"] is False and kw["start_new_session"] is True
+        assert kw["stdout"] == kw["stderr"] == worker.subprocess.DEVNULL
+        assert "GH_TOKEN" not in kw["env"]
+        return Child()
+    monkeypatch.setattr(worker.subprocess, "Popen", popen)
+    monkeypatch.setattr(worker.subprocess, "run", lambda *a, **kw: pytest.fail("no Windows commands"))
+    with pytest.raises(KeyboardInterrupt if interruption == "interrupt" else worker.WorkerError):
+        worker.run_codex(worker.codex_exec_command(tmp_path / "out"), tmp_path, issue())
+    assert calls == [(123456, signal.SIGKILL), "kill"]
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_linux_sigterm_unwinds_and_restores_handler(monkeypatch):
+    import signal
+    calls = []
+    previous = object()
+    monkeypatch.setattr(worker, "sys", SimpleNamespace(platform="linux"))
+    monkeypatch.setattr(signal, "signal", lambda *args: calls.append(args) or previous)
+    with pytest.raises(KeyboardInterrupt):
+        with worker.stop_on_sigterm():
+            calls[0][1](signal.SIGTERM, None)
+    assert calls[-1] == (signal.SIGTERM, previous)
+
+
+@pytest.mark.parametrize("mode", ["--once", "--watch"])
+def test_linux_main_offline_lifecycle(linux_proc, monkeypatch, tmp_path, mode):
+    root = tmp_path / "worker-state"
+    monkeypatch.setattr(worker.sys, "argv", ["worker", mode])
+    monkeypatch.setattr(__import__("sys"), "argv", ["worker", mode])
+    monkeypatch.setattr(worker, "home", lambda: root)
+    commands = []
+    def run(argv, **kw):
+        commands.append(argv)
+        return SimpleNamespace(stdout="", returncode=0)
+    monkeypatch.setattr(worker, "run", run)
+    monkeypatch.setattr(worker, "ensure_label", lambda: None)
+    monkeypatch.setattr(worker, "output_json", lambda argv: [issue(number=89), issue()])
+    monkeypatch.setattr(worker, "gh", lambda *a, **kw: "")
+    def execute(task, root, status):
+        assert worker.state_read(root / "state.json")["42"] == {"status": "started"}
+        status.publish("codex_running", task["number"])
+        raise OSError("synthetic-private-marker")
+    monkeypatch.setattr(worker, "execute_task", execute)
+    def stop(interval):
+        assert interval == 90
+        raise KeyboardInterrupt
+    monkeypatch.setattr(worker.time, "sleep", stop)
+    worker.state_write(root / "state.json", {"89": {"status": "blocked"}})
+    # Use the actual host kernel lock; platform inventory remains synthetic.
+    monkeypatch.setattr(worker.os, "name", __import__("os").name)
+    assert worker.main() == (0 if mode == "--once" else 130)
+    assert commands == [["git", "--version"], ["gh", "--version"], ["codex", "--version"],
+                        ["uv", "--version"], ["gh", "auth", "status"], ["codex", "login", "status"]]
+    state = worker.state_read(root / "state.json")
+    assert state["89"] == {"status": "blocked"}
+    assert state["42"] == {"status": "blocked", "reason": "Local worker I/O failed; task blocked"}
+    assert worker.eligible_tasks(state) == []
+    assert worker.state_read(root / "live_status.json")["phase"] == "stopped"
+
+
+def test_posix_flock_nonblocking_release_and_contention(monkeypatch, tmp_path):
+    calls = []
+    def flock(fd, operation):
+        calls.append(operation)
+    fake = SimpleNamespace(flock=flock, LOCK_EX=2, LOCK_NB=4, LOCK_UN=8)
+    monkeypatch.setitem(__import__("sys").modules, "fcntl", fake)
+    monkeypatch.setattr(worker, "os", SimpleNamespace(**{**vars(worker.os), "name": "posix"}))
+    with pytest.raises(RuntimeError):
+        with worker.instance_lock(tmp_path):
+            raise RuntimeError("synthetic unwind")
+    assert calls == [6, 8]
+    def denied(*args):
+        raise BlockingIOError("synthetic-private-marker")
+    fake.flock = denied
+    with pytest.raises(worker.WorkerError, match="^Worker already active or lock unavailable$"):
+        with worker.instance_lock(tmp_path):
+            pytest.fail("lock contention must block")
+
+
+def test_auth_failure_blocks_before_inventory_and_claim(monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(worker.sys, "argv", ["worker", "--once"])
+    monkeypatch.setattr(worker, "home", lambda: tmp_path)
+    monkeypatch.setattr(worker, "resolve_argv", lambda args: args)
+    def run(argv, **kw):
+        assert kw["shell"] is False
+        return SimpleNamespace(returncode=int(argv == ["gh", "auth", "status"]),
+                               stdout="synthetic-private-marker", stderr="synthetic-private-marker")
+    monkeypatch.setattr(worker.subprocess, "run", run)
+    monkeypatch.setattr(worker, "other_workers", lambda: pytest.fail("auth must succeed first"))
+    monkeypatch.setattr(worker, "process_once", lambda *a: pytest.fail("must not claim"))
+    assert worker.main() == 1
+    output = capsys.readouterr()
+    assert output.out == ""
+    assert output.err == "Setup failed: Command failed: gh (1)\n"
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_linux_inventory_failure_blocks_main_before_github(linux_proc, monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(__import__("sys"), "argv", ["worker", "--once"])
+    monkeypatch.setattr(worker.sys, "stderr", __import__("sys").stderr)
+    monkeypatch.setattr(worker, "home", lambda: tmp_path / "state")
+    monkeypatch.setattr(worker, "check_tools", lambda: None)
+    monkeypatch.setattr(worker.os, "name", __import__("os").name)
+    monkeypatch.setattr(worker, "ensure_label", lambda: pytest.fail("must not contact GitHub"))
+    monkeypatch.setattr(worker, "process_once", lambda *a: pytest.fail("must not claim"))
+    (linux_proc.root / "100" / "cmdline").write_bytes(b"synthetic-private-marker")
+    assert worker.main() == 1
+    assert capsys.readouterr().err == f"Setup failed: {worker.LINUX_INVENTORY_ERROR}\n"
+    assert not (tmp_path / "state" / "state.json").exists()
