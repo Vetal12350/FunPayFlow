@@ -71,17 +71,24 @@ def _menu(rows):
 
 def _home():
     return ('📦 <b>Лоты · локальные черновики</b>\n'
-            'Product Template + Game Route + variables = RU/EN draft.\n'
-            'Публикация FunPay недоступна. Существующие лоты не изменяются.', _menu([
-                [('➕ Создать', 'prd:choose:single:0')],
-                [('⚡ Быстрый черновик', 'prd:quick')],
-                [('🧩 Тип товара', 'prd:types')],
-                [('📚 Массовые drafts', 'prd:choose:bulk:0')],
-                [('📝 Сохранённые drafts', 'prd:drafts:0')],
-                [('🗺 Game Routes', 'prd:choose:routes:0')],
-                [('🧩 Product Templates', 'prd:templates:0')],
-                [('📝 Черновики из собственного лота', 'lot_templates')],
+            'Черновики товаров · публикация FunPay пока отключена.\n'
+            'Существующие лоты не изменяются.', _menu([
+                [('➕ Создать товар', 'prd:types')],
+                [('📝 Мои черновики', 'prd:drafts:0')],
+                [('⚙️ Дополнительно', 'prd:advanced')],
                 [('🔙 Главное меню', 'menu_main')],
+            ]))
+
+
+def _advanced():
+    return ('⚙️ <b>Дополнительно · локальные черновики</b>\n'
+            'Публикация FunPay пока отключена.', _menu([
+                [('🗺 Категории и маршруты', 'prd:choose:routes:0')],
+                [('🧩 Шаблоны оформления', 'prd:templates:0')],
+                [('📚 Массовое создание черновиков', 'prd:choose:bulk:0')],
+                [('➕ Расширенное создание', 'prd:choose:single:0')],
+                [('📝 Из существующего лота', 'lot_templates')],
+                [('🔙 Лоты', 'products')],
             ]))
 
 
@@ -828,6 +835,9 @@ async def _products_callback(callback, action, user_id):
         if command == 'home':
             discard_session(user_id)
             await _show(callback, *_home())
+        elif command == 'advanced':
+            discard_session(user_id)
+            await _show(callback, *_advanced())
         elif command == 'choose':
             await _template_picker(callback, parts[2], int(parts[3]), templates)
         elif command == 'types':
