@@ -381,7 +381,21 @@ def _route_form_evidence_text(evidence):
                'unknown': 'неизвестен'}[evidence['new_form_context']]
     csrf = {'present': 'признак есть', 'absent': 'распознаваемый признак отсутствует',
             'ambiguous': 'неизвестно / неоднозначно'}[evidence['csrf_input_presence']]
-    return (f'Источник: {source}.\nСтруктура: {controls}.\nКонтекст NEW: {context}.\n'
+    blocker = ''
+    if evidence['controls'] == 'unknown':
+        reason = {
+            'unknown': 'причина не установлена',
+            'cache_unavailable': 'структурные данные сетевого ответа недоступны в кеше',
+            'response_url': 'неоднозначный адрес ответа',
+            'duplicate_attributes': 'повторяющиеся атрибуты разметки',
+            'document_markup': 'неоднозначная разметка HTML',
+            'editor_markup': 'неподдерживаемая разметка формы',
+            'control_conflict': 'конфликт элементов формы',
+            'unsupported_controls': 'неподдерживаемые элементы формы',
+            'ambiguous_context': 'неоднозначный контекст формы',
+        }[evidence['evidence_blocker']]
+        blocker = f'Почему неизвестно: {reason}.\n'
+    return (f'Источник: {source}.\nСтруктура: {controls}.\n{blocker}Контекст NEW: {context}.\n'
             f'CSRF: {csrf}; свежесть и авторизация НЕ доказаны.\n'
             'Ручная выдача: НЕ проверена.\nКонтракт отправки: НЕ проверен.\n'
             'ID результата: НЕ проверен.')

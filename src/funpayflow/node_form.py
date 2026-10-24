@@ -63,6 +63,9 @@ _FORM_EVIDENCE = {
     'manual_delivery': ('unverified',),
     'submit_contract': ('unverified',),
     'response_id': ('unverified',),
+    'evidence_blocker': ('unknown', 'none', 'cache_unavailable', 'response_url',
+                         'duplicate_attributes', 'document_markup', 'editor_markup',
+                         'control_conflict', 'unsupported_controls', 'ambiguous_context'),
 }
 
 
@@ -73,10 +76,18 @@ def safe_form_evidence(value=None):
             or any(type(value[key]) is not str or value[key] not in choices
                    for key, choices in _FORM_EVIDENCE.items())):
         return unknown
-    clean = dict(value)
-    if clean['source'] != 'response' or clean['controls'] != 'recognized':
-        clean.update(controls='unknown', new_form_context='unknown', csrf_input_presence='ambiguous')
-    return clean
+    # Reject inconsistent objects wholesale, including invented positive claims.
+    if value['source'] != 'response':
+        expected = dict(unknown, source=value['source'], evidence_blocker=(
+            'cache_unavailable' if value['source'] == 'cache' else 'unknown'))
+        return expected if value == expected else unknown
+    if value['controls'] == 'recognized':
+        if value['evidence_blocker'] != 'none' or value['csrf_input_presence'] == 'ambiguous':
+            return unknown
+    elif (value['evidence_blocker'] in {'none', 'cache_unavailable'}
+          or value['new_form_context'] != 'unknown' or value['csrf_input_presence'] != 'ambiguous'):
+        return unknown
+    return dict(value)
 
 
 class _EvidenceMarkup(HTMLParser):
@@ -90,11 +101,13 @@ class _EvidenceMarkup(HTMLParser):
     def __init__(self):
         super().__init__(convert_charrefs=True)
         self.valid, self.stack = True, []
+        self.duplicate_attributes = False
 
     def handle_starttag(self, tag, attrs):
         names = [name for name, _ in attrs]
         if len(names) != len(set(names)):
             self.valid = False
+            self.duplicate_attributes = True
         if tag not in self._void:
             self.stack.append(tag)
 
@@ -126,12 +139,18 @@ def _form_evidence(html, soup, form, schema):
     markup = _EvidenceMarkup()
     markup.feed(html)
     markup.close()
-    if (not markup.valid or markup.stack or form.find_parent('form') or form.find('form')
+    # Fixed precedence: URL (in _get), duplicate attributes, document markup,
+    # editor markup, control conflicts, unsupported controls, context aliases.
+    if markup.duplicate_attributes:
+        return dict(result, evidence_blocker='duplicate_attributes')
+    if not markup.valid or markup.stack:
+        return dict(result, evidence_blocker='document_markup')
+    if (form.find_parent('form') or form.find('form')
             or form.select_one('script, template, noscript, iframe, object, output, keygen')
             or soup.find('base')
             or any(tag.has_attr('form') for tag in soup.find_all(['input', 'select', 'textarea', 'button']))
             or any(key.startswith('on') for tag in [form, *form.find_all(True)] for key in tag.attrs)):
-        return result
+        return dict(result, evidence_blocker='editor_markup')
     inputs = {
         'node_id': {'hidden'}, 'node': {'hidden'},
         'offer_id': {'hidden'}, 'offer': {'hidden'},
@@ -144,16 +163,19 @@ def _form_evidence(html, soup, form, schema):
              for locale in ('ru', 'en')}
     selects = {field['html_name'] for field in schema['fields']}
     controls = {}
+    blockers = set()
     for control in form.find_all(['input', 'select', 'textarea', 'button']):
         name = control.get('name')
         if (control.find_parent(['input', 'select', 'textarea', 'button'])
-                or any(key in control.attrs for key in ('formaction', 'formmethod', 'formenctype', 'formtarget'))
-                or _hidden(control) or _disabled(control)):
-            return result
+                or any(key in control.attrs for key in ('formaction', 'formmethod', 'formenctype', 'formtarget'))):
+            blockers.add('control_conflict')
+        if _hidden(control) or _disabled(control):
+            blockers.add('unsupported_controls')
         if control.name == 'button' and name is None and control.get('type', 'submit') in {'button', 'submit'}:
             continue
         if type(name) is not str or not name or name in controls:
-            return result
+            blockers.add('control_conflict')
+            continue
         controls[name] = control
         if control.name == 'select' and name in selects and is_safe_node_binding_name(name):
             continue
@@ -166,12 +188,15 @@ def _form_evidence(html, soup, form, schema):
             if (name in inputs and kind in inputs[name]
                     and (kind != 'hidden' or type(control.get('value')) is str)):
                 continue
-        return result
+        blockers.add('unsupported_controls')
+    for blocker in ('control_conflict', 'unsupported_controls'):
+        if blocker in blockers:
+            return dict(result, evidence_blocker=blocker)
     nodes = [controls[key] for key in ('node_id', 'node') if key in controls]
     offers = [controls[key] for key in ('offer_id', 'offer') if key in controls]
     if len(nodes) > 1 or len(offers) > 1:
-        return result
-    result.update(controls='recognized', csrf_input_presence=(
+        return dict(result, evidence_blocker='ambiguous_context')
+    result.update(controls='recognized', evidence_blocker='none', csrf_input_presence=(
         'present' if 'csrf_token' in controls else 'absent'))
     # Matching action + empty/zero identity only suggest NEW, never prove it.
     action = urlsplit(form.get('action', ''))
@@ -521,7 +546,8 @@ class NodeFormService:
             if not force and entry is not None and entry["account"] is account and now < entry["expires"]:
                 cache.move_to_end(key)
                 if include_evidence:
-                    return deepcopy(entry['schema']), dict(safe_form_evidence(), source='cache')
+                    return deepcopy(entry['schema']), dict(
+                        safe_form_evidence(), source='cache', evidence_blocker='cache_unavailable')
                 return deepcopy(entry["schema"])
             # Invalidate before dispatch so failed refresh can never expose old context.
             cache.pop(key, None)
@@ -569,7 +595,7 @@ class NodeFormService:
                 if include_evidence and (not final_url or url.scheme != 'https'
                         or url.netloc not in {'funpay.com', 'www.funpay.com'} or url.fragment
                         or parse_qs(url.query, keep_blank_values=True) != {'node': [str(node_id)]}):
-                    evidence = dict(safe_form_evidence(), source='response')
+                    evidence = dict(safe_form_evidence(), source='response', evidence_blocker='response_url')
             except NodeFormError as error:
                 raise NodeFormError(error.reason, **{**facts, **error.facts}) from None
             except RequestFailedError as error:
