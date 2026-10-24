@@ -245,6 +245,7 @@ def test_route_form_explicit_get_sanitized_metadata_and_no_mutations(context):
         assert 'ответ этого GET (свежесть не доказана)' in shown
         assert 'кандидат NEW; создание НЕ доказано' in shown
         assert 'CSRF: признак есть; свежесть и авторизация НЕ доказаны' in shown
+        assert 'Почему неизвестно:' not in shown
         assert 'Ручная выдача: НЕ проверена' in shown
         assert 'Контракт отправки: НЕ проверен' in shown and 'ID результата: НЕ проверен' in shown
         assert 'публикация НЕ проверена' in shown
@@ -291,6 +292,7 @@ def test_route_form_safe_errors_no_persistence(context, failure, reason):
         await view.products_callback(cb, action, 1)
         shown = str(cb.message.answer.call_args)
         assert 'не удалось прочитать' in shown and reason in shown
+        assert 'Почему неизвестно:' not in shown
         assert 'публикация НЕ проверена' in shown
         for forbidden in (canary, 'fields[', 'csrf_token', 'https://', 'RuntimeError', 'SELECT-полей:'):
             assert forbidden not in shown
@@ -402,6 +404,7 @@ def test_route_form_cache_reuse_and_expiry(context, monkeypatch):
         assert ctx.client.account.method.call_count == 1
         shown = cb.message.answer.call_args.args[0]
         assert 'кеш до 900 с; текущая структура неизвестна' in shown
+        assert 'Почему неизвестно: структурные данные сетевого ответа недоступны в кеше.' in shown
         assert 'Контекст NEW: неизвестен' in shown and 'CSRF: неизвестно / неоднозначно' in shown
         assert 'ответ этого GET' not in shown
         now[0] += 2
@@ -449,11 +452,94 @@ def test_route_form_revalidates_after_response_before_showing_evidence(context, 
     {'source': 'SYNTHETIC_PRIVATE_VALUE'},
     dict(view.safe_form_evidence(), csrf_input_presence='SYNTHETIC_PRIVATE_VALUE'),
     dict(view.safe_form_evidence(), hidden_name='SYNTHETIC_PRIVATE_VALUE'),
+    dict(view.safe_form_evidence(), evidence_blocker='SYNTHETIC_PRIVATE_VALUE'),
+    dict(view.safe_form_evidence(), source='response', controls='recognized', evidence_blocker='document_markup'),
+    dict(view.safe_form_evidence(), source='response', controls='recognized', evidence_blocker='none'),
+    dict(view.safe_form_evidence(), source='cache', evidence_blocker='document_markup'),
 ])
 def test_route_form_ui_revalidates_evidence_and_never_interpolates_unknown_values(bad):
     shown = view._route_form_evidence_text(bad)
     assert 'SYNTHETIC_PRIVATE' not in shown and 'hidden_name' not in shown
     assert 'Источник: неизвестен' in shown and 'Контекст NEW: неизвестен' in shown
+    assert 'Почему неизвестно: причина не установлена.' in shown
+
+
+@pytest.mark.parametrize('blocker,reason', [
+    ('response_url', 'неоднозначный адрес ответа'),
+    ('duplicate_attributes', 'повторяющиеся атрибуты разметки'),
+    ('document_markup', 'неоднозначная разметка HTML'),
+    ('editor_markup', 'неподдерживаемая разметка формы'),
+    ('control_conflict', 'конфликт элементов формы'),
+    ('unsupported_controls', 'неподдерживаемые элементы формы'),
+    ('ambiguous_context', 'неоднозначный контекст формы'),
+    ('unknown', 'причина не установлена'),
+])
+def test_route_form_blocker_has_one_fixed_russian_line(blocker, reason):
+    shown = view._route_form_evidence_text(dict(
+        view.safe_form_evidence(), source='response', evidence_blocker=blocker))
+    assert [line for line in shown.splitlines() if line.startswith('Почему неизвестно:')] == [
+        f'Почему неизвестно: {reason}.']
+    assert 'Структура: неизвестна / неоднозначна' in shown
+    assert 'Контекст NEW: неизвестен' in shown and 'CSRF: неизвестно / неоднозначно' in shown
+
+
+@pytest.mark.parametrize('kind,reason', [
+    ('markup', 'неоднозначная разметка HTML'),
+    ('control', 'неподдерживаемые элементы формы'),
+    ('url', 'неоднозначный адрес ответа'),
+])
+def test_route_form_unknown_response_is_transient_and_never_leaks(context, monkeypatch, kind, reason):
+    ctx = context
+    route = seed_route(ctx)
+    private = 'SYNTHETIC_PRIVATE_VALUE'
+    private_name = 'SYNTHETIC_PRIVATE_NAME'
+    fake_get = ctx.client.account.method.side_effect
+    logs = []
+    monkeypatch.setattr('funpayflow.node_form.logger.warning', logs.append)
+
+    def response(*args, **kwargs):
+        assert ctx.client._account_lock._is_owned()
+        result = fake_get(*args, **kwargs)
+        html = result.content.decode().replace('</form>',
+            f'<input type="hidden" name="csrf_token" value="{private}"></form>')
+        if kind == 'markup':
+            html = f'<html><body><p title="{private}">' + html
+        elif kind == 'control':
+            html = html.replace('</form>', f'<input name="{private_name}" value="{private}"></form>')
+        else:
+            result.url += '&token=' + private
+        result.content = html.encode()
+        return result
+
+    ctx.client.account.method.side_effect = response
+    before = database_snapshot(ctx)
+
+    async def run():
+        cb, action = await route_form_button(ctx, route)
+        await view.products_callback(cb, action, 1)
+        shown = cb.message.answer.call_args.args[0]
+        assert f'Почему неизвестно: {reason}.' in shown
+        assert 'ответ этого GET (свежесть не доказана)' in shown
+        assert 'Контекст NEW: неизвестен' in shown and 'CSRF: неизвестно / неоднозначно' in shown
+        assert 'публикация НЕ проверена' in shown
+        entry = next(iter(ctx.client._node_form_cache.values()))
+        assert set(entry) == {'account', 'expires', 'schema'}
+        retained = json.dumps([entry['schema'], view._flows[1]], default=str)
+        for forbidden in (private, private_name, 'csrf_token', 'https://', '<input', 'Traceback'):
+            assert forbidden not in shown + retained + str(logs)
+        assert 'evidence_blocker' not in retained and logs == []
+        assert database_snapshot(ctx) == before
+        ctx.client.account.method.assert_called_once_with('get', 'lots/offerEdit?node=100',
+            {'accept-language': 'ru'}, {}, raise_not_200=True)
+        ctx.client.account.save_lot.assert_not_called()
+        cb, action = await route_form_button(ctx, route)
+        await view.products_callback(cb, action, 1)
+        cached = cb.message.answer.call_args.args[0]
+        assert 'структурные данные сетевого ответа недоступны в кеше' in cached
+        assert f'Почему неизвестно: {reason}.' not in cached
+        ctx.client.account.method.assert_called_once()
+        assert database_snapshot(ctx) == before
+    asyncio.run(run())
 
 
 @pytest.mark.parametrize('kind', [kind for kind, _ in BUILTIN_TYPES if kind != 'GAME_KEY'])

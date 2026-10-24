@@ -523,19 +523,21 @@ def test_transient_form_evidence_single_get_and_no_hidden_cache_data(service, mo
     schema, evidence = service.get_with_evidence(976)
     assert evidence == dict(source='response', controls='recognized', new_form_context='candidate',
         csrf_input_presence='present' if csrf else 'absent', manual_delivery='unverified',
-        submit_contract='unverified', response_id='unverified')
+        submit_contract='unverified', response_id='unverified', evidence_blocker='none')
     ordinary = parse_node_form(html, 976)
     assert schema.keys() == ordinary.keys()
     assert schema['fields'] == ordinary['fields'] and schema['fingerprint'] == ordinary['fingerprint']
     assert service.get(976) == schema
     cached_schema, cached = service.get_with_evidence(976)
-    assert cached_schema == schema and cached == dict(safe_form_evidence(), source='cache')
+    assert cached_schema == schema and cached == dict(
+        safe_form_evidence(), source='cache', evidence_blocker='cache_unavailable')
     evidence['new_form_context'] = private
     assert service.get_with_evidence(976)[1] == cached
     entry = next(iter(service.client._node_form_cache.values()))
     assert set(entry) == {'account', 'expires', 'schema'}
     retained = json.dumps([schema, entry['schema'], cached, logs])
-    for forbidden in (private, 'SYNTHETIC_APP_PRIVATE', 'csrf_token', 'offer_id', 'controls', 'new_form_context'):
+    for forbidden in (private, 'SYNTHETIC_APP_PRIVATE', 'csrf_token', 'offer_id', 'controls',
+                      'new_form_context', 'evidence_blocker'):
         assert forbidden not in json.dumps([schema, entry['schema'], logs])
     assert private not in retained
     assert len(service.client.account.calls) == 1 and logs == []
@@ -549,38 +551,50 @@ def test_transient_form_evidence_single_get_and_no_hidden_cache_data(service, mo
 def test_evidence_does_not_refresh_an_ordinary_cached_schema(service):
     first = service.get(976)
     schema, evidence = service.get_with_evidence(976)
-    assert schema == first and evidence == dict(safe_form_evidence(), source='cache')
+    assert schema == first and evidence == dict(
+        safe_form_evidence(), source='cache', evidence_blocker='cache_unavailable')
     assert len(service.client.account.calls) == 1
 
 
-@pytest.mark.parametrize('extra', [
-    '<input type="hidden" name="SYNTHETIC_PRIVATE_NAME" value="SYNTHETIC_PRIVATE_VALUE">',
-    '<input type="hidden" name="csrf_token" value="x"><input type="hidden" name="csrf_token" value="y">',
-    '<input type="hidden" name="token" value="SYNTHETIC_PRIVATE_VALUE">',
-    '<input type="hidden" value="SYNTHETIC_PRIVATE_VALUE">',
-    '<input type="hidden" name="csrf_token">',
-    '<input type="text" name="csrf_token" value="x">',
-    '<input type="hidden" name="node" value="976">',
-    '<input type="hidden" name="offer" value="0">',
-    '<input type="hidden" name="csrf_token" value="x" disabled>',
-    '<input type="hidden" name="csrf_token" value="x" form="other">',
-    '<input type="hidden" name="csrf_token" name="csrf_token" value="x">',
-    '<button formaction="https://example.invalid/SYNTHETIC_PRIVATE_VALUE">Send</button>',
-    '<script>SYNTHETIC_PRIVATE_VALUE</script>',
-    '<template><input type="hidden" name="csrf_token" value="x"></template>',
-    '<input name="price" onclick="SYNTHETIC_PRIVATE_VALUE">',
-    '<input name="price"/><input name="price">',
-    '<fieldset><input name="price"></div>',
-    '<object name="SYNTHETIC_PRIVATE_NAME"></object>',
+@pytest.mark.parametrize('extra,blocker', [
+    ('<input type="hidden" name="SYNTHETIC_PRIVATE_NAME" value="SYNTHETIC_PRIVATE_VALUE">', 'unsupported_controls'),
+    ('<input type="hidden" name="csrf_token" value="x"><input type="hidden" name="csrf_token" value="y">', 'control_conflict'),
+    ('<input type="hidden" name="token" value="SYNTHETIC_PRIVATE_VALUE">', 'unsupported_controls'),
+    ('<input type="hidden" value="SYNTHETIC_PRIVATE_VALUE">', 'control_conflict'),
+    ('<input type="hidden" name="csrf_token">', 'unsupported_controls'),
+    ('<input type="text" name="csrf_token" value="x">', 'unsupported_controls'),
+    ('<input type="hidden" name="node" value="976">', 'ambiguous_context'),
+    ('<input type="hidden" name="offer" value="0">', 'ambiguous_context'),
+    ('<input type="hidden" name="csrf_token" value="x" disabled>', 'unsupported_controls'),
+    ('<input type="hidden" name="csrf_token" value="x" form="other">', 'editor_markup'),
+    ('<input type="hidden" name="csrf_token" name="csrf_token" value="x">', 'duplicate_attributes'),
+    ('<button formaction="https://example.invalid/SYNTHETIC_PRIVATE_VALUE">Send</button>', 'control_conflict'),
+    ('<script>SYNTHETIC_PRIVATE_VALUE</script>', 'editor_markup'),
+    ('<template><input type="hidden" name="csrf_token" value="x"></template>', 'editor_markup'),
+    ('<input name="price" onclick="SYNTHETIC_PRIVATE_VALUE">', 'editor_markup'),
+    ('<input name="price"/><input name="price">', 'control_conflict'),
+    ('<fieldset><input name="price"></div>', 'document_markup'),
+    ('<object name="SYNTHETIC_PRIVATE_NAME"></object>', 'editor_markup'),
+    ('<form></form>', 'editor_markup'),
+    ('<div hidden><input name="price"></div>', 'unsupported_controls'),
+    ('<button><input name="price"></button>', 'control_conflict'),
 ])
-def test_unknown_duplicate_malformed_controls_fail_closed_without_changing_schema(service, extra):
+def test_unknown_duplicate_malformed_controls_fail_closed_without_changing_schema(service, monkeypatch, extra, blocker):
     html = evidence_form(extra)
     ordinary = parse_node_form(html, 976)
     service.client.account.response.content = html.encode()
+    logs = []
+    monkeypatch.setattr('funpayflow.node_form.logger.warning', logs.append)
     schema, evidence = service.get_with_evidence(976)
-    assert evidence == dict(safe_form_evidence(), source='response')
+    assert evidence == dict(safe_form_evidence(), source='response', evidence_blocker=blocker)
     assert schema['fields'] == ordinary['fields'] and schema['fingerprint'] == ordinary['fingerprint']
     assert 'SYNTHETIC_PRIVATE' not in json.dumps([schema, evidence])
+    assert logs == []
+    entry = next(iter(service.client._node_form_cache.values()))
+    assert set(entry) == {'account', 'expires', 'schema'}
+    assert 'evidence_blocker' not in json.dumps(entry['schema'])
+    assert service.get_with_evidence(976)[1] == dict(
+        safe_form_evidence(), source='cache', evidence_blocker='cache_unavailable')
     assert len(service.client.account.calls) == 1
 
 
@@ -598,6 +612,46 @@ def test_missing_or_ambiguous_new_identity_is_unknown(service, old, new):
     service.client.account.response.content = evidence_form().replace(old, new).encode()
     _, evidence = service.get_with_evidence(976)
     assert evidence['new_form_context'] == 'unknown'
+    if old not in {'name="offer_id"', '</form>'}:
+        assert evidence['controls'] == 'recognized' and evidence['evidence_blocker'] == 'none'
+
+
+@pytest.mark.parametrize('prefix,suffix,blocker', [
+    ('<!doctype html><html><head><title>Page</title></head><body><main>',
+     '</main></body></html>', 'none'),
+    ('<!doctype html><html><head><title>Page</title></head><body>', '', 'document_markup'),
+    ('<html><head><meta charset="utf-8"><body>', '</body></html>', 'document_markup'),
+    ('<html><body><p>Page', '</body></html>', 'document_markup'),
+    ('<html><body><div><span></div></span>', '</body></html>', 'document_markup'),
+    ('<html><body><div/>', '</body></html>', 'document_markup'),
+    ('<html><body><aside title="a" title="b"></aside>', '</body></html>', 'duplicate_attributes'),
+    ('<html><head><base href="https://example.invalid/"></head><body>', '</body></html>', 'editor_markup'),
+])
+def test_evidence_checks_full_document_without_relaxing_html_rules(service, prefix, suffix, blocker):
+    html = prefix + evidence_form() + suffix
+    service.client.account.response.content = html.encode()
+    schema, evidence = service.get_with_evidence(976)
+    ordinary = parse_node_form(html, 976)
+    assert schema['fields'] == ordinary['fields'] and schema['fingerprint'] == ordinary['fingerprint']
+    assert evidence['evidence_blocker'] == blocker
+    assert evidence['controls'] == ('recognized' if blocker == 'none' else 'unknown')
+
+
+@pytest.mark.parametrize('reverse', [False, True])
+@pytest.mark.parametrize('extras,blocker', [
+    (['<div>', '<input name="price" name="price">'], 'duplicate_attributes'),
+    (['<div>', '<script></script>'], 'document_markup'),
+    (['<script></script>', '<input><input disabled>'], 'editor_markup'),
+    (['<input disabled name="price">', '<input>'], 'control_conflict'),
+    (['<input name="unknown">', '<input type="hidden" name="offer" value="0">'], 'unsupported_controls'),
+])
+def test_evidence_blocker_precedence_is_independent_of_control_order(service, extras, blocker, reverse):
+    service.client.account.response.content = evidence_form(''.join(extras[::(-1 if reverse else 1)])).encode()
+    assert service.get_with_evidence(976)[1]['evidence_blocker'] == blocker
+    service.client.account.response.url += '&private=SYNTHETIC_PRIVATE_VALUE'
+    service.test_clock[0] += 900
+    assert service.get_with_evidence(976)[1] == dict(
+        safe_form_evidence(), source='response', evidence_blocker='response_url')
 
 
 @pytest.mark.parametrize('extra', ['', '<input type="checkbox" name="auto_delivery">',
@@ -613,6 +667,7 @@ def test_delivery_presence_never_proves_manual_mode(service, extra):
     ('node', 'NODE_CONTEXT'), ('user', 'APP_USER_SCOPE'), ('login', 'LOGIN_PAGE'),
     ('url_auth', 'URL_AUTH'), ('redirect', 'HTTP_REDIRECT'), ('url_node', 'URL_NODE'),
     ('url_offer', 'URL_OFFER'), ('action', 'FORM_ACTION'), ('transport', 'REQUEST_TRANSPORT'),
+    ('evidence_parser', 'PARSER_UNEXPECTED'),
 ])
 def test_evidence_preserves_existing_rejections_and_safe_errors(service, monkeypatch, failure, reason):
     private = 'SYNTHETIC_PRIVATE_VALUE'
@@ -638,6 +693,10 @@ def test_evidence_preserves_existing_rejections_and_safe_errors(service, monkeyp
         response.url += '&offer=' + private
     elif failure == 'action':
         html = html.replace('/lots/offerSave', 'https://example.invalid/' + private)
+    elif failure == 'evidence_parser':
+        def broken_parser(*args):
+            raise ValueError(private)
+        monkeypatch.setattr('funpayflow.node_form._EvidenceMarkup.feed', broken_parser)
     else:
         service.client.account.failure = Timeout(private)
     response.content = html.encode()
@@ -652,16 +711,22 @@ def test_evidence_preserves_existing_rejections_and_safe_errors(service, monkeyp
 
 
 @pytest.mark.parametrize('url', [None, 'http://funpay.com/lots/offerEdit?node=976',
+    'https://funpay.com/lots/offerEdit?node=976#SYNTHETIC_PRIVATE_VALUE',
+    'https://funpay.com/lots/offerEdit?node=976&token=',
+    'https://SYNTHETIC_PRIVATE_VALUE@funpay.com/lots/offerEdit?node=976',
     'https://funpay.com/lots/offerEdit?node=976&private=SYNTHETIC_PRIVATE_VALUE'])
 def test_evidence_stricter_url_context_does_not_change_ordinary_parser(service, url):
     service.client.account.response.url = url
     service.client.account.response.content = evidence_form().encode()
     schema, evidence = service.get_with_evidence(976)
-    assert schema['fields'] and evidence == dict(safe_form_evidence(), source='response')
+    assert schema['fields'] and evidence == dict(
+        safe_form_evidence(), source='response', evidence_blocker='response_url')
 
 
 @pytest.mark.parametrize('invalid', [None, [], {'source': 'response'},
     dict(safe_form_evidence(), controls=True), dict(safe_form_evidence(), response_id='SYNTHETIC_PRIVATE_VALUE'),
+    dict(safe_form_evidence(), evidence_blocker='SYNTHETIC_PRIVATE_VALUE'),
+    dict(safe_form_evidence(), evidence_blocker=[]),
     dict(safe_form_evidence(), secret='SYNTHETIC_PRIVATE_VALUE')])
 def test_form_evidence_is_a_strict_fixed_enum_contract(invalid):
     assert safe_form_evidence(invalid) == safe_form_evidence()
@@ -672,6 +737,30 @@ def test_form_evidence_cannot_upgrade_cache_or_unknown_controls():
         value = dict(safe_form_evidence(), new_form_context='candidate', csrf_input_presence='present', **update)
         clean = safe_form_evidence(value)
         assert clean['new_form_context'] == 'unknown' and clean['csrf_input_presence'] == 'ambiguous'
+
+
+def test_evidence_schema_and_cross_field_invariants_exhaustively():
+    from itertools import product
+    from funpayflow.node_form import _FORM_EVIDENCE
+
+    unknown = safe_form_evidence()
+    blockers = {'unknown', 'response_url', 'duplicate_attributes', 'document_markup',
+                'editor_markup', 'control_conflict', 'unsupported_controls', 'ambiguous_context'}
+    assert set(_FORM_EVIDENCE['evidence_blocker']) == blockers | {'none', 'cache_unavailable'}
+    # Independent catalogue of permitted observations; everything else is denied.
+    allowed = [unknown, dict(unknown, source='cache', evidence_blocker='cache_unavailable')]
+    allowed += [dict(unknown, source='response', evidence_blocker=blocker) for blocker in blockers]
+    allowed += [dict(unknown, source='response', controls='recognized', evidence_blocker='none',
+                     new_form_context=context, csrf_input_presence=csrf)
+                for context, csrf in product(('unknown', 'candidate'), ('absent', 'present'))]
+    for values in product(*_FORM_EVIDENCE.values()):
+        value = dict(zip(_FORM_EVIDENCE, values))
+        assert safe_form_evidence(value) == (value if value in allowed else unknown)
+    for key in unknown:
+        missing = dict(unknown)
+        del missing[key]
+        assert safe_form_evidence(missing) == unknown
+        assert safe_form_evidence(dict(unknown, **{key: 'SYNTHETIC_PRIVATE_VALUE'})) == unknown
 
 
 def test_concurrent_evidence_calls_share_one_account_get(service):
