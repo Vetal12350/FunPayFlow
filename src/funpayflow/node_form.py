@@ -223,6 +223,169 @@ def _form_evidence(html, soup, form, schema):
     return safe_form_evidence(result)
 
 
+_PROOF_PREDICATES = (
+    'editor_url', 'document_markup', 'form_subtree', 'submission', 'blank_identity',
+    'new_semantics', 'csrf_presence', 'manual_control', 'manual_delivery', 'node_identity',
+    'currency_control', 'currency',
+    'control_inventory', 'select_names', 'response_id', 'no_retry_post',
+)
+_PROOF_COUNTS = ('control_count', 'hidden_count', 'duplicate_count', 'unknown_count')
+_PROOF_STATES = frozenset({'verified', 'absent', 'ambiguous', 'unverified'})
+
+
+def safe_contract_proof(value=None):
+    """Bounded observations only. No GET can establish a publishing capability."""
+    empty = dict(availability='unavailable', publish_ready=False,
+                 **dict.fromkeys(_PROOF_PREDICATES, 'unverified'),
+                 **dict.fromkeys(_PROOF_COUNTS, 0))
+    if (type(value) is not dict or value.keys() != empty.keys()
+            or type(value['availability']) is not str
+            or value['availability'] not in ('unavailable', 'response') or value['publish_ready'] is not False
+            or any(type(value[k]) is not str or value[k] not in _PROOF_STATES for k in _PROOF_PREDICATES)
+            or any(type(value[k]) is not int or not 0 <= value[k] <= 1001 for k in _PROOF_COUNTS)
+            or any(value[k] != 'unverified' for k in (
+                'new_semantics', 'manual_delivery', 'currency', 'response_id', 'no_retry_post'))
+            or (value['availability'] == 'unavailable' and value != empty)):
+        return empty
+    return dict(value)
+
+
+class _EditorMarkup(_EvidenceMarkup):
+    """Strict original subtree, never a BeautifulSoup-repaired serialization."""
+    def __init__(self):
+        super().__init__()
+        self.active = self.complete = False
+        self.count = 0
+
+    def handle_starttag(self, tag, attrs):
+        if tag == 'form' and 'form-offer-editor' in (dict(attrs).get('class') or '').split():
+            self.count += 1
+            self.active = True
+        if self.active:
+            if tag == 'form' and self.stack:
+                self.valid = False
+            super().handle_starttag(tag, attrs)
+
+    def handle_endtag(self, tag):
+        if self.active:
+            super().handle_endtag(tag)
+            if tag == 'form':
+                self.active = False
+                self.complete = True
+
+    def handle_startendtag(self, tag, attrs):
+        if self.active or tag == 'form':
+            super().handle_startendtag(tag, attrs)
+
+    def handle_data(self, data):
+        if self.active:
+            super().handle_data(data)
+
+
+def prove_new_form_contract(html, response_url, node_id=986):
+    """Pure offline proof of observations for node 986, not NEW wire semantics.
+
+    The three names come from the ordinary safe SELECT parser, never a guessed
+    live mapping. Blank identity is literal presence, not a NEW authorization.
+    All DOM/values are transient; the result contains only fixed enums/counts.
+    """
+    result = safe_contract_proof()
+    if node_id != 986 or type(node_id) is not int:
+        return result
+    result['availability'] = 'response'
+    try:
+        url = urlsplit(response_url)
+        result['editor_url'] = 'verified' if (
+            type(response_url) is str and not re.search(r'[\s\\\x00-\x1f\x7f]', response_url)
+            and url.scheme == 'https' and url.netloc in {'funpay.com', 'www.funpay.com'}
+            and url.path in {'/lots/offerEdit', '/en/lots/offerEdit', '/uk/lots/offerEdit'}
+            and not url.fragment
+            and parse_qs(url.query, keep_blank_values=True) == {'node': ['986']}) else 'ambiguous'
+        # Preserve all ordinary parser rejections, including EDIT/nonmatching node.
+        schema = _parse(html, node_id)
+        soup = BeautifulSoup(html, 'html.parser')
+        form = soup.select_one('form.form-offer-editor')
+        document, subtree = _EvidenceMarkup(), _EditorMarkup()
+        for markup in (document, subtree):
+            markup.feed(html)
+            markup.close()
+        result['document_markup'] = 'verified' if document.valid and not document.stack else 'ambiguous'
+        valid = (subtree.valid and not subtree.stack and subtree.complete and subtree.count == 1
+                 and not form.find_parent('form') and not form.find('form')
+                 and not _hidden(form) and not _disabled(form)
+                 and not soup.find('base')
+                 and not form.select_one('script, style, link, meta, template, noscript, iframe, object, '
+                                         'output, keygen, svg, math')
+                 and not any(tag.has_attr('form') for tag in soup.find_all(['input', 'select', 'textarea', 'button']))
+                 and not any(k.startswith('on') for tag in [form, *form.find_all(True)] for k in tag.attrs))
+        result['form_subtree'] = 'verified' if valid else 'ambiguous'
+        if not valid:
+            return safe_contract_proof(result)
+        controls = form.find_all(['input', 'select', 'textarea', 'button'])
+        names = [c.get('name') for c in controls]
+        for key, name in (('manual_control', 'auto_delivery'), ('currency_control', 'currency')):
+            count = names.count(name)
+            result[key] = 'absent' if not count else 'unverified' if count == 1 else 'ambiguous'
+        result['control_count'] = min(len(controls), 1001)
+        result['hidden_count'] = min(sum(c.get('type') == 'hidden' or _hidden(c) for c in controls), 1001)
+        result['duplicate_count'] = min(len(names) - len(set(names)), 1001)
+        category_names = {f['html_name'] for f in schema['fields']}
+        inputs = {'node_id': {'hidden'}, 'offer_id': {'hidden'}, 'csrf_token': {'hidden'},
+                  'price': {'text', 'number'}, 'amount': {'text', 'number'},
+                  'auto_delivery': {'checkbox'}, 'active': {'checkbox'},
+                  'deactivate_after_sale': {'checkbox'}}
+        texts = {f'fields[{field}][{locale}]' for field in ('summary', 'desc', 'payment_msg')
+                 for locale in ('ru', 'en')}
+
+        def recognized(c):
+            name = c.get('name')
+            if (_hidden(c) or _disabled(c) or c.find_parent(['input', 'select', 'textarea', 'button'])
+                    or any(k in c.attrs for k in ('formaction', 'formmethod', 'formenctype', 'formtarget'))):
+                return False
+            return ((c.name == 'select' and name in category_names
+                     and not c.find(lambda tag: tag.name not in {'option', 'optgroup'})
+                     and all(not option.find(True) for option in c.find_all('option')))
+                    or (c.name == 'textarea' and name in texts)
+                    or (c.name == 'input' and c.get('type', 'text') in inputs.get(name, set()))
+                    or (c.name == 'input' and name in texts and c.get('type', 'text') == 'text')
+                    or (c.name == 'button' and name is None and c.get('type', 'submit') in {'button', 'submit'}))
+        result['unknown_count'] = min(sum(not recognized(c) for c in controls), 1001)
+        clean = not result['duplicate_count'] and not result['unknown_count']
+        result['control_inventory'] = 'verified' if clean else 'ambiguous'
+        action = urlsplit(form.get('action', ''))
+        result['submission'] = 'verified' if (
+            result['editor_url'] == 'verified'
+            and not re.search(r'[\s\\\x00-\x1f\x7f]', form.get('action', ''))
+            and action.path in {'/lots/offerSave', '/en/lots/offerSave', '/uk/lots/offerSave'}
+            and (not action.scheme or action.scheme == 'https')
+            and (not action.netloc or action.netloc == 'funpay.com')
+            and (not action.scheme or action.netloc == 'funpay.com')
+            and not action.query and not action.fragment
+            and form.get('method', '').lower() == 'post'
+            and form.get('enctype', 'application/x-www-form-urlencoded').lower() == 'application/x-www-form-urlencoded'
+            and not any(c.has_attr(k) for c in controls for k in (
+                'formaction', 'formmethod', 'formenctype', 'formtarget'))
+        ) else 'ambiguous'
+        for key, name, expected in (('blank_identity', 'offer_id', ''),
+                                    ('node_identity', 'node_id', '986'),
+                                    ('csrf_presence', 'csrf_token', None)):
+            found = [c for c in controls if c.get('name') == name]
+            result[key] = 'absent' if not found else 'ambiguous'
+            if (clean and len(found) == 1 and found[0].name == 'input'
+                    and found[0].get('type') == 'hidden'
+                    and type(found[0].get('value')) is str
+                    and (bool(found[0]['value'].strip()) if expected is None else found[0]['value'] == expected)):
+                result[key] = 'verified'
+        result['select_names'] = 'verified' if (
+            clean and len(category_names) == 3 and all(is_safe_node_binding_name(n) for n in category_names)
+            and len(form.find_all('select')) == 3) else 'ambiguous'
+    except Exception:
+        # Never expose input or exception messages, including malformed URLs.
+        return dict(safe_contract_proof(), availability='response', editor_url=result['editor_url'],
+                    form_subtree='ambiguous')
+    return safe_contract_proof(result)
+
+
 def _safe_facts(facts):
     clean = {}
     if not isinstance(facts, dict):
@@ -524,17 +687,21 @@ class NodeFormService:
     def get(self, node_id, force=False):
         return self._read(node_id, force=force)
 
-    def get_with_evidence(self, node_id):
+    def get_with_evidence(self, node_id, *, contract_proof=None):
         """Same cached GET, plus transient enums; no force, retry or extra read.
 
         Cache hits intentionally carry no structural evidence. A response means
         obtained by this call, not proof of freshness, NEW or a bounded request.
         """
-        return self._read(node_id, include_evidence=True)
+        if type(contract_proof) is dict:
+            contract_proof.clear()
+            contract_proof.update(safe_contract_proof())
+        return self._read(node_id, include_evidence=True, contract_proof=contract_proof)
 
-    def _read(self, node_id, force=False, include_evidence=False):
+    def _read(self, node_id, force=False, include_evidence=False, contract_proof=None):
         try:
-            return self._get(node_id, force=force, include_evidence=include_evidence)
+            return self._get(node_id, force=force, include_evidence=include_evidence,
+                             contract_proof=contract_proof)
         except NodeFormError as error:
             logger.warning('NodeForm failure ' + json.dumps(error.diagnostic, sort_keys=True))
             raise NodeFormError(error.reason, **error.facts) from None
@@ -542,7 +709,7 @@ class NodeFormService:
             logger.warning('NodeForm failure ' + json.dumps({'reason': 'UNEXPECTED'}))
             raise NodeFormError('UNEXPECTED') from None
 
-    def _get(self, node_id, force=False, include_evidence=False):
+    def _get(self, node_id, force=False, include_evidence=False, contract_proof=None):
         if not _positive(node_id) or self.locale not in {"ru", "en", "uk"}:
             raise NodeFormError('REQUEST_INVALID')
         with self.client._account_lock:
@@ -610,6 +777,8 @@ class NodeFormService:
                         or url.netloc not in {'funpay.com', 'www.funpay.com'} or url.fragment
                         or parse_qs(url.query, keep_blank_values=True) != {'node': [str(node_id)]}):
                     evidence = dict(safe_form_evidence(), source='response', evidence_blocker='response_url')
+                if include_evidence and type(contract_proof) is dict:
+                    contract_proof.update(prove_new_form_contract(html, final_url, node_id))
             except NodeFormError as error:
                 raise NodeFormError(error.reason, **{**facts, **error.facts}) from None
             except RequestFailedError as error:

@@ -13,7 +13,7 @@ from .product_store import ProductStore
 from .product_templates import TemplateService, default_template, validate_overrides, validate_variable_value, BUILTIN_TYPES
 from .product_drafts import validate_price
 from .node_products import NodeDraftService, LEGACY_NODE_VARIABLES, LEGACY_WARNING, STALE_WARNING, NodeSelectionError, NodeVariantConflictError, VARIANT_WARNING
-from .node_form import NodeFormError, NodeFormService, safe_form_evidence
+from .node_form import NodeFormError, NodeFormService, safe_form_evidence, safe_contract_proof
 from . import telegram_node_fields as node_ui
 from .product_variants import VariantService
 from .state import StateError
@@ -348,14 +348,21 @@ async def _check_route_form(callback, user_id, parts, store, templates, routes):
         # Validate again after acquiring the same lock used by all Account work.
         with routes.client._account_lock:
             current()
-            schema, evidence = NodeFormService(routes.client, store).get_with_evidence(state['route']['node_id'])
+            row = state['route']
+            proof = {} if (row['node_id'] == 986 and row['metadata']['category_id'] == 274
+                           and row['metadata']['type'] == 'COMMON'
+                           and state['template']['id'] == 'GAME_KEY') else None
+            schema, evidence = NodeFormService(routes.client, store).get_with_evidence(
+                row['node_id'], contract_proof=proof)
             current()
-            return min(100, len(schema['fields'])), safe_form_evidence(evidence)
+            return min(100, len(schema['fields'])), safe_form_evidence(evidence), proof
 
     try:
-        count, evidence = await asyncio.to_thread(read)
+        count, evidence, proof = await asyncio.to_thread(read)
         status = f'доступна\nВидимых SELECT-полей: {count} (метаданные).'
         status += '\n' + _route_form_evidence_text(evidence)
+        if proof is not None:
+            status += '\n' + _route_contract_proof_text(proof)
     except NodeFormError as cause:
         status = 'не удалось прочитать\n' + node_ui.safe_error_text(cause)
     except (ValueError, KeyError, IndexError, StateError, sqlite3.Error):
@@ -368,6 +375,25 @@ async def _check_route_form(callback, user_id, parts, store, templates, routes):
         'get может вернуть кеш до 900 с; клиент следует редиректам. '
         'Это не гарантированно одна ограниченная HTTP-транзакция.',
         reply_markup=_menu([[('🔙 Маршрут', f"prd:route:{row['id']}")], [('Лоты', 'products')]]))
+
+
+def _route_contract_proof_text(value):
+    proof = safe_contract_proof(value)
+    # Keys and values are revalidated; no response-derived text is interpolated.
+    rows = [('URL', 'editor_url'), ('Документ', 'document_markup'), ('Поддерево', 'form_subtree'),
+            ('Action/POST/encoding', 'submission'), ('Blank identity', 'blank_identity'),
+            ('NEW semantics', 'new_semantics'), ('CSRF presence', 'csrf_presence'),
+            ('Manual control', 'manual_control'), ('Manual semantics', 'manual_delivery'),
+            ('Node', 'node_identity'), ('Currency control', 'currency_control'),
+            ('Currency semantics', 'currency'), ('Controls', 'control_inventory'),
+            ('3 SELECT names', 'select_names'), ('Response ID', 'response_id'),
+            ('No-retry POST', 'no_retry_post')]
+    return ('Contract proof: ' + proof['availability'] + '\n'
+            + '\n'.join(label + ': ' + proof[key] for label, key in rows)
+            + '\nControls/hidden/duplicates/unknown: '
+            + '/'.join(str(proof[k]) for k in (
+                'control_count', 'hidden_count', 'duplicate_count', 'unknown_count'))
+            + '\npublish_ready: false; публикация OFF.')
 
 
 def _route_form_evidence_text(evidence):
