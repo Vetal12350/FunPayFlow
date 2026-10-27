@@ -1,5 +1,77 @@
 # Создание лота FunPay: evidence и блокер
 
+## Publisher v1 — offline vertical slice, 2026-10-27
+
+**Работает сейчас:** один сохранённый product draft `GAME_KEY` / Elden Ring,
+category 274 / COMMON node 986 → проверенный business payload → синтетический
+transport → exact-ID read-back → durable `CONFIRMED` либо `UNKNOWN`.
+Реальная публикация остаётся **OFF**. Это реализация offline пути, а не новое
+наблюдение FunPay или подтверждение create-контракта. Исторический аудит ниже
+сохраняется; его рекомендация не добавлять каркас относится к прежнему этапу.
+
+- [lot_publisher.py](../src/funpayflow/lot_publisher.py) использует существующий
+  scoped `ProductStore` и сохранённые `NodeDraftService` drafts. Проверяет owner,
+  account и экземпляр Account, draft/route/template revisions и snapshots,
+  node/category/type, полный явный выбор options, fingerprint, возраст схемы
+  0–300 секунд, RU/EN тексты, цену и quantity=1. Variant drafts пока отклоняются.
+  Валюта отсутствует в существующем draft: в harness она явно задаётся при
+  подготовке и должна совпасть с `FormContext`; нет подразумеваемой валюты или
+  конвертации. Поддержаны только synthetic USD/EUR/RUB.
+- Business allowlist не содержит identity, CSRF, goods, cookies или скрытых
+  controls. `SYNTHETIC_NEW` / `SYNTHETIC_MANUAL` — **только mock-протокол**, не
+  реальные значения `offer_id` / `auto_delivery`. `FormContext` с обычным
+  response/cache/unverified provenance не допускается. Service controls живут
+  только в памяти, не входят в prepared summary или SQLite.
+- `SyntheticTransport.submit_once` всегда бросает `LIVE_DISABLED`; реализация
+  заменяется только в тестах. Live Account отвергается ещё до чтения профиля.
+  Ни HTTP-адаптера, ни settings/env switch, ни Telegram publish callback нет.
+  `PreparedLot.summary()` возвращает только фиксированные безопасные метаданные.
+  Telegram flow оставлен прежним: без доказанного form/currency контракта он
+  не должен выдавать synthetic preparation за готовность реального предложения.
+- В существующей SQLite добавлена только `lot_publish_attempts`, с UNIQUE scope
+  `(owner_id, account_id, draft_id)`, **независимо от revision**. `BEGIN IMMEDIATE`
+  повторно читает текущие scoped snapshots и фиксирует `UNKNOWN/CLAIMED` до
+  границы transport. Первая и поздняя проверки используют общий Account RLock,
+  runtime action gate и обязательный `late_check` (по умолчанию закрыт).
+  Отмена/изменение после claim консервативно расходует попытку. Claim никогда
+  не удаляется, не истекает и не становится retryable; crash уже оставляет
+  UNKNOWN без recovery rewrite. Гарантия относится к одному saved draft ID;
+  это не серверная идемпотентность и не дедупликация разных/клонированных drafts.
+- Mock моделирует одну отправку в `lots/offerSave` с redirects=False и
+  max_attempts=1. Missing/conflicting ID, redirect/resend, exception, timeout,
+  crash или ошибка result commit не разрешают повтор. Сверяются точный новый
+  ID, owner profile, category/node/type, все подготовленные business fields,
+  manual mode и неизменность business snapshots остальных лотов через fake
+  `get_user` / `get_lot_fields`. Нет поиска по title, edit/delete или rollback.
+  Baseline существует только в памяти; после crash автоматического reconciliation
+  нет. Таблица попыток хранит только scope, revision, timestamp, фиксированные
+  state/reason и подтверждённый ID — без payload, HTML, токенов и exception text.
+
+**Source evidence:** повторно прочитаны локальные locked FunPayAPI 1.1.0
+`Account.method`, `get_lot_fields`, `save_lot`, `LotFields` и API профиля.
+`get_lot_fields` читает существующий offer; `save_lot` не возвращает ID, а
+`method` не предоставляет per-call запрет redirects. Поэтому они не используются
+для отправки. `LotFields.lot_id` и `UserProfile.id` повторяют аргументы запроса:
+это не независимая identity ответа. Harness дополнительно требует synthetic
+`offer_id`/`node_id`/`user_id` в read-back; этот live-контракт тоже не доказан.
+Cardinal main и его лицензия заново не получались: задача
+выполняется offline. Сторонний код не копировался; прежняя ссылка на pinned
+Cardinal source ниже — историческое evidence, не проверка текущего main.
+
+**Перед отдельно одобренным owner experiment остаются конкретные proofs:**
+точная NEW identity без заимствования edit identity; свежий create-CSRF и его
+связь с Account/form; реальный набор полей/options node 986, currency и explicit
+manual/visibility controls; HTTP transport без redirect/replay/retry; однозначный
+response ID и свежий exact-ID read-back owner/node/business/manual состояния.
+Три видимых SELECT и `candidate` этого не доказывают. Нужны независимый review
+и отдельное разрешение владельца; этот код не содержит переключателя live test.
+
+PR handoff: изменения ограничены новым publisher/test, additive таблицей в
+`state.py` и двумя документами. `CURRENT_STATE` оценён, но не меняется: production
+snapshot прежний, файл вне разрешённого scope. Commit/push/PR/merge/deploy здесь
+не выполняются; PR создаёт trusted worker. Hosted Windows/Linux CI и Product/Core
+QA остаются за worker.
+
 Проверено 2026-10-21, source HEAD `683a101680fc8df0d02d7a5ee60c4113445713b2`.
 **Решение: Publish остаётся OFF; publisher adapter skeleton пока не обоснован.**
 Нового доказанного create-контракта сверх прежних документов не найдено.

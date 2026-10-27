@@ -390,6 +390,13 @@ class ReviewReceiptStore:
                     ).fetchone()
                     from .product_store import initialize_schema
                     initialize_schema(connection)
+                    connection.execute(
+                        "CREATE TABLE IF NOT EXISTS lot_publish_attempts ("
+                        "owner_id TEXT NOT NULL, account_id INTEGER NOT NULL, draft_id TEXT NOT NULL, "
+                        "revision INTEGER NOT NULL, state TEXT NOT NULL CHECK(state IN ('UNKNOWN','CONFIRMED')), "
+                        "reason TEXT NOT NULL, remote_id INTEGER, created_at REAL NOT NULL, "
+                        "PRIMARY KEY(owner_id,account_id,draft_id))"
+                    )
                     if connection.execute("PRAGMA quick_check").fetchone() != ("ok",):
                         raise StateError("Persistent state integrity check failed.")
         except (sqlite3.Error, OSError):
