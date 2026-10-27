@@ -573,7 +573,7 @@ def test_evidence_does_not_refresh_an_ordinary_cached_schema(service):
     ('<template><input type="hidden" name="csrf_token" value="x"></template>', 'editor_markup'),
     ('<input name="price" onclick="SYNTHETIC_PRIVATE_VALUE">', 'editor_markup'),
     ('<input name="price"/><input name="price">', 'control_conflict'),
-    ('<fieldset><input name="price"></div>', 'document_markup'),
+    ('<fieldset><input name="price"></div>', 'document_tag_mismatch'),
     ('<object name="SYNTHETIC_PRIVATE_NAME"></object>', 'editor_markup'),
     ('<form></form>', 'editor_markup'),
     ('<div hidden><input name="price"></div>', 'unsupported_controls'),
@@ -619,11 +619,11 @@ def test_missing_or_ambiguous_new_identity_is_unknown(service, old, new):
 @pytest.mark.parametrize('prefix,suffix,blocker', [
     ('<!doctype html><html><head><title>Page</title></head><body><main>',
      '</main></body></html>', 'none'),
-    ('<!doctype html><html><head><title>Page</title></head><body>', '', 'document_markup'),
-    ('<html><head><meta charset="utf-8"><body>', '</body></html>', 'document_markup'),
-    ('<html><body><p>Page', '</body></html>', 'document_markup'),
-    ('<html><body><div><span></div></span>', '</body></html>', 'document_markup'),
-    ('<html><body><div/>', '</body></html>', 'document_markup'),
+    ('<!doctype html><html><head><title>Page</title></head><body>', '', 'document_unclosed_tags'),
+    ('<html><head><meta charset="utf-8"><body>', '</body></html>', 'document_tag_mismatch'),
+    ('<html><body><p>Page', '</body></html>', 'document_tag_mismatch'),
+    ('<html><body><div><span></div></span>', '</body></html>', 'document_tag_mismatch'),
+    ('<html><body><div/>', '</body></html>', 'document_self_closing'),
     ('<html><body><aside title="a" title="b"></aside>', '</body></html>', 'duplicate_attributes'),
     ('<html><head><base href="https://example.invalid/"></head><body>', '</body></html>', 'editor_markup'),
 ])
@@ -637,10 +637,62 @@ def test_evidence_checks_full_document_without_relaxing_html_rules(service, pref
     assert evidence['controls'] == ('recognized' if blocker == 'none' else 'unknown')
 
 
+@pytest.mark.parametrize('prefix,suffix,blocker', [
+    # Legitimate omissions outside the editor remain UNKNOWN. These fixtures
+    # establish parser behavior only; they do not explain any live response.
+    ('<html><head><title>Page</title><body>', '</body></html>', 'document_tag_mismatch'),
+    ('<html><body>', '', 'document_unclosed_tags'),
+    ('<p>Intro', '', 'document_unclosed_tags'),
+    ('<ul><li>One<li>Two</ul>', '', 'document_tag_mismatch'),
+    ('<dl><dt>Term<dd>Definition</dl>', '', 'document_tag_mismatch'),
+    ('<table><tbody><tr><td>One<td>Two</table>', '', 'document_tag_mismatch'),
+    # Malformed/ambiguous constructs must never be repaired into evidence.
+    ('</SYNTHETIC_PRIVATE_TAG>', '', 'document_tag_mismatch'),
+    ('<SYNTHETIC_PRIVATE_TAG>', '', 'document_unclosed_tags'),
+    ('<div/>', '', 'document_self_closing'),
+    ('<span title="SYNTHETIC_PRIVATE_VALUE">&lt;</span>', '', 'document_text'),
+    ('<script>if (a < b) {}</script>', '', 'document_text'),
+    ('', '<div><span></div></span>', 'document_tag_mismatch'),
+])
+def test_document_diagnosis_is_transient_fixed_enum_without_acceptance(service, monkeypatch, prefix, suffix, blocker):
+    html = prefix + evidence_form(
+        '<input type="hidden" name="csrf_token" value="SYNTHETIC_PRIVATE_VALUE">') + suffix
+    ordinary = parse_node_form(html, 976)
+    service.client.account.response.content = html.encode()
+    logs = []
+    monkeypatch.setattr('funpayflow.node_form.logger.warning', logs.append)
+    schema, evidence = service.get_with_evidence(976)
+    assert evidence == dict(safe_form_evidence(), source='response', evidence_blocker=blocker)
+    assert schema['fields'] == ordinary['fields']
+    assert schema['fingerprint'] == ordinary['fingerprint']
+    assert safe_form_evidence(evidence) == evidence
+    entry = next(iter(service.client._node_form_cache.values()))
+    assert set(entry) == {'account', 'expires', 'schema'}
+    assert 'evidence_blocker' not in json.dumps(entry['schema'])
+    assert 'SYNTHETIC_PRIVATE' not in json.dumps([schema, evidence, logs])
+    assert service.get_with_evidence(976)[1] == dict(
+        safe_form_evidence(), source='cache', evidence_blocker='cache_unavailable')
+    assert len(service.client.account.calls) == 1 and logs == []
+
+
+@pytest.mark.parametrize('reverse', [False, True])
+@pytest.mark.parametrize('parts,blocker', [
+    (['<div/>', '&lt;', '</aside>', '<section>'], 'document_self_closing'),
+    (['&lt;', '</aside>', '<section>'], 'document_text'),
+    (['</aside>', '<section>'], 'document_tag_mismatch'),
+    (['<div/>', '<aside title="a" TITLE="b"></aside>'], 'duplicate_attributes'),
+])
+def test_document_diagnosis_precedence_is_fixed(service, parts, blocker, reverse):
+    service.client.account.response.content = (evidence_form() + ''.join(
+        parts[::(-1 if reverse else 1)])).encode()
+    assert service.get_with_evidence(976)[1] == dict(
+        safe_form_evidence(), source='response', evidence_blocker=blocker)
+
+
 @pytest.mark.parametrize('reverse', [False, True])
 @pytest.mark.parametrize('extras,blocker', [
     (['<div>', '<input name="price" name="price">'], 'duplicate_attributes'),
-    (['<div>', '<script></script>'], 'document_markup'),
+    (['<div>', '<script></script>'], 'document_tag_mismatch'),
     (['<script></script>', '<input><input disabled>'], 'editor_markup'),
     (['<input disabled name="price">', '<input>'], 'control_conflict'),
     (['<input name="unknown">', '<input type="hidden" name="offer" value="0">'], 'unsupported_controls'),
@@ -745,6 +797,7 @@ def test_evidence_schema_and_cross_field_invariants_exhaustively():
 
     unknown = safe_form_evidence()
     blockers = {'unknown', 'response_url', 'duplicate_attributes', 'document_markup',
+                'document_tag_mismatch', 'document_unclosed_tags', 'document_self_closing', 'document_text',
                 'editor_markup', 'control_conflict', 'unsupported_controls', 'ambiguous_context'}
     assert set(_FORM_EVIDENCE['evidence_blocker']) == blockers | {'none', 'cache_unavailable'}
     # Independent catalogue of permitted observations; everything else is denied.
