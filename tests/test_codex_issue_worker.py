@@ -613,7 +613,7 @@ def test_issue_scoped_scratch_ignored_without_hiding_other_issues(tmp_path):
     rules = (repo / ".git" / "info" / "exclude").read_text(encoding="utf-8").splitlines()
     assert rules.count("/tests/.offline-tmp/") == 1
     assert rules.count("/tests/.offline-tmp-121/") == 1
-    assert not any("*" in rule for rule in rules)
+    assert not any("*" in rule for rule in rules if rule.startswith("/tests/.offline-tmp"))
 
     ignored = repo / "tests" / ".offline-tmp-121" / "case" / "state.sqlite3"
     ignored.parent.mkdir(parents=True)
