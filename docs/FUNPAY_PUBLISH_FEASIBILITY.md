@@ -1,5 +1,32 @@
 # Создание лота FunPay: evidence и блокер
 
+## NEW-form → envelope: только offline, 2026-10-27
+
+`create_wire_contract.py` содержит чистую `assemble_new_request(PreparedLot,
+NewFormFacts, now=...)`: без HTML parser, HTTP, Account, persistence или live switch.
+Вызывающий код передаёт полный проверенный synthetic form inventory как tuple,
+сохраняя duplicate controls; произвольный HTML и production forms не принимаются.
+Профиль `synthetic-new-v1` требует точный fresh URL node 986, action offerSave,
+POST/form encoding, совпадающие timestamp/fingerprint, currency/options и CSRF.
+Blank `offer_id`, `SYNTHETIC_MANUAL`, `currency=USD/EUR/RUB`, пустые visibility
+controls — **fixture facts**, не доказанные значения реальной NEW-формы.
+Поля не угадываются: missing/duplicate/unknown/edit controls дают fixed error.
+Envelope immutable, bounded, разделяет transient service и business tuples;
+policy фиксирована: `lots/offerSave`, POST, form encoding, redirects=False,
+max_attempts=1. Secret-bearing tuples предназначены только для памяти;
+repr скрывает значения, сериализации/логирования/сохранения адаптер не выполняет.
+Локально перечитанный FunPayAPI 1.1.0 подтверждает offerSave/form encoding и
+`location=trade`, но его edit-only getter и save без ID не используются.
+Cardinal source не загружался (offline); сторонний код не копировался.
+Fake seam существует только в тестах: durable claim и safety gates не менялись;
+success без independently verified exact NEW ID, redirect/replay остаются UNKNOWN.
+Response parser отсутствует. Envelope не разрешает первую или повторную отправку.
+Остаются live blockers: полный документ node 986, NEW identity, manual/currency/
+visibility и session-CSRF binding, transport без replay, response ID и exact read-back.
+Три SELECT остаются owner report, не verified full-document evidence. Следующий
+шаг требует отдельного owner-approved read-only proof, затем отдельного write opt-in.
+`CURRENT_STATE` оценён: production snapshot прежний; этот файл вне scope задачи.
+
 ## Publisher v1 — offline vertical slice, 2026-10-27
 
 **Работает сейчас:** один сохранённый product draft `GAME_KEY` / Elden Ring,
