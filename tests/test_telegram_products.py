@@ -468,6 +468,10 @@ def test_route_form_ui_revalidates_evidence_and_never_interpolates_unknown_value
     ('response_url', 'неоднозначный адрес ответа'),
     ('duplicate_attributes', 'повторяющиеся атрибуты разметки'),
     ('document_markup', 'неоднозначная разметка HTML'),
+    ('document_tag_mismatch', 'несовпадение закрывающего тега со строгим стеком HTML'),
+    ('document_unclosed_tags', 'непустой строгий стек тегов в конце HTML'),
+    ('document_self_closing', 'самозакрывающийся обычный тег HTML'),
+    ('document_text', 'неоднозначный текст HTML'),
     ('editor_markup', 'неподдерживаемая разметка формы'),
     ('control_conflict', 'конфликт элементов формы'),
     ('unsupported_controls', 'неподдерживаемые элементы формы'),
@@ -484,7 +488,7 @@ def test_route_form_blocker_has_one_fixed_russian_line(blocker, reason):
 
 
 @pytest.mark.parametrize('kind,reason', [
-    ('markup', 'неоднозначная разметка HTML'),
+    ('markup', 'непустой строгий стек тегов в конце HTML'),
     ('control', 'неподдерживаемые элементы формы'),
     ('url', 'неоднозначный адрес ответа'),
 ])

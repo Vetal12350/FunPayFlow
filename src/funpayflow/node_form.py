@@ -64,7 +64,8 @@ _FORM_EVIDENCE = {
     'submit_contract': ('unverified',),
     'response_id': ('unverified',),
     'evidence_blocker': ('unknown', 'none', 'cache_unavailable', 'response_url',
-                         'duplicate_attributes', 'document_markup', 'editor_markup',
+                         'duplicate_attributes', 'document_markup', 'document_tag_mismatch',
+                         'document_unclosed_tags', 'document_self_closing', 'document_text', 'editor_markup',
                          'control_conflict', 'unsupported_controls', 'ambiguous_context'),
 }
 
@@ -94,6 +95,7 @@ class _EvidenceMarkup(HTMLParser):
     """Reject repaired/ambiguous markup for evidence, without changing _parse.
 
     Even legal omitted end tags are unknown in this deliberately narrow path.
+    Diagnoses describe strict-stack observations, not HTML conformance or cause.
     Only tag names are stacked, never attribute names/values or response text.
     """
     _void = frozenset('area base br col embed hr img input link meta param source track wbr'.split())
@@ -102,6 +104,7 @@ class _EvidenceMarkup(HTMLParser):
         super().__init__(convert_charrefs=True)
         self.valid, self.stack = True, []
         self.duplicate_attributes = False
+        self.tag_mismatch = self.self_closing = self.ambiguous_text = False
 
     def handle_starttag(self, tag, attrs):
         names = [name for name, _ in attrs]
@@ -115,16 +118,19 @@ class _EvidenceMarkup(HTMLParser):
         self.handle_starttag(tag, attrs)
         if tag not in self._void:
             self.valid = False  # HTML does not self-close ordinary elements.
+            self.self_closing = True
 
     def handle_endtag(self, tag):
         if not self.stack or self.stack[-1] != tag:
             self.valid = False
+            self.tag_mismatch = True
         else:
             self.stack.pop()
 
     def handle_data(self, data):
         if '<' in data:
             self.valid = False
+            self.ambiguous_text = True
 
 
 def _form_evidence(html, soup, form, schema):
@@ -143,8 +149,16 @@ def _form_evidence(html, soup, form, schema):
     # editor markup, control conflicts, unsupported controls, context aliases.
     if markup.duplicate_attributes:
         return dict(result, evidence_blocker='duplicate_attributes')
-    if not markup.valid or markup.stack:
-        return dict(result, evidence_blocker='document_markup')
+    # Fixed sub-priority, independent of encounter order. No repair/pop on a
+    # mismatch: optional end tags still fail closed, including outside the form.
+    for blocked, reason in (
+            (markup.self_closing, 'document_self_closing'),
+            (markup.ambiguous_text, 'document_text'),
+            (markup.tag_mismatch, 'document_tag_mismatch'),
+            (bool(markup.stack), 'document_unclosed_tags'),
+            (not markup.valid, 'document_markup')):
+        if blocked:
+            return dict(result, evidence_blocker=reason)
     if (form.find_parent('form') or form.find('form')
             or form.select_one('script, template, noscript, iframe, object, output, keygen')
             or soup.find('base')
