@@ -350,7 +350,7 @@ def test_worker_step_order_uses_only_observed_phases(tmp_path, monkeypatch):
     monkeypatch.setattr(worker, "git", lambda *args, **kwargs: "")
     # This test mocks git clone, so it has no .git/info/exclude metadata.
     # The exclusion itself is exercised by the separate real-offline-Git test.
-    monkeypatch.setattr(worker, "ignore_known_pytest_scratch", lambda checkout: None)
+    monkeypatch.setattr(worker, "ignore_known_pytest_scratch", lambda *args: None)
     monkeypatch.setattr(worker, "run_codex", lambda *args: calls.append("codex"))
     monkeypatch.setattr(worker, "changed_paths", lambda *args: ["tests/test_new.py"])
     monkeypatch.setattr(worker, "stage_and_pr", lambda *args: "https://github.com/Vetal12350/FunPayFlow/pull/88")
@@ -599,6 +599,44 @@ def test_known_pytest_scratch_ignored_only_in_local_checkout(tmp_path):
     with pytest.raises(worker.WorkerError, match="unauthorized file"):
         worker.changed_paths(repo)
     assert not worker.safe_path("tests/.offline-tmp/case/live_status.json")
+
+
+def test_issue_scoped_scratch_ignored_without_hiding_other_issues(tmp_path):
+    import subprocess
+
+    repo = tmp_path / "checkout"
+    repo.mkdir()
+    init = subprocess.run(["git", "init", "-q", str(repo)], capture_output=True, text=True)
+    assert init.returncode == 0
+    worker.ignore_known_pytest_scratch(repo, 121)
+    worker.ignore_known_pytest_scratch(repo, 121)  # idempotent
+    rules = (repo / ".git" / "info" / "exclude").read_text(encoding="utf-8").splitlines()
+    assert rules.count("/tests/.offline-tmp/") == 1
+    assert rules.count("/tests/.offline-tmp-121/") == 1
+    assert not any("*" in rule for rule in rules if rule.startswith("/tests/.offline-tmp"))
+
+    ignored = repo / "tests" / ".offline-tmp-121" / "case" / "state.sqlite3"
+    ignored.parent.mkdir(parents=True)
+    ignored.write_bytes(b"synthetic-test-only")
+    tracked_candidate = repo / "tests" / "test_allowed.py"
+    tracked_candidate.write_text("# synthetic allowed change")
+    assert worker.changed_paths(repo) == ["tests/test_allowed.py"]
+
+    # No wildcard: files from another job remain visible and BLOCKED.
+    stray = repo / "tests" / ".offline-tmp-122" / "unexpected.txt"
+    stray.parent.mkdir(parents=True)
+    stray.write_text("synthetic")
+    with pytest.raises(worker.WorkerError, match="unauthorized file"):
+        worker.changed_paths(repo)
+    assert not worker.safe_path("tests/.offline-tmp-121/case/state.sqlite3")
+
+
+def test_issue_scoped_scratch_rejects_invalid_issue_before_writing(tmp_path):
+    for invalid in (None, True, 0, -1, "121", 2**63):
+        if invalid is None:
+            continue  # compatibility: default no issue is supported
+        with pytest.raises(worker.WorkerError, match="Invalid issue number"):
+            worker.ignore_known_pytest_scratch(tmp_path, invalid)
 
 
 def test_known_pytest_scratch_refuses_untrusted_git_metadata(tmp_path):
