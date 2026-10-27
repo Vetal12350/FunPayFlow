@@ -387,6 +387,53 @@ def test_route_form_revalidates_account_after_waiting_for_shared_lock(context):
     asyncio.run(run())
 
 
+def test_route_contract_proof_same_owner_get_and_unavailable_cache(context):
+    ctx = context
+    ctx.nodes[0].id = 986
+    ctx.nodes[0].category.id = 274
+    route = seed_route(ctx)
+    original_get = ctx.client.account.method.side_effect
+
+    def get(*args, **kwargs):
+        response = original_get(*args, **kwargs)
+        response.content = response.content.replace(b'</form>',
+            b'<input type="hidden" name="csrf_token" value="SYNTHETIC_PRIVATE"></form>')
+        return response
+
+    ctx.client.account.method.side_effect = get
+
+    async def run():
+        before = database_snapshot(ctx)
+        cb, action = await route_form_button(ctx, route)
+        await view.products_callback(cb, action, 1)
+        shown = cb.message.answer.call_args.args[0]
+        assert 'Contract proof: response' in shown and 'publish_ready: false' in shown
+        assert 'Response ID: unverified' in shown and 'No-retry POST: unverified' in shown
+        assert 'Manual semantics: unverified' in shown
+        assert len(shown.encode('utf-16-le')) // 2 < 3600 and 'SYNTHETIC_PRIVATE' not in shown
+        assert 'contract_proof' not in repr(view._flows)
+        cb, action = await route_form_button(ctx, route)
+        await view.products_callback(cb, action, 1)
+        shown = cb.message.answer.call_args.args[0]
+        assert 'Contract proof: unavailable' in shown and 'CSRF presence: unverified' in shown
+        ctx.client.account.method.assert_called_once()
+        ctx.client.account.save_lot.assert_not_called()
+        assert database_snapshot(ctx) == before
+        retained = json.dumps([e['schema'] for e in ctx.client._node_form_cache.values()])
+        assert 'csrf_presence' not in retained and 'SYNTHETIC_PRIVATE' not in retained
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize('bad', [None, {'secret': 'SYNTHETIC_PRIVATE'},
+    dict(view.safe_contract_proof(), currency='SYNTHETIC_PRIVATE'),
+    dict(view.safe_contract_proof(), publish_ready=True)])
+def test_contract_proof_ui_fixed_size_and_sanitized(bad):
+    shown = view._route_contract_proof_text(bad)
+    assert shown == view._route_contract_proof_text(None)
+    assert 'Contract proof: unavailable' in shown and 'SYNTHETIC_PRIVATE' not in shown
+    assert len(shown.encode('utf-16-le')) // 2 < 1000
+
+
 def test_route_form_cache_reuse_and_expiry(context, monkeypatch):
     from funpayflow import node_form
     ctx = context

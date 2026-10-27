@@ -1,5 +1,44 @@
 # Создание лота FunPay: evidence и блокер
 
+## Один GET → ограниченная contract matrix, 2026-10-27
+
+`prove_new_form_contract(html, response_url, node_id=986)` — чистая offline
+функция наблюдения, без Account/HTTP/write capability. Существующая owner-кнопка
+показывает её результат только для saved `GAME_KEY`, category 274 / COMMON node
+986. Используются байты **того же** ответа существующего `get_with_evidence`,
+тот же Account/RLock и cache TTL 900 с. Нет второго GET, force refresh, retry,
+startup/background scan или новой кнопки. Cache hit явно даёт
+`availability=unavailable`: матрица не кешируется и не восстанавливается из схемы.
+Late owner/account/route/template проверки до и после чтения сохранены.
+
+Матрица содержит фиксированные ключи, статусы `verified/absent/ambiguous/unverified`,
+availability `response/unavailable`, четыре счётчика 0–1001 (controls, hidden,
+duplicates, unknown) и постоянный `publish_ready=false`. UI повторно проверяет
+формат целиком. HTML, URL, имена/значения controls/options, CSRF, cookies,
+заголовки и exception text не попадают в матрицу, flow, cache, SQLite или логи.
+Прежняя safe SELECT schema и старый диагностический результат не меняются.
+
+| Predicate | Независимо устанавливает код | Что остаётся недоказанным |
+| --- | --- | --- |
+| `editor_url` | HTTPS FunPay editor, ровно node=986, без offer/прочих query/fragment/userinfo/port. | Свежесть и отсутствие внутренних redirect/replay в Account.method. |
+| `document_markup` / `form_subtree` | Строгий исходный HTML отдельно от исходного поддерева единственного editor; нет nested forms, base, form= overrides, handlers, scripts в форме. | Browser/JS runtime semantics. Незакрытые внешние html/body допускают только частичное наблюдение; malformed internal tags не ремонтируются в доказательство. |
+| `submission` | Явные offerSave/action + POST, HTTPS для absolute action, form encoding (включая стандартный HTML default), без submit overrides. | Возможность безопасно отправить запрос и серверный create contract. |
+| `blank_identity` / `node_identity` | Один явный hidden offer_id с буквально пустым value и один node_id=986; zero не считается blank. Неоднозначный inventory не даёт verified identity. | `new_semantics` всегда unverified: blank не доказывает NEW, даже в synthetic fixture. |
+| `csrf_presence` | Один непустой hidden csrf_token; значение остаётся только в локальном разборе. | Session binding, freshness, server acceptance. |
+| `manual_control` / `currency_control` | Отсутствие, единичное непроверенное присутствие или неоднозначность одноимённых controls. | `manual_delivery` и `currency` всегда unverified: source не задаёт live mapping/default; SYNTHETIC_MANUAL, USD/EUR/RUB не превращаются в live evidence. Currency control также остаётся unknown inventory, пока нет доказанного live профиля. |
+| `control_inventory` / `select_names` | Дубликаты, hidden/disabled/unknown controls учитываются; ровно три видимых safe SELECT name согласованы с обычным parser schema. | Реальные имена Elden Ring не зашиты: три имени в synthetic тесте не подтверждают owner report или business bindings saved draft. |
+| `response_id` / `no_retry_post` | Только unverified. | GET не доказывает ID будущего ответа и transport policy POST. |
+
+**Publishing OFF.** В этом checkout не было реального GET/POST и live HTML не
+получался. Synthetic offline PASS не является live evidence. Для получения
+матрицы реальной формы нужны отдельно одобренные владельцем последующее
+deployment и нажатие существующей кнопки. Если матрица останется частичной,
+это не разрешает публикацию. Следующий supervised create milestone требует
+независимого review реального NEW/manual/currency/CSRF/visibility контракта,
+response ID/read-back и no-retry transport, затем отдельного разрешения на
+единственный real test publish. `CURRENT_STATE` оценён и не меняется: production
+snapshot прежний, документ вне разрешённого scope этой задачи.
+
 ## NEW-form → envelope: только offline, 2026-10-27
 
 `create_wire_contract.py` содержит чистую `assemble_new_request(PreparedLot,

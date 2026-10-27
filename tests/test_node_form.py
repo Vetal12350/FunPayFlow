@@ -10,7 +10,8 @@ import pytest
 from bs4 import BeautifulSoup
 from requests.exceptions import Timeout
 
-from funpayflow.node_form import NodeFormError, NodeFormService, parse_node_form, safe_form_evidence
+from funpayflow.node_form import (NodeFormError, NodeFormService, parse_node_form, safe_form_evidence,
+                                 prove_new_form_contract, safe_contract_proof)
 
 
 FIXTURES = Path(__file__).parent / "fixtures" / "node_forms"
@@ -502,6 +503,160 @@ def test_visible_service_selects_are_never_retained(name):
     assert actual['fields'] == original['fields']
     assert actual['fingerprint'] == original['fingerprint']
     assert 'SYNTHETIC_PRIVATE' not in json.dumps(actual)
+
+
+def contract_form(extra=''):
+    """Conceptual names only; deliberately no asserted manual/currency mapping."""
+    groups = ''.join('<div class="form-group"><label>Option</label>'
+                     f'<select name="{name}"><option value="SYNTHETIC_OPTION">Choice</option>'
+                     '</select></div>' for name in ('platform', 'edition', 'region'))
+    return ('<form class="form-offer-editor" action="/lots/offerSave" method="post">'
+            '<input name="node_id" type="hidden" value="986">'
+            '<input name="offer_id" type="hidden" value="">'
+            '<input name="csrf_token" type="hidden" value="SYNTHETIC_PRIVATE">'
+            + groups + extra + '</form>')
+
+
+CONTRACT_URL = 'https://funpay.com/lots/offerEdit?node=986'
+
+
+def test_contract_proof_independent_observations_are_not_live_semantics():
+    proof = prove_new_form_contract(contract_form(), CONTRACT_URL)
+    for key in ('editor_url', 'document_markup', 'form_subtree', 'submission',
+                'blank_identity', 'csrf_presence', 'node_identity', 'control_inventory', 'select_names'):
+        assert proof[key] == 'verified'
+    assert proof['manual_control'] == proof['currency_control'] == 'absent'
+    assert proof['hidden_count'] == 3 and proof['control_count'] == 6
+    for key in ('new_semantics', 'manual_delivery', 'currency', 'response_id', 'no_retry_post'):
+        assert proof[key] == 'unverified'
+    assert proof['publish_ready'] is False
+    assert len(json.dumps(proof)) < 900 and 'SYNTHETIC' not in json.dumps(proof)
+    assert safe_contract_proof(proof) == proof
+
+
+@pytest.mark.parametrize('url', [
+    CONTRACT_URL.replace('https:', 'http:'), CONTRACT_URL.replace('986', '987'),
+    CONTRACT_URL + '&offer=', CONTRACT_URL + '&node=986', CONTRACT_URL + '#edit',
+    CONTRACT_URL.replace('funpay.com', 'evil.example'), CONTRACT_URL + '&secret=SYNTHETIC_PRIVATE',
+    CONTRACT_URL.replace('funpay.com', 'user:pass@funpay.com'),
+    CONTRACT_URL.replace('https:', 'https:\n'),
+])
+def test_contract_proof_exact_https_url(url):
+    proof = prove_new_form_contract(contract_form(), url)
+    assert proof['editor_url'] == 'ambiguous' and proof['publish_ready'] is False
+    assert 'SYNTHETIC' not in json.dumps(proof) and url not in json.dumps(proof)
+
+
+@pytest.mark.parametrize('old,new,key', [
+    ('value="986"', 'value="987"', 'node_identity'),
+    ('name="offer_id" type="hidden" value=""', 'name="offer_id" type="hidden" value="42"', 'blank_identity'),
+    ('name="offer_id" type="hidden" value=""', 'name="offer_id" type="hidden" value="0"', 'blank_identity'),
+    ('action="/lots/offerSave"', 'action="http://funpay.com/lots/offerSave"', 'submission'),
+    ('action="/lots/offerSave"', 'action="https://evil.example/lots/offerSave"', 'submission'),
+    ('method="post"', 'method="get"', 'submission'),
+    ('method="post"', 'method="post" enctype="multipart/form-data"', 'submission'),
+    ('value="SYNTHETIC_PRIVATE"', 'value=""', 'csrf_presence'),
+])
+def test_contract_proof_wrong_identity_action_encoding_csrf(old, new, key):
+    proof = prove_new_form_contract(contract_form().replace(old, new), CONTRACT_URL)
+    assert proof[key] != 'verified' and proof['publish_ready'] is False
+
+
+@pytest.mark.parametrize('extra,key,state', [
+    ('<input name="offer_id" type="hidden" value="">', 'blank_identity', 'unverified'),
+    ('<input name="csrf_token" type="hidden" value="SYNTHETIC_OTHER">', 'control_inventory', 'ambiguous'),
+    ('<input name="secret" type="hidden" value="SYNTHETIC_PRIVATE">', 'control_inventory', 'ambiguous'),
+    ('<input name="price" hidden>', 'control_inventory', 'ambiguous'),
+    ('<input name="price" disabled>', 'control_inventory', 'ambiguous'),
+    ('<button formaction="https://evil.example">Submit</button>', 'submission', 'ambiguous'),
+    ('<input name="auto_delivery" type="checkbox" value="SYNTHETIC_MANUAL">', 'manual_control', 'unverified'),
+    ('<input name="auto_delivery" type="hidden" value="SYNTHETIC_MANUAL">', 'control_inventory', 'ambiguous'),
+    ('<input name="currency" type="hidden" value="USD">', 'currency_control', 'unverified'),
+    ('<input name="currency"><input name="currency">', 'currency_control', 'ambiguous'),
+    ('<script>throw "SYNTHETIC_PRIVATE";</script>', 'form_subtree', 'ambiguous'),
+    ('<style>select {display:none}</style>', 'form_subtree', 'ambiguous'),
+    ('<form><input name="price"></form>', 'form_subtree', 'ambiguous'),
+    ('<div><span></div>', 'form_subtree', 'ambiguous'),
+    ('<input name="price" name="SYNTHETIC_PRIVATE">', 'form_subtree', 'ambiguous'),
+    ('<select hidden name="forged"></select>', 'control_inventory', 'ambiguous'),
+])
+def test_contract_proof_hostile_and_unproven_controls(extra, key, state):
+    proof = prove_new_form_contract(contract_form(extra), CONTRACT_URL)
+    assert proof[key] == state
+    assert proof['publish_ready'] is False and 'SYNTHETIC' not in json.dumps(proof)
+    assert len(json.dumps(proof)) < 900
+
+
+@pytest.mark.parametrize('prefix,suffix', [('<html><body>', ''), ('<html><body><main>', '</main>')])
+def test_contract_proof_optional_outer_end_tags_allow_partial_observation_only(prefix, suffix):
+    proof = prove_new_form_contract(prefix + contract_form() + suffix, CONTRACT_URL)
+    assert proof['document_markup'] == 'ambiguous'
+    assert proof['form_subtree'] == proof['blank_identity'] == 'verified'
+    assert proof['publish_ready'] is False
+
+
+def test_contract_proof_external_form_owner_and_missing_controls():
+    html = contract_form().replace('class="form-offer-editor"', 'id="editor" class="form-offer-editor"')
+    proof = prove_new_form_contract(html + '<input form="editor" name="offer_id" value="42">', CONTRACT_URL)
+    assert proof['form_subtree'] == 'ambiguous' and proof['blank_identity'] != 'verified'
+    for name, key in [('offer_id', 'blank_identity'), ('csrf_token', 'csrf_presence')]:
+        soup = BeautifulSoup(contract_form(), 'html.parser')
+        soup.find('input', attrs={'name': name}).decompose()
+        assert prove_new_form_contract(str(soup), CONTRACT_URL)[key] == 'absent'
+
+
+def test_contract_proof_three_safe_names_are_not_a_guessed_mapping():
+    html = contract_form().replace('name="platform"', 'name="another_safe_name"')
+    assert prove_new_form_contract(html, CONTRACT_URL)['select_names'] == 'verified'
+    html = contract_form('<div class="form-group"><label>Extra</label>'
+                         '<select name="fourth"><option>A</option></select></div>')
+    assert prove_new_form_contract(html, CONTRACT_URL)['select_names'] == 'ambiguous'
+    html = contract_form().replace('<option value=', '<div></div><option value=')
+    assert prove_new_form_contract(html, CONTRACT_URL)['control_inventory'] == 'ambiguous'
+
+
+def test_contract_proof_bounds_and_failure_do_not_leak_or_leave_old_evidence(service):
+    proof = prove_new_form_contract(contract_form('<input name="unexpected">' * 1100), CONTRACT_URL)
+    assert proof['unknown_count'] == proof['duplicate_count'] == proof['control_count'] == 1001
+    assert len(json.dumps(proof)) < 900
+    assert prove_new_form_contract(contract_form(), CONTRACT_URL, 976) == safe_contract_proof()
+    service.client.account.response.content = contract_form().encode()
+    service.client.account.response.url = CONTRACT_URL
+    service.get_with_evidence(986, contract_proof=proof)
+    service.test_clock[0] += 901
+    service.client.account.failure = RuntimeError('SYNTHETIC_PRIVATE')
+    with pytest.raises(NodeFormError):
+        service.get_with_evidence(986, contract_proof=proof)
+    assert proof == safe_contract_proof() and len(service.client.account.calls) == 2
+
+
+def test_contract_proof_reuses_get_but_is_never_cached(service, monkeypatch):
+    service.client.account.response.content = contract_form().encode()
+    service.client.account.response.url = CONTRACT_URL
+    proof = {'secret': 'SYNTHETIC_PRIVATE'}
+    logs = []
+    monkeypatch.setattr('funpayflow.node_form.logger.warning', logs.append)
+    schema, _ = service.get_with_evidence(986, contract_proof=proof)
+    assert proof['availability'] == 'response' and proof['blank_identity'] == 'verified'
+    retained = json.dumps([schema, [e['schema'] for e in service.client._node_form_cache.values()]])
+    assert 'SYNTHETIC_PRIVATE' not in retained and 'blank_identity' not in retained and logs == []
+    service.get_with_evidence(986, contract_proof=proof)
+    assert proof == safe_contract_proof() and len(service.client.account.calls) == 1
+    service.test_clock[0] += 901
+    service.get_with_evidence(986, contract_proof=proof)
+    assert proof['availability'] == 'response' and len(service.client.account.calls) == 2
+    assert all(call[0][0] == 'get' for call in service.client.account.calls)
+
+
+@pytest.mark.parametrize('change', [
+    {'publish_ready': True}, {'currency': 'verified'}, {'response_id': 'verified'},
+    {'control_count': True}, {'hidden_count': -1}, {'unknown_count': 1002},
+    {'csrf_presence': 'SYNTHETIC_PRIVATE'}, {'secret': 'SYNTHETIC_PRIVATE'},
+    {'availability': []},
+])
+def test_contract_proof_output_boundary(change):
+    proof = dict(prove_new_form_contract(contract_form(), CONTRACT_URL), **change)
+    assert safe_contract_proof(proof) == safe_contract_proof()
 
 
 def evidence_form(extra='', offer='0'):
