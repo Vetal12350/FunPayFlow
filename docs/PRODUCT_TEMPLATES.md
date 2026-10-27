@@ -2,6 +2,15 @@
 
 Этот слой создаёт **только локальные черновики**. Publish отсутствует. Отдельный GET-only adapter читает create-form выбранного node; write/verification contract не реализован, FunPayAPI 1.1.0 не менялась. Никаких `save_lot`, modifying HTTP, AI-перевода или конвертации цен здесь нет.
 
+Offline publisher v1 переиспользует сохранённый одиночный `GAME_KEY` draft для
+Elden Ring (274/986), без Variant. Чистый builder проверяет точный scoped snapshot,
+выбранные node options, цену, явно заданную валюту, quantity=1 и свежесть synthetic
+source-form. Закрытый transport seam подменяется только тестами; durable claim
+запрещает повтор даже после crash/restart или редактирования draft. Реальный
+Account отвергается, публикации и новых callbacks в Telegram нет. Это не новый
+тип товара и не путь из legacy lot templates. Контракт, ограничения и оставшиеся
+proofs: [Publisher v1](FUNPAY_PUBLISH_FEASIBILITY.md#publisher-v1--offline-vertical-slice-2026-10-27).
+
 ## Telegram
 
 Владелец открывает `📦 Лоты`: было 9 пунктов, стало 4; создание ключа доступно через «Создать товар», прочие функции — в «Дополнительно». Публикация FunPay пока отключена.
