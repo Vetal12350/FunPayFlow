@@ -17,6 +17,9 @@ import webbrowser
 _spec = importlib.util.spec_from_file_location("monitor_worker", Path(__file__).with_name("codex_issue_worker.py"))
 worker = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(worker)
+_vps_spec = importlib.util.spec_from_file_location("vps_update_status", Path(__file__).with_name("vps_update_status.py"))
+vps = importlib.util.module_from_spec(_vps_spec)
+_vps_spec.loader.exec_module(vps)
 WINDOWS = os.name == "nt"
 REPO = worker.REPO
 BASE = f"https://github.com/{REPO}"
@@ -446,6 +449,44 @@ def observed_timeline(live, issue):
         for event in events) or "Нет сохранённых событий для этой задачи."
 
 
+class VpsCheck:
+    """One in-flight observation; only the Tk thread touches widgets or schedules."""
+    def __init__(self, app, button, result):
+        self.app, self.button, self.result = app, button, result
+        self.queue = queue.SimpleQueue()
+        self.busy = False
+        self.closed = threading.Event()
+
+    def start(self):
+        if self.busy or self.closed.is_set():
+            return
+        self.busy = True
+        self.button.configure(state="disabled")
+        self.result.configure(text="VPS: проверка выполняется…")
+        def work():
+            try:
+                value = vps.check_once()
+            except Exception:
+                value = vps.unknown()
+            if not self.closed.is_set():
+                self.queue.put(value)
+        threading.Thread(target=work, daemon=True).start()
+        self.app.after(100, self.poll)
+
+    def poll(self):
+        if self.closed.is_set():
+            return
+        try:
+            value = self.queue.get_nowait()
+        except queue.Empty:
+            self.app.after(100, self.poll)
+            return
+        self.busy = False
+        self.button.configure(state="normal")
+        self.result.configure(text="VPS: " + value["status"] + "\n" + " · ".join(
+            f"{key}={value[key]}" for key in vps.FIELDS))
+
+
 def main():
     # Optional dependency must be checked BEFORE accessing worker state or starting threads.
     try:
@@ -716,6 +757,21 @@ def main():
     ctk.CTkButton(footer, text="Открыть GitHub", corner_radius=10, command=open_selected).grid(
         row=1, column=1, sticky="w", padx=10)
 
+    vps_area = ctk.CTkFrame(app, corner_radius=12, fg_color=surface)
+    vps_area.grid(row=4, column=0, sticky="ew", padx=20, pady=(0, 12))
+    vps_area.grid_columnconfigure(1, weight=1)
+    vps_button = ctk.CTkButton(vps_area, text="Проверить VPS", corner_radius=10)
+    vps_button.grid(row=0, column=0, padx=12, pady=8)
+    vps_result = label(vps_area, "VPS: UNKNOWN · проверка только по кнопке", wraplength=740)
+    vps_result.grid(row=0, column=1, sticky="ew", padx=12)
+    vps_check = VpsCheck(app, vps_button, vps_result)
+    vps_button.configure(command=vps_check.start)
+    vps_pipeline = label(vps_area, "Проверить → Исходники готовы (только source_staged=YES) → Зависимости НЕ готовы → "
+          "Совместимость/резервная копия НЕ проверены → Деплой недоступен\n"
+          "Source-only 0affd678 не готов к деплою; наличие backup-каталога не подтверждает резервную копию.",
+          wraplength=950)
+    vps_pipeline.grid(row=1, column=0, columnspan=2, sticky="ew", padx=12, pady=(0, 8))
+
     def resize(event):
         if event.widget is app:
             ratio = int(app.geometry().split("x")[0]) / max(1, app.winfo_width())
@@ -724,6 +780,9 @@ def main():
                 widget.configure(wraplength=width)
             for widget in (status, phase_text, details):
                 widget.configure(wraplength=max(400, int(header.winfo_width() * ratio) - 20))
+            vps_width = int(vps_area.winfo_width() * ratio)
+            vps_result.configure(wraplength=max(220, vps_width - 200))
+            vps_pipeline.configure(wraplength=max(300, vps_width - 24))
     app.bind("<Configure>", resize, add="+")
 
     def browse(direction):
@@ -736,6 +795,7 @@ def main():
 
     def close():
         stop.set()
+        vps_check.closed.set()
         app.destroy()  # Worker remains independent; never terminate external processes.
     app.protocol("WM_DELETE_WINDOW", close)
     threading.Thread(target=poll_launch, daemon=True).start()
