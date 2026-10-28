@@ -208,13 +208,15 @@ def test_remote_collector_with_fake_systemd_proc_and_sqlite(monkeypatch):
     assert len(commands) == 5
     workdir[0] = '/root/FunPayFlow-next'
     assert ns['collect']()['active'] != 'YES'
+    assert sql == ['PRAGMA query_only=ON', 'PRAGMA quick_check'] * 2
     workdir[0] = '/root/FunPayFlow-stage-b567b561'
     # No deployment, mkdir, application launch, shell, backup, or install call exists.
     assert all(args[0] in {'systemctl', 'git'} for args in commands)
     assert all(args[1] == 'show' for args in commands if args[0] == 'systemctl')
     FakePath.exists = lambda self: self.value.endswith('-wal')
+    before = list(sql)
     assert ns['collect']()['database_ok'] == 'UNKNOWN'
-    assert len(sql) == 2
+    assert sql == before  # WAL must prevent SQLite quick_check entirely
     FakePath.exists = lambda self: self.value.endswith('.venv')
     FakePath.is_file = lambda self: not self.value.endswith('src/funpayflow/main.py')
     assert ns['collect']()['source_staged'] == 'NO'
