@@ -12,14 +12,20 @@ _spec = importlib.util.spec_from_file_location(
     "vps_status_config", Path(__file__).with_name("vps_status_controller.py"))
 config_api = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(config_api)
+_prepare_spec = importlib.util.spec_from_file_location(
+    "vps_update_prepare", Path(__file__).with_name("vps_update_prepare.py"))
+prepare = importlib.util.module_from_spec(_prepare_spec)
+_prepare_spec.loader.exec_module(prepare)
 WINDOWS = os.name == "nt"
-TARGET = "0affd6784f2f903fa69a38ceb783a30b0816594e"
-REPO = "Vetal12350/FunPayFlow"
+TARGET = prepare.TARGET
+REPO = prepare.REPO
 FIELDS = {
     "active": {"YES", "NO", "UNKNOWN"},
     "current": {"b567b561", TARGET[:8], "UNKNOWN"},
     "target": {TARGET[:8], "UNKNOWN"},
+    "current_main": {"TARGET", "DIFFERENT", "UNKNOWN"},
     "source_staged": {"YES", "NO", "UNKNOWN"},
+    "source_integrity": {"VERIFIED", "MISMATCH", "UNKNOWN"},
     "deps_not_installed": {"YES", "UNKNOWN"},
     "database_ok": {"YES", "NO", "UNKNOWN"},
     "backup_dir_present": {"YES", "NO", "UNKNOWN"},
@@ -27,8 +33,8 @@ FIELDS = {
 }
 
 # Fixed stdlib collector only: never import or execute staged/application code.
-REMOTE_SOURCE = r'''
-import json, os, sqlite3, subprocess, time
+REMOTE_SOURCE = prepare.SOURCE_COLLECTOR + r'''
+import json, os, sqlite3, stat, subprocess, time
 from contextlib import closing
 from pathlib import Path
 
@@ -49,6 +55,18 @@ def collect():
     legacy = run(['systemctl', 'show', '--property=ActiveState', '--value', 'funpay-bot.service'])
     pid = run(['systemctl', 'show', '--property=MainPID', '--value', 'funpayflow.service'])
     workdir = run(['systemctl', 'show', '--property=WorkingDirectory', '--value', 'funpayflow.service'])
+    user = run(['systemctl', 'show', '--property=User', '--value', 'funpayflow.service'])
+    fragment = run(['systemctl', 'show', '--property=FragmentPath', '--value', 'funpayflow.service'])
+    dropins = run(['systemctl', 'show', '--property=DropInPaths', '--value', 'funpayflow.service'])
+    unit_owned = user in ('', 'root') and fragment == '/etc/systemd/system/funpayflow.service' and not dropins
+    for name in ('/', '/etc', '/etc/systemd', '/etc/systemd/system',
+                 '/etc/systemd/system/funpayflow.service', '/root', str(code)):
+        p = Path(name)
+        st = p.lstat()
+        directory = name != fragment
+        if (p.is_symlink() or st.st_uid != 0 or st.st_mode & 0o022 or
+            not (stat.S_ISDIR(st.st_mode) if directory else stat.S_ISREG(st.st_mode))):
+            unit_owned = False
     processes = []
     for entry in Path('/proc').iterdir():
         if entry.name.isdecimal():
@@ -58,7 +76,7 @@ def collect():
                 continue
             if b'-m' in argv and b'funpayflow.main' in argv:
                 processes.append(entry.name)
-    if state == 'active' and legacy == 'inactive' and processes == [pid] and workdir == str(code):
+    if unit_owned and state == 'active' and legacy == 'inactive' and processes == [pid] and workdir == str(code):
         if (Path('/proc') / pid / 'cwd').resolve(strict=True) == code:
             out['active'] = 'YES'
     elif state in ('inactive', 'failed') or legacy == 'active' or len(processes) != 1:
@@ -88,6 +106,9 @@ def collect():
             con.execute('PRAGMA query_only=ON')
             con.set_progress_handler(lambda: time.monotonic() > deadline, 1000)
             out['database_ok'] = 'YES' if con.execute('PRAGMA quick_check').fetchall() == [('ok',)] else 'NO'
+    out['source_digest'] = (stage_digest() if out['active'] == 'YES' and
+                            out['current'] == 'b567b561' and
+                            out['deps_not_installed'] == 'YES' else 'UNKNOWN')
     return out
 
 if __name__ == '__main__':
@@ -136,17 +157,20 @@ def check_once():
         head = main.get("sha") if isinstance(main, dict) else None
         if not isinstance(head, str) or not re.fullmatch('[0-9a-f]{40}', head):
             return unknown("REFUSED")
-        page = get(f"actions/workflows/ci.yml/runs?branch=main&event=push&head_sha={head}&per_page=1")
+        # Historical target push CI is independent of the moving main observation.
+        # The newest run/latest attempt for this exact SHA must still be successful.
+        page = get(f"actions/workflows/ci.yml/runs?branch=main&event=push&head_sha={TARGET}&per_page=1")
         runs = page.get("workflow_runs") if isinstance(page, dict) else None
         if not isinstance(runs, list) or len(runs) != 1:
             return unknown("REFUSED")
         run = runs[0]
-        expected = {"head_sha": head, "head_branch": "main", "event": "push",
+        expected = {"head_sha": TARGET, "head_branch": "main", "event": "push",
                     "path": ".github/workflows/ci.yml", "status": "completed", "conclusion": "success"}
         if (not isinstance(run, dict) or any(run.get(k) != v for k, v in expected.items())
                 or any(not isinstance(run.get(k), dict) or run[k].get("full_name") != REPO
                        for k in ("repository", "head_repository"))):
             return unknown("REFUSED")
+        expected_digest = prepare.trusted_source_digest()
         args = ["ssh.exe", "-F", "NUL", "-T", "-a", "-x"]
         for option in ("StrictHostKeyChecking=yes", "BatchMode=yes", "ForwardAgent=no",
                        "ClearAllForwardings=yes", "ProxyCommand=none", "ProxyJump=none",
@@ -157,17 +181,23 @@ def check_once():
             args.extend(("-o", option))
         args.extend(("-i", config["identity"], "-l", "root", config["host"], "python3 -I -B -"))
         value = config_api.decode_json(_invoke(args, REMOTE_SOURCE.encode()), 4096, "schema")
-        if not isinstance(value, dict) or set(value) != set(FIELDS) - {"target"}:
+        if not isinstance(value, dict) or set(value) != (set(FIELDS) - {
+                "target", "current_main", "source_integrity"}) | {"source_digest"}:
             return unknown()
-        # A newer main can be observed, but this reviewed source-only stage cannot
-        # satisfy it. Never expose arbitrary commit text or silently stage a new SHA.
-        value["target"] = TARGET[:8] if head == TARGET else "UNKNOWN"
+        digest = value.pop('source_digest')
+        if not isinstance(digest, str) or not (digest == 'UNKNOWN' or re.fullmatch('[0-9a-f]{64}', digest)):
+            return unknown()
+        value["target"] = TARGET[:8]
+        value["current_main"] = 'TARGET' if head == TARGET else 'DIFFERENT'
+        value["source_integrity"] = ('UNKNOWN' if digest == 'UNKNOWN' else
+                                     'VERIFIED' if digest == expected_digest else 'MISMATCH')
         if any(not isinstance(value[k], str) or value[k] not in allowed for k, allowed in FIELDS.items()):
             return unknown()
         healthy = all(value[k] == "YES" for k in (
             "active", "source_staged", "deps_not_installed", "database_ok", "backup_dir_present"))
-        healthy = healthy and value['current'] != 'UNKNOWN' and value['disk'] == 'SUFFICIENT'
-        status = "REFUSED" if head != TARGET else "OBSERVED" if healthy else "UNKNOWN"
+        healthy = (healthy and value['current'] == 'b567b561' and value['disk'] == 'SUFFICIENT'
+                   and value['source_integrity'] == 'VERIFIED')
+        status = "REFUSED" if value['source_integrity'] == 'MISMATCH' else "OBSERVED" if healthy else "UNKNOWN"
         return {"status": status, **value}
     except Exception:
         return unknown()

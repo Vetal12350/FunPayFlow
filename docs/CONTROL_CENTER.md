@@ -197,32 +197,53 @@ automatic merge, deployment, owner approval bypass, FunPay/Telegram call or bot 
 Phone Telegram notifications are future work through a separately authorized dedicated
 notifier; existing bot tokens must never be reused. Live ChatGPT internals remain unavailable.
 
-## VPS: first integration, no deployment executor
+## VPS: pinned-source prerequisite; environment preparation disabled
 
 The integrated **Проверить VPS** button starts one bounded background check. Opening
 the window and passive refresh never read VPS configuration or start SSH. Repeated
 clicks are disabled while checking; closing discards late results. Worker controls
-and their existing polling remain independent. No deploy button exists.
+and their existing polling remain independent. No deploy button exists. The visible
+**Подготовить обновление** button is disabled with the exact backend outcome
+`NOT_PREPARED_ISOLATION_REQUIRED` and `DEPLOY_READY=NO`; checking cannot enable it.
 
-One click performs GitHub GETs for main and its newest push run of the fixed
-`Vetal12350/FunPayFlow/.github/workflows/ci.yml`, requiring exact SHA, branch,
-repository identities and completed success.
+One click observes current main separately and checks the newest **historical push
+CI for the fixed target `0affd6784f2f903fa69a38ceb783a30b0816594e`** in
+`Vetal12350/FunPayFlow/.github/workflows/ci.yml`, requiring exact SHA, main branch,
+push event, both repository identities and completed success. A later UI-only merge
+does not invalidate that target. Its CI cannot substitute for target CI. The UI
+reports current main as `TARGET` or `DIFFERENT`; it never selects a new target.
 The running bot is checked against the owner-confirmed
 `/root/FunPayFlow-stage-b567b561` path (not the historical `FunPayFlow-next`)
 and the matching systemd `WorkingDirectory`, PID/cwd and **exact** pinned commit.
+The unit must be root-owned, with root/default User, the exact
+`/etc/systemd/system/funpayflow.service` fragment and no drop-ins; its ancestors and
+the production directory must be owned by root, without symlinks or group/world writes.
 An unexpected service layout or a change of production version is not silently accepted. It then sends only a fixed stdlib
 read-only collector over SSH: service/legacy state, one matching PID and cwd,
 current commit, source-file presence, absence of stage dependency directories,
 disk threshold (512 MiB), SQLite quick_check and backup-directory presence.
+It also compares **all source file bytes and directory entries** in the existing
+`/root/.FunPayFlow-source-0affd678` with a freshly fetched exact-target HTTPS archive
+from the fixed GitHub codeload URL. Archives stay in bounded memory, are never
+extracted, and redirects, links, special files, duplicate/ambiguous paths, unexpected
+prefixes and missing parents are refused. No source download/extraction occurs on
+the VPS. The stage is traversed through directory descriptors with `O_NOFOLLOW`;
+root ownership, no group/world writes, single-link regular files, size/count/time
+limits and mutation checks are required. `.env`, private directories and dependency
+environments are refused before reading them. No remote filenames or content reach
+the GUI. Extra or altered source files cannot count as verified. If the older
+source-only staging tool omitted archive entries, this check refuses that stage;
+it does not silently repair or repeat staging.
 No application/staged code is imported or run. No installs, restaging, backups,
 service changes, POST, issue comments or automatic retries occur.
 
 Results contain only enums and the reviewed `b567b561` / `0affd678` prefixes.
 `OBSERVED` means these limited observations succeeded, never deploy-ready.
-Failures/incomplete evidence show `UNKNOWN` or `REFUSED`. Source evidence is tied
+Failures/incomplete evidence show `UNKNOWN` or `REFUSED`. A hash disagreement is
+`source_integrity=MISMATCH` / `REFUSED`; inaccessible/unverifiable source is `UNKNOWN`.
+Only an exact comparison yields `source_integrity=VERIFIED`. Source evidence is tied
 only to `/root/.FunPayFlow-source-0affd678`, never the deployable stage pathname.
-If main advances, its CI can still be checked and VPS observed, but target becomes
-`UNKNOWN` and overall status `REFUSED`: this old source cannot satisfy the new target.
+`source_staged=YES` alone still means presence, never verified bytes or an environment.
 Missing `.venv`, `venv`, `site-packages` means no local dependency environment
 observed; it does not attest installed packages or dependency compatibility.
 
@@ -243,19 +264,33 @@ nor key contents belong in issues or this checkout. A trusted Windows PATH must
 provide OpenSSH and authenticated GitHub CLI; no new dependencies are installed.
 
 The installed Center does not gain this UI automatically. A separately approved
-local source update must deliver reviewed `scripts/control_center.py` and the new
-`scripts/vps_update_status.py` together, retaining sibling
+**one-time Center update** must deliver reviewed `scripts/control_center.py`,
+`scripts/vps_update_status.py` and `scripts/vps_update_prepare.py` together, retaining sibling
 `vps_status_controller.py` and the matching worker. Restart the Center through its
 existing `scripts/start_control_center.bat`; launch path and installer are unchanged.
 If the optional CTk venv is absent, the existing explicit setup above is still needed.
-No installed Windows files were updated here.
+No installed Windows files were updated here. No fresh ZIP, CMD launcher or per-update
+Python script is introduced. After that one-time trusted Center update, supported
+routine operations belong in this existing GUI.
 
-The visible sequence remains **Проверить → Исходники готовы** (only when observed)
-**→ Зависимости НЕ готовы → Совместимость/резервная копия НЕ проверены → Деплой
-недоступен**. This only starts integration. Isolated dependency builds without root
-build hooks, SQLite preflight on a consistent copy, backup/rollback, health checks
-and explicit one-time owner approval require separately reviewed work. Hosted
-Windows/Linux CI and Product/Core QA remain external PR gates.
+**One-click environment preparation is not yet available.** The small real prerequisite
+here is historical target CI plus source integrity, not a completed execution workflow.
+The existing root SSH identity and root-only source directory do not establish an
+isolated build identity with denied access to production/credentials. A venv, clean
+environment or pip binary-only flag cannot provide that boundary. No dedicated
+identity, sandbox policy or root filesystem/service change is installed by this code.
+`prepare_once(approved=True)` therefore still refuses, without I/O, retries or cleanup;
+it never reports `ENV_PREPARED`. Declined/missing approval also performs no I/O.
+Startup reads only the pure capability, never calls `prepare_once` or confirms anything.
+
+A separate reviewed prerequisite must establish and test that isolation boundary,
+then implement exclusive stage ownership, Python 3.13, pinned locked binary wheels
+only (no root build hooks/project install/app imports), bounded resources, partial
+and uncertain-timeout handling and static metadata/compilation verification. Until
+then no active prepare/confirmation path is shipped. Once supported, the GUI must
+ask once for the exact target and stage-only scope before dispatch. Production
+cutover remains a separate explicit approval with backup/rollback and health gates.
+Hosted Windows/Linux CI and Product/Core QA remain external PR gates.
 
 ## Offline verification
 
@@ -263,7 +298,12 @@ Windows/Linux CI and Product/Core QA remain external PR gates.
 all gh responses and process startup; `tests/test_codex_issue_worker.py` covers safe phase
 snapshots, heartbeat, locking, timeout cleanup, mark-before-execution and restart dedup.
 `tests/test_vps_update_status.py` fakes GitHub, SSH, systemd, proc and SQLite responses,
-including malformed/unsafe/timeout results and main advancing beyond the source stage.
+and `tests/test_vps_update_prepare.py` verifies synthetic archives and a descriptor-only
+fake source tree, plus the actual disabled GUI capability gate. They cover source
+mismatch, corrupt archives, unsafe ownership/links/paths, extra stage/environment
+entries, changed main, unvetted target CI and sanitized timeout/partial responses.
+There are no wheel installation tests because no installer exists or can dispatch;
+missing binary wheels and uncertain builds must be tested before enabling it.
 Run with the existing development environment:
 
 ```powershell
@@ -271,7 +311,7 @@ New-Item -ItemType Directory -Force tests/.offline-tmp | Out-Null
 $env:TEMP = Join-Path (Get-Location) 'tests/.offline-tmp'
 $env:TMP = $env:TEMP
 $env:PYTHONDONTWRITEBYTECODE = '1'
-uv run --no-sync pytest -q -p no:cacheprovider tests/test_control_center.py tests/test_codex_issue_worker.py tests/test_vps_update_status.py tests/test_vps_status_controller.py --basetemp=tests/.offline-tmp/control-center
+uv run --no-sync pytest -q -p no:cacheprovider tests/test_control_center.py tests/test_codex_issue_worker.py tests/test_vps_update_status.py tests/test_vps_update_prepare.py tests/test_vps_status_controller.py --basetemp=tests/.offline-tmp/control-center
 ```
 
 Keep every generated fixture under `tests/.offline-tmp/`; do not use other scratch paths.

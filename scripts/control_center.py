@@ -487,6 +487,18 @@ class VpsCheck:
             f"{key}={value[key]}" for key in vps.FIELDS))
 
 
+def prepare_panel(button, result):
+    """Pure backend capability gate, used on every opening. No remote dispatch.
+
+    No enabled/confirmation path is shipped until a reviewed isolated executor
+    exists. Neither a green observation nor owner approval can enable root builds.
+    """
+    value = vps.prepare.capability()
+    button.configure(state="disabled")
+    result.configure(text=(f"Цель: {value['target']}\n{value['status']} · DEPLOY_READY={value['deploy_ready']}\n"
+                           + vps.prepare.BLOCKER))
+
+
 def main():
     # Optional dependency must be checked BEFORE accessing worker state or starting threads.
     try:
@@ -766,11 +778,11 @@ def main():
     vps_result.grid(row=0, column=1, sticky="ew", padx=12)
     vps_check = VpsCheck(app, vps_button, vps_result)
     vps_button.configure(command=vps_check.start)
-    vps_pipeline = label(vps_area, "Проверить → Исходники готовы (только source_staged=YES) → Зависимости НЕ готовы → "
-          "Совместимость/резервная копия НЕ проверены → Деплой недоступен\n"
-          "Source-only 0affd678 не готов к деплою; наличие backup-каталога не подтверждает резервную копию.",
-          wraplength=950)
-    vps_pipeline.grid(row=1, column=0, columnspan=2, sticky="ew", padx=12, pady=(0, 8))
+    prepare_button = ctk.CTkButton(vps_area, text="Подготовить обновление", corner_radius=10, state="disabled")
+    prepare_button.grid(row=1, column=0, padx=12, pady=8)
+    vps_pipeline = label(vps_area, "", wraplength=950)
+    prepare_panel(prepare_button, vps_pipeline)
+    vps_pipeline.grid(row=1, column=1, sticky="ew", padx=12, pady=(0, 8))
 
     def resize(event):
         if event.widget is app:
