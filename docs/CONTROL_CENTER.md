@@ -206,7 +206,11 @@ and their existing polling remain independent. No deploy button exists.
 
 One click performs GitHub GETs for main and its newest push run of the fixed
 `Vetal12350/FunPayFlow/.github/workflows/ci.yml`, requiring exact SHA, branch,
-repository identities and completed success. It then sends only a fixed stdlib
+repository identities and completed success.
+The running bot is checked against the owner-confirmed
+`/root/FunPayFlow-stage-b567b561` path (not the historical `FunPayFlow-next`)
+and the matching systemd `WorkingDirectory`, PID/cwd and **exact** pinned commit.
+An unexpected service layout or a change of production version is not silently accepted. It then sends only a fixed stdlib
 read-only collector over SSH: service/legacy state, one matching PID and cwd,
 current commit, source-file presence, absence of stage dependency directories,
 disk threshold (512 MiB), SQLite quick_check and backup-directory presence.
