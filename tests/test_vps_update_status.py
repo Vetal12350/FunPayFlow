@@ -172,7 +172,7 @@ def test_remote_collector_with_fake_systemd_proc_and_sqlite(monkeypatch):
         def is_symlink(self): return False
         def exists(self): return False
         def stat(self): return SimpleNamespace(st_size=128)
-        def resolve(self, **kwargs): return FakePath('/root/FunPayFlow-next')
+        def resolve(self, **kwargs): return FakePath('/root/FunPayFlow-stage-b567b561')
         def iterdir(self): return [FakePath('/proc/42')]
         def read_bytes(self):
             paths.append(self.value)
@@ -180,11 +180,14 @@ def test_remote_collector_with_fake_systemd_proc_and_sqlite(monkeypatch):
         def as_uri(self): return 'file:///synthetic.sqlite3'
     ns['Path'] = FakePath
     commands = []
+    workdir = ['/root/FunPayFlow-stage-b567b561']
     def run(args, **kwargs):
         commands.append(args)
         assert kwargs['shell'] is False and kwargs['timeout'] == 5
-        if args[0] == 'git': return SimpleNamespace(returncode=0, stdout='b567b561' + 'a'*32)
-        value = '42' if 'MainPID' in args[2] else 'inactive' if args[-1] == 'funpay-bot.service' else 'active'
+        if args[0] == 'git':
+            return SimpleNamespace(returncode=0, stdout='b567b561e0509de5595fa804d2372aa4cc28bbf1')
+        value = ('42' if 'MainPID' in args[2] else workdir[0] if 'WorkingDirectory' in args[2]
+                 else 'inactive' if args[-1] == 'funpay-bot.service' else 'active')
         return SimpleNamespace(returncode=0, stdout=value)
     monkeypatch.setattr(subprocess, 'run', run)
     monkeypatch.setattr(ns['os'], 'statvfs', lambda p: SimpleNamespace(f_bavail=1024**3, f_frsize=1), raising=False)
@@ -202,7 +205,10 @@ def test_remote_collector_with_fake_systemd_proc_and_sqlite(monkeypatch):
     assert result['active'] == result['database_ok'] == result['source_staged'] == 'YES'
     assert sql == ['PRAGMA query_only=ON', 'PRAGMA quick_check']
     assert paths == ['/proc/42/cmdline']
-    assert len(commands) == 4
+    assert len(commands) == 5
+    workdir[0] = '/root/FunPayFlow-next'
+    assert ns['collect']()['active'] != 'YES'
+    workdir[0] = '/root/FunPayFlow-stage-b567b561'
     # No deployment, mkdir, application launch, shell, backup, or install call exists.
     assert all(args[0] in {'systemctl', 'git'} for args in commands)
     assert all(args[1] == 'show' for args in commands if args[0] == 'systemctl')
