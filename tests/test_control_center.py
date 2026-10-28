@@ -582,6 +582,8 @@ def test_ctk_ui_refresh_is_sound_only_and_worker_stays_disabled(monkeypatch, tmp
     bells = []
     callbacks = []
     protocols = {}
+    monkeypatch.setattr(cc.vps, "check_once", lambda: pytest.fail("Passive VPS check"))
+    monkeypatch.setattr(cc.vps.config_api, "local_directory", lambda: pytest.fail("Passive VPS config read"))
     class Widget:
         def __init__(self, *args, **kwargs):
             self.options = kwargs

@@ -197,11 +197,69 @@ automatic merge, deployment, owner approval bypass, FunPay/Telegram call or bot 
 Phone Telegram notifications are future work through a separately authorized dedicated
 notifier; existing bot tokens must never be reused. Live ChatGPT internals remain unavailable.
 
+## VPS: first integration, no deployment executor
+
+The integrated **Проверить VPS** button starts one bounded background check. Opening
+the window and passive refresh never read VPS configuration or start SSH. Repeated
+clicks are disabled while checking; closing discards late results. Worker controls
+and their existing polling remain independent. No deploy button exists.
+
+One click performs GitHub GETs for main and its newest push run of the fixed
+`Vetal12350/FunPayFlow/.github/workflows/ci.yml`, requiring exact SHA, branch,
+repository identities and completed success. It then sends only a fixed stdlib
+read-only collector over SSH: service/legacy state, one matching PID and cwd,
+current commit, source-file presence, absence of stage dependency directories,
+disk threshold (512 MiB), SQLite quick_check and backup-directory presence.
+No application/staged code is imported or run. No installs, restaging, backups,
+service changes, POST, issue comments or automatic retries occur.
+
+Results contain only enums and the reviewed `b567b561` / `0affd678` prefixes.
+`OBSERVED` means these limited observations succeeded, never deploy-ready.
+Failures/incomplete evidence show `UNKNOWN` or `REFUSED`. Source evidence is tied
+only to `/root/.FunPayFlow-source-0affd678`, never the deployable stage pathname.
+If main advances, its CI can still be checked and VPS observed, but target becomes
+`UNKNOWN` and overall status `REFUSED`: this old source cannot satisfy the new target.
+Missing `.venv`, `venv`, `site-packages` means no local dependency environment
+observed; it does not attest installed packages or dependency compatibility.
+
+SQLite opens with `mode=ro&immutable=1` plus `query_only`, bounded size (256 MiB)
+and progress deadline. WAL/journal presence skips the check as `UNKNOWN`, avoiding
+SHM/journal creation and a misleading main-file-only check. This observation of a
+live file is **not** a consistent-copy/schema preflight. Backup-directory presence
+does not verify any backup. These limitations never enable deployment.
+
+Owner setup after review (not performed by this source task): retain the existing
+`%LOCALAPPDATA%/FunPayFlowVpsStatus/config.json` setup described in
+[LOCAL_VPS_STATUS.md](LOCAL_VPS_STATUS.md). In that same protected local directory,
+manually provide `update_known_hosts`: exactly one ASCII line containing the
+configured IPv4, a space, `ssh-ed25519`, a space, and its independently verified
+base64 public host key. No wildcards, aliases, extra entries or automatic key
+enrollment are accepted. Missing/changed pins fail closed. Neither configuration
+nor key contents belong in issues or this checkout. A trusted Windows PATH must
+provide OpenSSH and authenticated GitHub CLI; no new dependencies are installed.
+
+The installed Center does not gain this UI automatically. A separately approved
+local source update must deliver reviewed `scripts/control_center.py` and the new
+`scripts/vps_update_status.py` together, retaining sibling
+`vps_status_controller.py` and the matching worker. Restart the Center through its
+existing `scripts/start_control_center.bat`; launch path and installer are unchanged.
+If the optional CTk venv is absent, the existing explicit setup above is still needed.
+No installed Windows files were updated here.
+
+The visible sequence remains **Проверить → Исходники готовы** (only when observed)
+**→ Зависимости НЕ готовы → Совместимость/резервная копия НЕ проверены → Деплой
+недоступен**. This only starts integration. Isolated dependency builds without root
+build hooks, SQLite preflight on a consistent copy, backup/rollback, health checks
+and explicit one-time owner approval require separately reviewed work. Hosted
+Windows/Linux CI and Product/Core QA remain external PR gates.
+
 ## Offline verification
 
 `tests/test_control_center.py` imports headlessly without creating Tk windows. Tests fake
 all gh responses and process startup; `tests/test_codex_issue_worker.py` covers safe phase
 snapshots, heartbeat, locking, timeout cleanup, mark-before-execution and restart dedup.
+`tests/test_vps_update_status.py` fakes GitHub, SSH, systemd, proc and SQLite responses,
+including malformed/unsafe/timeout results and main advancing beyond the source stage.
 Run with the existing development environment:
 
 ```powershell
@@ -209,7 +267,7 @@ New-Item -ItemType Directory -Force tests/.offline-tmp | Out-Null
 $env:TEMP = Join-Path (Get-Location) 'tests/.offline-tmp'
 $env:TMP = $env:TEMP
 $env:PYTHONDONTWRITEBYTECODE = '1'
-uv run --no-sync pytest -q -p no:cacheprovider tests/test_control_center.py tests/test_codex_issue_worker.py --basetemp=tests/.offline-tmp/control-center
+uv run --no-sync pytest -q -p no:cacheprovider tests/test_control_center.py tests/test_codex_issue_worker.py tests/test_vps_update_status.py tests/test_vps_status_controller.py --basetemp=tests/.offline-tmp/control-center
 ```
 
 Keep every generated fixture under `tests/.offline-tmp/`; do not use other scratch paths.
