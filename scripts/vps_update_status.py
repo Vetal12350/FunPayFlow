@@ -39,7 +39,8 @@ def run(args):
     return p.stdout.strip()
 
 def collect():
-    code = Path('/root/FunPayFlow-next')
+    # Owner-verified production directory; never infer active stage from an old install path.
+    code = Path('/root/FunPayFlow-stage-b567b561')
     stage = Path('/root/.FunPayFlow-source-0affd678')
     data = Path('/root/FunPayFlow-data')
     out = dict.fromkeys(('active', 'current', 'source_staged', 'deps_not_installed',
@@ -47,6 +48,7 @@ def collect():
     state = run(['systemctl', 'show', '--property=ActiveState', '--value', 'funpayflow.service'])
     legacy = run(['systemctl', 'show', '--property=ActiveState', '--value', 'funpay-bot.service'])
     pid = run(['systemctl', 'show', '--property=MainPID', '--value', 'funpayflow.service'])
+    workdir = run(['systemctl', 'show', '--property=WorkingDirectory', '--value', 'funpayflow.service'])
     processes = []
     for entry in Path('/proc').iterdir():
         if entry.name.isdecimal():
@@ -56,14 +58,15 @@ def collect():
                 continue
             if b'-m' in argv and b'funpayflow.main' in argv:
                 processes.append(entry.name)
-    if state == 'active' and legacy == 'inactive' and processes == [pid]:
+    if state == 'active' and legacy == 'inactive' and processes == [pid] and workdir == str(code):
         if (Path('/proc') / pid / 'cwd').resolve(strict=True) == code:
             out['active'] = 'YES'
     elif state in ('inactive', 'failed') or legacy == 'active' or len(processes) != 1:
         out['active'] = 'NO'
     sha = run(['git', '--no-optional-locks', '-C', str(code), 'rev-parse', '--verify', 'HEAD'])
     if len(sha) == 40 and all(c in '0123456789abcdef' for c in sha):
-        if sha.startswith('b567b561') or sha == '0affd6784f2f903fa69a38ceb783a30b0816594e':
+        if sha in {'b567b561e0509de5595fa804d2372aa4cc28bbf1',
+                   '0affd6784f2f903fa69a38ceb783a30b0816594e'}:
             out['current'] = sha[:8]
     # Evidence of source files is deliberately not an integrity/deployability claim.
     out['source_staged'] = 'YES' if (stage.is_dir() and not stage.is_symlink() and all(
