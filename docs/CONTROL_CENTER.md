@@ -283,14 +283,117 @@ identity, sandbox policy or root filesystem/service change is installed by this 
 it never reports `ENV_PREPARED`. Declined/missing approval also performs no I/O.
 Startup reads only the pure capability, never calls `prepare_once` or confirms anything.
 
-A separate reviewed prerequisite must establish and test that isolation boundary,
-then implement exclusive stage ownership, Python 3.13, pinned locked binary wheels
-only (no root build hooks/project install/app imports), bounded resources, partial
-and uncertain-timeout handling and static metadata/compilation verification. Until
-then no active prepare/confirmation path is shipped. Once supported, the GUI must
+The reusable Linux backend below implements the isolation probe prerequisite.
+Environment preparation still needs a reviewed locked-wheel resolver, artifact and
+packaged metadata verification and sandbox-only compilation. Until those exist,
+no active prepare/confirmation path is shipped. Once supported, the GUI must
 ask once for the exact target and stage-only scope before dispatch. Production
 cutover remains a separate explicit approval with backup/rollback and health gates.
 Hosted Windows/Linux CI and Product/Core QA remain external PR gates.
+
+### Isolated builder protocol v1: actual probe, mandatory owner bootstrap
+
+`scripts/vps_isolated_wheel_builder.py` is a local Linux trusted-broker component.
+It contains no SSH transport, installer, package manager, downloads or application
+imports. It does not enable or change the Center. This is the request's bounded
+**isolation probe/bootstrap deliverable**, not a completed wheel/environment builder.
+No host provisioning or live Linux sandbox execution was performed in this checkout.
+
+Its API is passive on import. `check_configuration(trusted_digest=...)` validates
+the provisioned filesystem without dispatch; even success returns
+`ISOLATION_MISSING / LIVE_PROBE_REQUIRED`. Explicit `probe_once(trusted_digest=...)`
+launches the actual fixed `systemd-run` service and can return `ISOLATION_READY`
+only after the reviewed probe succeeds and inputs are reattested. Missing bootstrap
+returns `ISOLATION_MISSING / BOOTSTRAP_REQUIRED`; unsafe or unverifiable evidence
+returns `ISOLATION_REFUSED` with a fixed reason. All results include the fixed target
+and `deploy_ready=NO`. There is no `ENV_PREPARED` execution path or environment artifact.
+Readiness describes one completed probe, not a cached authorization for later work.
+
+Mandatory **one-time, separately owner-authorized provisioning contract** (no
+automatic installation, sudo policy or systemd host configuration is shipped):
+
+1. Review and install this broker and sibling `vps_update_prepare.py` in an
+   administrator-controlled code directory, outside the staged application.
+   A future authenticated transport may expose only this fixed protocol, never
+   caller-selected commands, properties, unit names, paths or Python code. The broker
+   needs host root solely for namespace setup; the sandbox Python must be non-root.
+   Existing root SSH is not a package build identity and is not used by this module.
+2. Provide `/var/lib/funpayflow-wheel-builder`, root:root, no group/other writes,
+   no symlink ancestors, and `jobs` beneath it with mode `0700`. The validator
+   rejects every mount at or beneath this base, including same-device bind mounts.
+   These directories must be ordinary directories on a trusted host filesystem.
+3. Provide a minimal `rootfs` beneath that base. It contains only real directories
+   `usr`, `usr/bin`, `usr/lib`, optional `lib`/`lib64`, the actual trusted executables
+   `usr/bin/env` and `usr/bin/python3.13`, and reviewed Python 3.13 stdlib/ELF runtime
+   libraries under `usr/lib`, `lib`, `lib64`. Copy needed loader libraries as regular
+   files at their required paths, without symlinks/hardlinks. Provide empty `proc`,
+   `sys`, `dev`, `run`, `tmp`, `work`, `input` directories. All entries are root:root, no
+   group/other writes, set-id/sticky bits, links, special files or nested mounts;
+   ordinary readable `0755` directories/executables and `0644` data are suitable.
+   Do not copy the host root filesystem, `/etc`, home directories, credentials,
+   logs, package caches or installed third-party packages. File capabilities must
+   not be added; bounding/ambient capabilities are empty and NoNewPrivileges is on.
+   The image is bounded to 256 MiB, 16,000 entries, 32 MiB per file and a 15-second scan.
+4. Independently audit and seal that image using `bootstrap.json` beneath the base,
+   a root:root regular single-link file, no group/other writes, at most 4096 bytes,
+   with exactly `{"protocol":1,"rootfs_digest":"<64 lowercase hex>"}`. The digest
+   uses PR #133's canonical entry format: relative path to `["dir"]` or
+   `["file", byte_count, sha256_hex]`, SHA-256 of UTF-8 JSON with sorted keys and
+   separators `(',', ':')`. Permissions are checked separately. This seal is a trust
+   assertion by the owner after auditing the image, not evidence the probe can mint
+   for an arbitrary host tree. Replacing the interpreter/image requires renewed review.
+5. Supply a pristine public `source-0affd678` beneath the base, with exactly the
+   fixed-target archive entries, root:root and the same source restrictions as
+   PR #133 (no links, private/runtime/environment entries or extra files). Do not
+   bind `/root`, copy runtime data, relax production permissions or give DynamicUser
+   access to the existing root-only stage. Source transfer must be a separately
+   reviewed trusted exporter of public source bytes. The future Center must obtain
+   `trusted_source_digest()` through the existing fixed HTTPS archive attestation
+   and pass it as `trusted_digest`; an issue-supplied or self-calculated stage digest
+   is not provenance. This backend never changes the source or fetches an archive.
+6. On an authorized disposable Linux host, verify systemd supports all requested
+   properties, mount/network namespaces, seccomp and resource controllers. No
+   property may be silently dropped, no generic/per-unit drop-in may override the
+   policy, and no fallback is permitted. Run the explicit probe and review its
+   result before approving transport integration. The CLI defaults to configuration
+   checking; `--probe` explicitly dispatches, both require `--trusted-source-digest`.
+
+The transient unit uses `DynamicUser=yes`, `NoNewPrivileges=yes`,
+`ProtectSystem=strict`, `ProtectHome=yes`, an independently sealed `RootDirectory`,
+only a read-only source bind at `/input`, private devices/tmp/network, hidden
+foreign processes, no capabilities and restricted syscalls/address families.
+The Python process receives only `PATH=/usr/bin` and `LC_ALL=C` through trusted
+`env -i`, uses `-I -S`, and executes only the fixed probe. No shell is involved.
+The probe checks Python 3.13, UID/GID/groups, clean environment, kernel capabilities,
+NoNewPrivs/seccomp, distinct mount/network namespaces, effective read-only root/input,
+and the actual input bind's device/inode identity against the attested host snapshot,
+and a bounded noexec/nodev/nosuid tmpfs output at `/work`. It tests denied/absent
+root/home/log/credential and foreign `/proc/1` access without reading any bytes there;
+it tests socket creation denial without connecting to any endpoint. It verifies its
+own eight-byte output's size, type, single link and non-root owner inside the sandbox.
+It never compiles or executes project/package code. `/work` is ephemeral per unit;
+its probe marker is not an environment artifact and is not exported.
+
+Each dispatch reserves a unique root-only `jobs/<32 hex>` directory before launch.
+An existing reservation is refused. At 64 reservations further probes are refused
+until explicit owner reconciliation; no automatic deletion or retry exists.
+The service has a 20-second runtime limit, 3-second stop timeout, process-group kill,
+128 MiB memory, no swap, eight tasks, 50% CPU and a 16 MiB output tmpfs with 1 MiB
+file limit. `/tmp` is a separate bounded 4 MiB tmpfs inside the rootfs; host-backed
+`PrivateTmp` is disabled, so no host `/tmp` or `/var/tmp` bind is required.
+A 28-second client timeout attempts a bounded stop of only that unique probe unit,
+retains its reservation and returns `DISPATCH_UNKNOWN` even when stop succeeds.
+The caller must not blindly retry unknown results. No production unit is addressed.
+
+`binary_lock_blocker(bytes)` is a separate pure static preflight for the supported
+v1/revision-3 Python `>=3.13` lock runtime graph. Ambiguous versions, conditional/extra
+edges and non-PyPI sources are refused as `LOCK_UNSUPPORTED`. An sdist-only runtime
+dependency yields `BINARY_WHEELS_MISSING`; the current checkout's `funpayapi==1.1.0`
+has this blocker. An all-wheel graph still yields `LOCK_RESOLVER_REQUIRED`: wheel
+availability alone does not attest compatible tags, pinned hashes or packaged metadata.
+No pip/uv fallback, project build, root installation or `ENV_PREPARED` is possible.
+Resolving this blocker requires a separate reviewed dependency decision, outside
+this task's prohibition on lock/dependency changes.
 
 ## Offline verification
 
@@ -302,8 +405,12 @@ and `tests/test_vps_update_prepare.py` verifies synthetic archives and a descrip
 fake source tree, plus the actual disabled GUI capability gate. They cover source
 mismatch, corrupt archives, unsafe ownership/links/paths, extra stage/environment
 entries, changed main, unvetted target CI and sanitized timeout/partial responses.
-There are no wheel installation tests because no installer exists or can dispatch;
-missing binary wheels and uncertain builds must be tested before enabling it.
+`tests/test_vps_isolated_wheel_builder.py` exercises the real fixed probe code against
+synthetic kernel observations and the broker against a descriptor-only fake host:
+non-root credentials, denied production/credential access, clean environment,
+hashes, links/ownership/mounts, output ownership/limits, collisions, timeouts and
+missing binary wheels. No test launches real systemd or proves live Linux isolation.
+Wheel installation/metadata/compilation remain unimplemented and cannot be enabled.
 Run with the existing development environment:
 
 ```powershell
@@ -311,7 +418,7 @@ New-Item -ItemType Directory -Force tests/.offline-tmp | Out-Null
 $env:TEMP = Join-Path (Get-Location) 'tests/.offline-tmp'
 $env:TMP = $env:TEMP
 $env:PYTHONDONTWRITEBYTECODE = '1'
-uv run --no-sync pytest -q -p no:cacheprovider tests/test_control_center.py tests/test_codex_issue_worker.py tests/test_vps_update_status.py tests/test_vps_update_prepare.py tests/test_vps_status_controller.py --basetemp=tests/.offline-tmp/control-center
+uv run --no-sync pytest -q -p no:cacheprovider tests/test_control_center.py tests/test_codex_issue_worker.py tests/test_vps_update_status.py tests/test_vps_update_prepare.py tests/test_vps_isolated_wheel_builder.py tests/test_vps_status_controller.py --basetemp=tests/.offline-tmp/control-center
 ```
 
 Keep every generated fixture under `tests/.offline-tmp/`; do not use other scratch paths.
@@ -319,7 +426,8 @@ Tests fake CTk, gh responses and process startup. They do not install packages, 
 windows, call FunPay/Telegram, perform POST, or read runtime credentials. Windows/Linux CI,
 Product/Core QA and ChatGPT audit must all pass before any separately authorized merge.
 Headless tests do not prove real desktop rendering or audible Windows sound.
-`CURRENT_STATE.md` is intentionally unchanged: this request permits exactly five files.
+`CURRENT_STATE.md` is intentionally unchanged: this task's explicit path allowlist
+excludes it. The current backend scope and remaining blockers are recorded here.
 
 ## Rollback after an explicit upgrade
 
