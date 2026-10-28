@@ -22,6 +22,7 @@ PIN = '8.8.8.8 ssh-ed25519 ' + base64.b64encode(
 def offline(monkeypatch):
     monkeypatch.setattr(v.subprocess, 'run', lambda *a, **k: pytest.fail('Unexpected process'))
     monkeypatch.setattr(v.subprocess, 'Popen', lambda *a, **k: pytest.fail('Unexpected launch'))
+    monkeypatch.setattr(v.prepare, '_fetch_archive', lambda: pytest.fail('Unexpected network'))
 
 
 @pytest.fixture
@@ -33,8 +34,9 @@ def setup(monkeypatch, tmp_path):
     run = dict(head_sha=v.TARGET, head_branch='main', event='push',
                path='.github/workflows/ci.yml', status='completed', conclusion='success',
                repository={'full_name': v.REPO}, head_repository={'full_name': v.REPO})
-    report = {k: 'YES' for k in v.FIELDS if k != 'target'}
-    report.update(current='b567b561', disk='SUFFICIENT')
+    report = {k: 'YES' for k in v.FIELDS if k not in {'target', 'current_main', 'source_integrity'}}
+    report.update(current='b567b561', disk='SUFFICIENT', source_digest='a'*64)
+    monkeypatch.setattr(v.prepare, 'trusted_source_digest', lambda: 'a'*64)
     replies = [{'sha': v.TARGET}, {'workflow_runs': [run]}, report]
     calls = []
     def invoke(args, **kwargs):
@@ -51,6 +53,7 @@ def test_pinned_read_only_check(setup):
     result = v.check_once()
     assert result['status'] == 'OBSERVED' and result['target'] == v.TARGET[:8]
     assert result['deps_not_installed'] == 'YES'
+    assert result['source_integrity'] == 'VERIFIED'
     assert len(calls) == 3
     assert all('--method=GET' in args and '--hostname' in args for args, _ in calls[:2])
     args, kwargs = calls[-1]
@@ -78,14 +81,43 @@ def test_unvetted_ci_never_ssh(setup, field, value):
     assert len(calls) == 2
 
 
-def test_new_main_can_observe_but_never_matches_old_source_stage(setup):
+def test_new_main_does_not_replace_pinned_target_or_its_historical_ci(setup):
+    _, replies, calls = setup
+    replies[0]['sha'] = 'b'*40
+    result = v.check_once()
+    assert result['status'] == 'OBSERVED' and result['target'] == v.TARGET[:8]
+    assert result['current_main'] == 'DIFFERENT'
+    assert f'head_sha={v.TARGET}' in calls[1][0][-1]
+    assert result['source_staged'] == 'YES'
+    assert len(calls) == 3
+
+
+def test_new_main_ci_cannot_vet_the_old_target(setup):
     _, replies, calls = setup
     replies[0]['sha'] = 'b'*40
     replies[1]['workflow_runs'][0]['head_sha'] = 'b'*40
+    assert v.check_once() == v.unknown('REFUSED')
+    assert len(calls) == 2
+
+
+@pytest.mark.parametrize('digest,status', [('b'*64, 'REFUSED'), ('UNKNOWN', 'UNKNOWN'),
+                                         ('SYNTHETIC_SECRET', 'UNKNOWN'), ([], 'UNKNOWN')])
+def test_source_integrity_never_inferred_from_presence(setup, digest, status):
+    _, replies, _ = setup
+    replies[2]['source_digest'] = digest
     result = v.check_once()
-    assert result['status'] == 'REFUSED' and result['target'] == 'UNKNOWN'
-    assert result['source_staged'] == 'YES'
-    assert len(calls) == 3
+    assert result['status'] == status
+    assert result['source_integrity'] != 'VERIFIED'
+    assert 'SYNTHETIC_SECRET' not in str(result)
+
+
+def test_corrupt_independent_archive_never_ssh(setup, monkeypatch):
+    _, _, calls = setup
+    def corrupt():
+        return v.prepare.archive_digest(b'corrupt gzip')
+    monkeypatch.setattr(v.prepare, 'trusted_source_digest', corrupt)
+    assert v.check_once() == v.unknown()
+    assert len(calls) == 2
 
 
 @pytest.mark.parametrize('sha', [None, [], 'evil;command', 'a'*41])
@@ -159,6 +191,7 @@ def collector_namespace():
 
 def test_remote_collector_with_fake_systemd_proc_and_sqlite(monkeypatch):
     ns = collector_namespace()
+    ns['stage_digest'] = lambda: 'a'*64
     paths = []
     class FakePath:
         def __init__(self, value):
@@ -172,6 +205,8 @@ def test_remote_collector_with_fake_systemd_proc_and_sqlite(monkeypatch):
         def is_symlink(self): return False
         def exists(self): return False
         def stat(self): return SimpleNamespace(st_size=128)
+        def lstat(self):
+            return SimpleNamespace(st_uid=0, st_mode=0o100644 if self.value.endswith('.service') else 0o40755)
         def resolve(self, **kwargs): return FakePath('/root/FunPayFlow-stage-b567b561')
         def iterdir(self): return [FakePath('/proc/42')]
         def read_bytes(self):
@@ -181,13 +216,16 @@ def test_remote_collector_with_fake_systemd_proc_and_sqlite(monkeypatch):
     ns['Path'] = FakePath
     commands = []
     workdir = ['/root/FunPayFlow-stage-b567b561']
+    overrides = {}
     def run(args, **kwargs):
         commands.append(args)
         assert kwargs['shell'] is False and kwargs['timeout'] == 5
         if args[0] == 'git':
             return SimpleNamespace(returncode=0, stdout='b567b561e0509de5595fa804d2372aa4cc28bbf1')
-        value = ('42' if 'MainPID' in args[2] else workdir[0] if 'WorkingDirectory' in args[2]
+        value = ('root' if 'User' in args[2] else '/etc/systemd/system/funpayflow.service' if 'FragmentPath' in args[2]
+                 else '' if 'DropInPaths' in args[2] else '42' if 'MainPID' in args[2] else workdir[0] if 'WorkingDirectory' in args[2]
                  else 'inactive' if args[-1] == 'funpay-bot.service' else 'active')
+        value = overrides.get(args[2], value)
         return SimpleNamespace(returncode=0, stdout=value)
     monkeypatch.setattr(subprocess, 'run', run)
     monkeypatch.setattr(ns['os'], 'statvfs', lambda p: SimpleNamespace(f_bavail=1024**3, f_frsize=1), raising=False)
@@ -205,10 +243,18 @@ def test_remote_collector_with_fake_systemd_proc_and_sqlite(monkeypatch):
     assert result['active'] == result['database_ok'] == result['source_staged'] == 'YES'
     assert sql == ['PRAGMA query_only=ON', 'PRAGMA quick_check']
     assert paths == ['/proc/42/cmdline']
-    assert len(commands) == 5
+    assert result['source_digest'] == 'a'*64
+    assert len(commands) == 8
+    for field, value in [('--property=User', 'other'), ('--property=FragmentPath', '/tmp/unit'),
+                         ('--property=DropInPaths', '/tmp/override'), ('--property=MainPID', '43')]:
+        overrides[field] = value
+        refused = ns['collect']()
+        assert refused['active'] != 'YES' and refused['source_digest'] == 'UNKNOWN'
+        overrides.clear()
+    before_sql = len(sql)
     workdir[0] = '/root/FunPayFlow-next'
     assert ns['collect']()['active'] != 'YES'
-    assert sql == ['PRAGMA query_only=ON', 'PRAGMA quick_check'] * 2
+    assert len(sql) == before_sql + 2
     workdir[0] = '/root/FunPayFlow-stage-b567b561'
     # No deployment, mkdir, application launch, shell, backup, or install call exists.
     assert all(args[0] in {'systemctl', 'git'} for args in commands)
