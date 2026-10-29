@@ -118,7 +118,6 @@ def test_status_disallows_cross_repo_and_untrusted_pr_urls(tmp_path):
 def test_prompt_selects_correct_sandbox_policy():
     sen = worker.prompt_for(worker.profile_for(SEN), task(12))
     assert "Flutter Android" in sen
-    assert "No" not in sen.split("TASK TITLE:", 1)[0] or "no" in sen.lower()
     assert "FunPay or production VPS" in sen
     assert "Do not commit, push" in sen
     funpay = worker.prompt_for(worker.profile_for(FUNPAY), task(12))
@@ -198,7 +197,10 @@ def test_checked_changes_rejects_symlink_and_unapproved_path(monkeypatch, tmp_pa
     monkeypatch.setattr(worker.legacy, "run", lambda *args, **kw: SimpleNamespace(
         stdout="?? lib/target.dart\x00"))
     (tmp_path / "lib").mkdir()
-    (tmp_path / "lib" / "target.dart").symlink_to(tmp_path / "outside.dart")
+    try:
+        (tmp_path / "lib" / "target.dart").symlink_to(tmp_path / "outside.dart")
+    except OSError:
+        pytest.skip("Windows runner does not permit symlink creation")
     with pytest.raises(worker.legacy.WorkerError):
         worker.checked_changes(tmp_path, worker.profile_for(SEN))
 
