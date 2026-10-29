@@ -17,6 +17,9 @@ import webbrowser
 _spec = importlib.util.spec_from_file_location("monitor_worker", Path(__file__).with_name("codex_issue_worker.py"))
 worker = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(worker)
+_project_spec = importlib.util.spec_from_file_location("project_status_ui", Path(__file__).with_name("project_status.py"))
+project_status = importlib.util.module_from_spec(_project_spec)
+_project_spec.loader.exec_module(project_status)
 _vps_spec = importlib.util.spec_from_file_location("vps_update_status", Path(__file__).with_name("vps_update_status.py"))
 vps = importlib.util.module_from_spec(_vps_spec)
 _vps_spec.loader.exec_module(vps)
@@ -409,13 +412,22 @@ def collect(root):
     return {"live": live, "rows": rows, "online": online, "notices": notices}
 
 
-def start_worker(root):
-    """No pull, install, shell, or user-supplied command. Old installations fail closed."""
+def start_worker(root, *, universal=False):
+    """Explicit owner-requested launch, never from opening the GUI.
+
+    The universal mode is opt-in and checks every trusted installed dependency
+    before it can spawn one worker. The global legacy instance lock is shared.
+    """
     if not WINDOWS or sys.version_info[:2] != (3, 13):
         raise Unavailable("Windows Python 3.13 required")
-    installed = root / "source" / "scripts" / "codex_issue_worker.py"
+    scripts = root / "source" / "scripts"
+    trusted = Path(__file__).parent
+    executable = "universal_codex_worker.py" if universal else "codex_issue_worker.py"
+    installed = scripts / executable
     try:
-        if installed.read_bytes() != Path(worker.__file__).read_bytes():
+        required = ("codex_issue_worker.py", "worker_projects.py", "universal_codex_worker.py") if universal else ("codex_issue_worker.py",)
+        if any((scripts / name).read_bytes() != (trusted / name).read_bytes()
+               for name in required):
             raise Unavailable("Installed worker needs trusted source update")
         with worker.instance_lock(root):
             if worker.other_workers():
@@ -513,7 +525,7 @@ def main():
     ctk.set_appearance_mode("System")
     ctk.set_default_color_theme("blue")
     app = ctk.CTk()
-    app.title("FunPayFlow — Центр задач")
+    app.title("Control Center — Проекты")
     app.geometry("1150x700")
     app.minsize(760, 480)
     app.update_idletasks()
@@ -537,15 +549,19 @@ def main():
     header = ctk.CTkFrame(app, fg_color="transparent")
     header.grid(row=0, column=0, sticky="ew", padx=20, pady=(16, 6))
     header.grid_columnconfigure(0, weight=1)
-    title = label(header, "FunPayFlow · Центр задач")
+    title = label(header, "Codex · Центр проектов")
     title.configure(font=("Segoe UI", 24, "bold"))
     title.grid(row=0, column=0, sticky="w")
     themes = {"Системная": "System", "Светлая": "Light", "Тёмная": "Dark"}
     theme = ctk.CTkOptionMenu(header, values=list(themes), width=145,
                             command=lambda value: ctk.set_appearance_mode(themes[value]))
     theme.grid(row=0, column=1, padx=(8, 0))
+    project_menu = ctk.CTkOptionMenu(header, values=["FunPayFlow", "SenReader"], width=142,
+                                      command=lambda project: switch_project(project))
+    project_menu.set("FunPayFlow")
+    project_menu.grid(row=0, column=2, padx=(8, 0))
     status = label(header, "Worker: состояние неизвестно | GitHub: ожидание", wraplength=900)
-    status.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+    status.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(6, 0))
     phase_text = label(app, "Задачи создаются в ChatGPT → GitHub. Здесь — только наблюдение.", wraplength=900)
     phase_text.grid(row=1, column=0, sticky="ew", padx=20, pady=(0, 10))
     content = ctk.CTkFrame(app, fg_color="transparent")
@@ -566,12 +582,17 @@ def main():
     summary.configure(font=("Segoe UI", 19, "bold"))
     summary.grid(row=1, column=0, sticky="ew", padx=12, pady=(0, 12))
     check_widgets = {}
+    check_frames = []
     for index, (name, text) in enumerate(CHECK_LABELS.items(), 2):
         item = ctk.CTkFrame(card, corner_radius=12, fg_color=("#f0f5fb", "#22364c"))
         item.grid(row=index, column=0, sticky="ew", padx=12, pady=3)
+        check_frames.append(item)
         value = label(item, f"{text}: Неизвестно", wraplength=470)
         value.pack(fill="x", padx=12, pady=8)
         check_widgets[name] = value
+    senreader_hint = label(card, "SenReader: Android APK и тесты — в GitHub Actions.")
+    senreader_hint.grid(row=2, column=0, sticky="ew", padx=12)
+    senreader_hint.grid_remove()
     label(card, "Наблюдаемые этапы · без процента готовности").grid(
         row=6, column=0, sticky="ew", padx=12, pady=(16, 4))
     timeline = label(card, "Нет сохранённых событий.", wraplength=500)
@@ -596,6 +617,7 @@ def main():
     last = None
     last_launch = ""
     selected = None
+    selected_project = "FunPayFlow"
     history_buttons = {}
     notice_history = {}  # Safe fixed messages only, bounded by visible task history below.
 
@@ -615,7 +637,7 @@ def main():
                 launch_busy.set()
                 launch.clear()
                 try:
-                    children.append(start_worker(root))
+                    children.append(start_worker(root, universal=True))
                     message = "Запуск запрошен; ожидается heartbeat Worker"
                 except Unavailable:
                     message = "Сначала проверьте уже запущенный Worker. Запуск не подтверждён проверкой безопасности."
@@ -653,6 +675,14 @@ def main():
         selected = issue
         display()
 
+    def switch_project(project):
+        nonlocal selected, selected_project
+        if project not in {"FunPayFlow", "SenReader"}:
+            return
+        selected_project = project
+        selected = None
+        display()
+
     def display():
         if last is None:
             return
@@ -661,9 +691,22 @@ def main():
         status.configure(text=worker_status_text(live, last["online"], now))
         phase_text.configure(text=phase_status_text(live, now, snapshot))
         active = worker_active(live, now)
-        start_button.configure(text="Worker запущен" if active else "Запустить Worker",
+        start_button.configure(text="Worker запущен" if active else "Запустить Universal Worker",
                                state="disabled" if active or launch.is_set() or launch_busy.is_set() else "normal")
-        visible = dict(sorted(snapshot.items(), reverse=True)[:100])
+        view_repo = "Vetal12350/" + selected_project
+        view_base = "https://github.com/" + view_repo
+        view_snapshot = (snapshot if selected_project == "FunPayFlow" else
+                         project_status.project_rows(project_status.read_project_status(root), view_repo))
+        visible = dict(sorted(view_snapshot.items(), reverse=True)[:100])
+        for frame in check_frames:
+            if selected_project == "FunPayFlow":
+                frame.grid()
+            else:
+                frame.grid_remove()
+        if selected_project == "FunPayFlow":
+            senreader_hint.grid_remove()
+        else:
+            senreader_hint.grid()
         # Keep widgets during refresh so focus, selection and scroll position survive.
         for n in list(history_buttons):
             if n not in visible:
@@ -672,36 +715,41 @@ def main():
             if n not in history_buttons:
                 history_buttons[n] = ctk.CTkButton(history, anchor="w", height=74, corner_radius=12,
                     command=lambda issue=n: select_task(issue), text_color=ink, hover_color=("#dcecff", "#314d6b"))
-            text = task_text(row, live, now)
+            text = (task_text(row, live, now) if selected_project == "FunPayFlow"
+                    else PHASE_TEXT.get(row["phase"], "Неизвестно"))
             if not last["online"] and row.get("pr_url"):
                 text += " · данные ранее"
             button = history_buttons[n]
             short = text if len(text) <= 34 else text[:31] + "…"
-            task_links = {f"{BASE}/issues/{n}", row.get("pr_url")}
+            task_links = {f"{view_base}/issues/{n}", row.get("pr_url")}
             marker = " · •" if any(link in task_links for _, link in notice_history.values()) else ""
             button.configure(text=f"#{n}" + (f" · PR #{row['pr']}" if row.get("pr") else "") + marker + f"\n{short}",
                              fg_color=("#dcecff", "#314d6b") if selected == n else ("#f0f5fb", "#22364c"))
             button.grid(row=index, column=0, sticky="ew", padx=4, pady=4)
-        empty.configure(text="Отправьте задачу в ChatGPT.\nЗдесь появится очередь GitHub." if not visible else "")
+        empty.configure(text=("Задачи появятся после запуска универсального воркера.\nОткрой GitHub для проверки очереди." if selected_project == "SenReader"
+                              else "Отправьте задачу в ChatGPT.\nЗдесь появится очередь GitHub.") if not visible else "")
         empty.grid(row=len(visible), column=0, sticky="ew", padx=4)
-        caption, featured = featured_task(visible, live, now)
+        caption, featured = featured_task(visible, live if selected_project == "FunPayFlow" else None, now)
         if selected in visible:
             caption, featured = "Выбранная задача", visible[selected]
         heading.configure(text=caption)
-        summary.configure(text=(f"Задача #{featured['issue']} · {task_text(featured, live, now)}"
+        summary.configure(text=(f"Задача #{featured['issue']} · {(task_text(featured, live, now) if selected_project == 'FunPayFlow' else PHASE_TEXT.get(featured['phase'], 'Неизвестно'))}"
                                 if featured else "Отправьте задачу в ChatGPT; Worker проверяет очередь GitHub."))
         for name, widget in check_widgets.items():
             state = (featured or {}).get("checks", {}).get(name)
             widget.configure(text=f"{CHECK_LABELS[name]}: {CHECK_TEXT.get(state, 'Неизвестно')}",
                              text_color=("#207547", "#70d69d") if state == "success" else
                              ("#ae343c", "#ff9299") if state in FAILURES else ink)
-        timeline.configure(text=observed_timeline(live, (featured or {}).get("issue")))
-        links = {f"{BASE}/issues/{n}" for n in visible}
+        timeline.configure(text=(observed_timeline(live, (featured or {}).get("issue"))
+                                 if selected_project == "FunPayFlow" else
+                                 "Для SenReader показаны подтверждённые сохранённые этапы.\nПодробности сборки APK доступны на GitHub."))
+        links = {f"{view_base}/issues/{n}" for n in visible}
         links.update(row.get("pr_url") for row in visible.values())
-        for key in list(notice_history):
-            if notice_history[key][1] not in links:
-                del notice_history[key]
-        task_links = {f"{BASE}/issues/{featured['issue']}", featured.get("pr_url")} if featured else set()
+        if selected_project == "FunPayFlow":
+            for key in list(notice_history):
+                if notice_history[key][1] not in links:
+                    del notice_history[key]
+        task_links = {f"{view_base}/issues/{featured['issue']}", featured.get("pr_url")} if featured else set()
         messages = [message for message, link in notice_history.values() if link in task_links][-4:]
         event_indicator.configure(text="События\n" + "\n".join(messages) if messages else "Событий для задачи пока нет")
         notice = launch_notice(last_launch, live, now)
@@ -751,10 +799,14 @@ def main():
         app.after(1000, render)
 
     def open_selected():
-        _, featured = featured_task(snapshot, (last or {}).get("live"), time.time())
-        row = snapshot.get(selected, featured or {})
-        link = row.get("link", BASE)
-        if link == BASE or safe_link(link):
+        view_repo = "Vetal12350/" + selected_project
+        base = "https://github.com/" + view_repo
+        view_rows = (snapshot if selected_project == "FunPayFlow" else
+                     project_status.project_rows(project_status.read_project_status(root), view_repo))
+        _, featured = featured_task(view_rows, (last or {}).get("live") if selected_project == "FunPayFlow" else None, time.time())
+        row = view_rows.get(selected, featured or {})
+        link = row.get("link", base)
+        if link == base or project_status.safe_project_link(view_repo, link):
             webbrowser.open(link)
 
     def request_launch():
@@ -763,7 +815,7 @@ def main():
             start_button.configure(state="disabled")
 
     empty = label(history, "", wraplength=250)
-    start_button = ctk.CTkButton(footer, text="Запустить Worker", corner_radius=10,
+    start_button = ctk.CTkButton(footer, text="Запустить Universal Worker", corner_radius=10,
                                fg_color=accent, command=request_launch)
     start_button.grid(row=1, column=0, sticky="w")
     ctk.CTkButton(footer, text="Открыть GitHub", corner_radius=10, command=open_selected).grid(
