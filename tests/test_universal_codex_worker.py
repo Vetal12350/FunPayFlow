@@ -39,7 +39,7 @@ def test_queue_label_setup_is_explicit_and_repo_allowlisted(monkeypatch):
                         lambda argv, **kwargs: writes.append(argv) or SimpleNamespace(stdout=""))
     worker.ensure_labels()
     assert len(read_calls) == 2 and len(writes) == 2
-    assert {args[5] for args in read_calls} == {FUNPAY, SEN}
+    assert {args[4] for args in read_calls} == {FUNPAY, SEN}
     assert all(args[:4] == ["gh", "label", "create", "codex-local"] for args in writes)
     assert all("-R" in args for args in writes)
 
