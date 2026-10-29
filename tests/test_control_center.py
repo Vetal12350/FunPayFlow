@@ -594,7 +594,8 @@ def test_ctk_ui_refresh_is_sound_only_and_worker_stays_disabled(monkeypatch, tmp
             pass
         pack = grid
         grid_remove = grid
-        set = grid
+        def set(self, value):
+            self.options["value"] = value
         grid_columnconfigure = lambda *args, **kwargs: None
         grid_rowconfigure = grid_columnconfigure
         title = grid_columnconfigure
