@@ -290,8 +290,12 @@ def checked_changes(checkout: Path, profile: ProjectProfile) -> list[str]:
         if not allowed_path(profile, path):
             raise legacy.WorkerError("Unauthorized file path; no changes pushed")
         target = checkout / path
-        if target.is_symlink() or (target.exists() and not target.is_file()):
-            raise legacy.WorkerError("Unexpected file type; no changes pushed")
+        if (target.is_symlink() or any(parent.is_symlink()
+                for parent in list(target.parents) if parent != checkout and checkout in parent.parents)
+                or (target.exists() and not target.is_file())):
+            raise legacy.WorkerError("Unexpected file type or symlink; no changes pushed")
+        if target.is_file() and target.stat().st_size > 1_000_000:
+            raise legacy.WorkerError("File too large; no changes pushed")
         changed.append(path)
     return changed
 
@@ -316,8 +320,10 @@ def stage_and_pr(checkout: Path, task: dict, profile: ProjectProfile) -> str:
         indexed[match.group(3)] = match.group(1)
     if set(indexed) != set(changed):
         raise legacy.WorkerError("Unapproved Git file removal or index")
-    if len(legacy.git(checkout, "diff", "--cached", "--numstat")) > 30000:
-        raise legacy.WorkerError("Patch too large")
+    numstat = legacy.git(checkout, "diff", "--cached", "--numstat")
+    if len(numstat) > 30000 or any(line.startswith("-\t-\t")
+                                   for line in numstat.splitlines()):
+        raise legacy.WorkerError("Binary or oversized patch; no changes pushed")
     legacy.git(checkout, "-c", "user.name=Codex Worker",
                "-c", "user.email=codex-worker@users.noreply.github.com",
                "commit", "-m", f"test: implement issue #{issue} ({profile.repo})")
