@@ -59,11 +59,15 @@ def read_queue(profile: ProjectProfile, state: dict) -> list[dict]:
 
 
 def normalize_state(raw: dict) -> tuple[dict, bool]:
-    """Convert legacy numeric FunPay keys, reject corrupt/ambiguous data."""
+    """Retain legacy numeric keys as a rollback-safe mirror, plus scoped IDs.
+
+    The previous worker only looks for numeric keys. Removing them could cause
+    a rollback to accidentally claim old GitHub issues *again*. Preserve both
+    views atomically; reject any inconsistent copies rather than retrying work.
+    """
     if not isinstance(raw, dict):
         raise legacy.WorkerError("Worker state invalid")
     result: dict[str, Any] = {}
-    changed = False
     for key, value in raw.items():
         if key == "_last_repo":
             if value is not None:
@@ -75,24 +79,43 @@ def normalize_state(raw: dict) -> tuple[dict, bool]:
             continue
         if type(key) is not str or type(value) is not dict:
             raise legacy.WorkerError("Worker state invalid")
-        if key.isascii() and re.fullmatch(r"[1-9][0-9]{0,14}", key):
-            composite = task_key(legacy.REPO, int(key))
-            changed = True
+        if re.fullmatch(r"[1-9][0-9]{0,14}", key):
+            pass  # Legacy numeric FunPayFlow task.
         else:
             parts = key.rsplit("#", 1)
-            if (len(parts) != 2 or not re.fullmatch(r"[1-9][0-9]{0,14}", parts[1])):
+            if len(parts) != 2 or not re.fullmatch(r"[1-9][0-9]{0,14}", parts[1]):
                 raise legacy.WorkerError("Worker state invalid")
             try:
-                composite = task_key(parts[0], int(parts[1]))
+                canonical = task_key(parts[0], int(parts[1]))
             except ValueError:
                 raise legacy.WorkerError("Worker state invalid") from None
-            if composite != key:
+            if canonical != key:
                 raise legacy.WorkerError("Worker state invalid")
-        if composite in result:
-            raise legacy.WorkerError("Duplicate worker state entry")
-        result[composite] = value.copy()
+        result[key] = value.copy()
+
+    changed = False
+    for key, value in list(result.items()):
+        if key == "_last_repo":
+            continue
+        if re.fullmatch(r"[1-9][0-9]{0,14}", key):
+            counterpart = task_key(legacy.REPO, int(key))
+        elif key.startswith(legacy.REPO + "#"):
+            counterpart = key.rsplit("#", 1)[1]
+        else:
+            continue  # SenReader jobs are never presented to old FunPay worker.
+        if counterpart not in result:
+            result[counterpart] = value.copy()
+            changed = True
+        elif result[counterpart] != value:
+            raise legacy.WorkerError("Conflicting legacy and namespaced worker state")
     return result, changed
 
+
+def record_task_state(state: dict, repo: str, issue: int, value: dict) -> None:
+    """Atomically mirror FunPay issue state to keep legacy rollback fail-safe."""
+    state[task_key(repo, issue)] = value.copy()
+    if repo == legacy.REPO:
+        state[str(issue)] = value.copy()
 
 def load_state(root: Path) -> dict:
     """One-time migration under the *existing* shared instance lock."""
@@ -399,14 +422,14 @@ def process_once(root: Path, status: MultiStatus | None = None) -> bool:
     issue = task["number"]
     key = task_key(repo, issue)
     legacy.task_profile(task)
-    state[key] = {"status": "started"}
+    record_task_state(state, repo, issue, {"status": "started"})
     state["_last_repo"] = repo
     legacy.state_write(root / "state.json", state)
     try:
         if status:
             status.publish("claimed", repo, issue)
         url = execute_task(profile, task, root, status)
-        state[key] = {"status": "pr_created", "url": url}
+        record_task_state(state, repo, issue, {"status": "pr_created", "url": url})
         legacy.state_write(root / "state.json", state)
         if status:
             status.publish("pr_created", repo, issue, url)
@@ -416,7 +439,7 @@ def process_once(root: Path, status: MultiStatus | None = None) -> bool:
     except (legacy.WorkerError, OSError) as err:
         # Never automatically retry a claimed task, even if the PR was created.
         reason = str(err) if isinstance(err, legacy.WorkerError) else "Local worker I/O failed"
-        state[key] = {"status": "blocked", "reason": reason}
+        record_task_state(state, repo, issue, {"status": "blocked", "reason": reason})
         legacy.state_write(root / "state.json", state)
         if status:
             status.publish("blocked", repo, issue)
