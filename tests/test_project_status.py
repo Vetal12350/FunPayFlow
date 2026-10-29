@@ -126,3 +126,31 @@ def test_no_auto_launch_on_import():
     assert callable(cc.main)
     assert "customtkinter" not in cc.main.__globals__
     assert callable(project.read_project_status)
+
+
+def test_senreader_queue_is_owner_scoped_and_read_only(monkeypatch, tmp_path):
+    seen = []
+    def fake_gh(argv):
+        seen.append(argv)
+        return [
+            {"number": 8, "title": "[Codex] Implement alerts",
+             "author": {"login": "Vetal12350"}, "labels": [{"name": "codex-local"}]},
+            {"number": 9, "title": "[Codex] Untrusted",
+             "author": {"login": "attacker"}, "labels": [{"name": "codex-local"}]},
+            {"number": 10, "title": "Arbitrary untrusted title",
+             "author": {"login": "Vetal12350"}, "labels": [{"name": "codex-local"}]},
+        ]
+    monkeypatch.setattr(cc, "gh_json", fake_gh)
+    rows, online = cc.collect_senreader(tmp_path)
+    assert online and set(rows) == {8}
+    assert rows[8]["link"] == f"https://github.com/{SEN}/issues/8"
+    assert seen == [cc.SENREADER_ISSUES]
+
+
+def test_offline_senreader_queue_preserves_only_verified_local_status(monkeypatch, tmp_path):
+    write_status(tmp_path)
+    monkeypatch.setattr(cc, "gh_json", lambda _: (_ for _ in ()).throw(cc.Unavailable("offline")))
+    rows, online = cc.collect_senreader(tmp_path)
+    assert not online
+    assert set(rows) == {1}
+    assert rows[1]["pr_url"] == f"https://github.com/{SEN}/pull/7"
