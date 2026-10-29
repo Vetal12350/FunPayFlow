@@ -123,6 +123,39 @@ def test_consistent_mirrored_ledger_is_idempotent():
     assert next_state["89"] == next_state[worker.task_key(FUNPAY, 89)]
 
 
+def test_telemetry_history_restored_without_restarting_inflight_jobs(tmp_path):
+    root = tmp_path
+    previous = {
+        "version": 1, "phase": "stopped", "heartbeat": 100.0,
+        "jobs": {
+            "89": {"phase": "pr_created", "pr_url": f"https://github.com/{FUNPAY}/pull/40"},
+            "90": {"phase": "codex_running"},
+            "91": {"phase": "pr_created", "pr_url": f"https://github.com/{SEN}/pull/8"},
+        },
+        "project_jobs": {
+            f"{SEN}#4": {"phase": "pr_created", "pr_url": f"https://github.com/{SEN}/pull/4"},
+            f"{SEN}#5": {"phase": "codex_running"},
+            "attacker/evil#1": {"phase": "pr_created", "pr_url": "https://evil.test"},
+        },
+    }
+    worker.legacy.state_write(root / "live_status.json", previous)
+    status = worker.MultiStatus(root)
+    assert status.data["jobs"]["89"]["pr_url"].endswith("/FunPayFlow/pull/40")
+    assert status.data["jobs"]["90"]["phase"] == "blocked"
+    assert "pr_url" not in status.data["jobs"]["91"]
+    assert status.data["project_jobs"][worker.task_key(SEN, 4)]["pr_url"].endswith("/SenReader/pull/4")
+    assert status.data["project_jobs"][worker.task_key(SEN, 5)]["phase"] == "blocked"
+    assert "attacker/evil#1" not in status.data["project_jobs"]
+    assert status.data["project_jobs"][worker.task_key(FUNPAY, 89)]["phase"] == "pr_created"
+
+
+def test_corrupted_live_history_is_not_trusted(tmp_path):
+    (tmp_path / "live_status.json").write_text("not-json", encoding="utf-8")
+    status = worker.MultiStatus(tmp_path)
+    assert status.data["jobs"] == {}
+    assert status.data["project_jobs"] == {}
+
+
 def test_status_keeps_funpay_legacy_compatibility_without_leaking_senreader_issue(tmp_path):
     status = worker.MultiStatus(tmp_path)
     status.publish("claimed", FUNPAY, 13)
