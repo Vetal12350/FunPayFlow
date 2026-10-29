@@ -330,16 +330,12 @@ def stage_and_pr(checkout: Path, task: dict, profile: ProjectProfile) -> str:
         "Full project tests/builds belong to credential-free GitHub Actions. "
         "Review code and checks before merge. No production or VPS actions.\n"
     )
-    value = github_json([
+    value = legacy.run([
         "gh", "pr", "create", "-R", profile.repo,
         "--head", branch, "--base", profile.branch,
         "--title", f"Codex task #{issue}: source-only implementation",
-        "--body", body, "--json", "url",
-    ])
-    # gh pr create returns a URL string by default; some CLI versions reject
-    # --json for pr create. Avoid depending on output format in the trusted path.
-    if isinstance(value, dict):
-        value = value.get("url", "")
+        "--body", body,
+    ], timeout=90).stdout.strip()
     validated = pr_link(profile, value)
     if not validated:
         raise legacy.WorkerError("PR URL unavailable or not in allowed repository")
