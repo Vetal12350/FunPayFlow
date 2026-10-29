@@ -39,6 +39,29 @@ def github_json(argv: list[str]) -> Any:
     return legacy.output_json(argv)
 
 
+def ensure_labels() -> None:
+    """Create only the fixed owner-approved queue label in trusted projects.
+
+    Called by the orchestration process once under the shared lock, never by
+    the model or Issue instructions. Permission failures block startup safely.
+    """
+    for profile in PROFILES.values():
+        data = github_json([
+            "gh", "label", "list", "-R", profile.repo,
+            "--json", "name", "--limit", "100",
+        ])
+        if not isinstance(data, list) or len(data) > 100:
+            raise legacy.WorkerError("Repository labels unavailable")
+        names = {row.get("name") for row in data if isinstance(row, dict)
+                 and isinstance(row.get("name"), str)}
+        if LABEL not in names:
+            legacy.run([
+                "gh", "label", "create", LABEL, "-R", profile.repo,
+                "--color", "1F6FEB",
+                "--description", "Owner-authorized local Codex task queue",
+            ], timeout=60)
+
+
 def read_queue(profile: ProjectProfile, state: dict) -> list[dict]:
     data = github_json([
         "gh", "issue", "list", "-R", profile.repo, "--state", "open",
@@ -472,6 +495,7 @@ def main(argv: list[str] | None = None) -> int:
         with legacy.instance_lock(root), legacy.stop_on_sigterm():
             if legacy.other_workers():
                 raise legacy.WorkerError("Existing worker detected; refusing duplicate")
+            ensure_labels()
             with MultiStatus(root) as status:
                 while True:
                     try:
