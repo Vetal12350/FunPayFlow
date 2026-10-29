@@ -37,6 +37,9 @@ ISSUES = ["gh", "issue", "list", "-R", REPO, "--state", "open", "--label", worke
           "--author", worker.OWNER, "--limit", "100", "--json", "number,title,author,labels"]
 PRS = ["gh", "pr", "list", "-R", REPO, "--state", "all", "--limit", "100", "--json",
        "number,url,headRefName,headRefOid,state,mergedAt"]
+SENREADER_ISSUES = ["gh", "issue", "list", "-R", "Vetal12350/SenReader", "--state", "open",
+                    "--label", worker.LABEL, "--author", worker.OWNER, "--limit", "100",
+                    "--json", "number,title,author,labels"]
 
 
 class Unavailable(Exception):
@@ -63,7 +66,7 @@ def gh_json(argv):
                re.escape(f"repos/{REPO}/actions/") +
                r"(runs\?head_sha=[0-9a-f]{40}&event=pull_request&per_page=100|"
                r"runs/[1-9][0-9]*/attempts/[1-9][0-9]*/jobs\?per_page=100)", argv[4]))
-    if argv != ISSUES and argv != PRS and not api:
+    if argv != ISSUES and argv != PRS and argv != SENREADER_ISSUES and not api:
         raise Unavailable("Call not allowlisted")
     try:
         result = subprocess.run(argv, shell=False, timeout=20, check=False,
@@ -412,6 +415,33 @@ def collect(root):
     return {"live": live, "rows": rows, "online": online, "notices": notices}
 
 
+def collect_senreader(root):
+    """Read-only SenReader candidate queue and verified local jobs.
+
+    Failure of this optional GitHub call never impacts the original FunPay UI.
+    A candidate is not claimed until the worker checks its full Issue body.
+    """
+    repo = "Vetal12350/SenReader"
+    rows = project_status.project_rows(project_status.read_project_status(root), repo)
+    try:
+        entries = gh_json(SENREADER_ISSUES)
+        if not isinstance(entries, list) or len(entries) > 100:
+            raise Unavailable("SenReader queue unavailable")
+        for item in entries:
+            if (isinstance(item, dict) and number(item.get("number")) and
+                    isinstance(item.get("title"), str) and item["title"].startswith(worker.PREFIX) and
+                    isinstance(item.get("author"), dict) and item["author"].get("login") == worker.OWNER and
+                    isinstance(item.get("labels"), list) and
+                    any(isinstance(x, dict) and x.get("name") == worker.LABEL
+                        for x in item["labels"])):
+                issue = item["number"]
+                rows.setdefault(issue, {"issue": issue, "phase": "Queued",
+                                        "link": f"https://github.com/{repo}/issues/{issue}"})
+        return rows, True
+    except (Unavailable, TypeError, AttributeError, ValueError):
+        return rows, False
+
+
 def start_worker(root, *, universal=False):
     """Explicit owner-requested launch, never from opening the GUI.
 
@@ -613,6 +643,7 @@ def main():
     launch_busy = threading.Event()
     notification_store = Notifications(root)
     snapshot = {}
+    senreader_snapshot = {}
     children = []
     last = None
     last_launch = ""
@@ -655,8 +686,11 @@ def main():
         while not stop.is_set():
             try:
                 result = collect(root)
+                result["senreader_rows"], result["senreader_online"] = collect_senreader(root)
             except Exception:
-                result = {"live": read_live(root), "rows": {}, "online": False, "notices": []}
+                result = {"live": read_live(root), "rows": {}, "online": False, "notices": [],
+                          "senreader_rows": project_status.project_rows(project_status.read_project_status(root), "Vetal12350/SenReader"),
+                          "senreader_online": False}
             # Drop old snapshots; main thread always gets recent observations.
             try:
                 result_queue.put_nowait(result)
@@ -696,7 +730,7 @@ def main():
         view_repo = "Vetal12350/" + selected_project
         view_base = "https://github.com/" + view_repo
         view_snapshot = (snapshot if selected_project == "FunPayFlow" else
-                         project_status.project_rows(project_status.read_project_status(root), view_repo))
+                         {**senreader_snapshot, **project_status.project_rows(project_status.read_project_status(root), view_repo)})
         visible = dict(sorted(view_snapshot.items(), reverse=True)[:100])
         for frame in check_frames:
             if selected_project == "FunPayFlow":
@@ -726,7 +760,7 @@ def main():
             button.configure(text=f"#{n}" + (f" · PR #{row['pr']}" if row.get("pr") else "") + marker + f"\n{short}",
                              fg_color=("#dcecff", "#314d6b") if selected == n else ("#f0f5fb", "#22364c"))
             button.grid(row=index, column=0, sticky="ew", padx=4, pady=4)
-        empty.configure(text=("Задачи появятся после запуска универсального воркера.\nОткрой GitHub для проверки очереди." if selected_project == "SenReader"
+        empty.configure(text=("Очередь SenReader пока пуста или GitHub недоступен.\nСоздайте задачу в ChatGPT." if selected_project == "SenReader"
                               else "Отправьте задачу в ChatGPT.\nЗдесь появится очередь GitHub.") if not visible else "")
         empty.grid(row=len(visible), column=0, sticky="ew", padx=4)
         caption, featured = featured_task(visible, live if selected_project == "FunPayFlow" else None, now)
@@ -760,7 +794,7 @@ def main():
         details.configure(text=notice.strip(" ·") or "Звук — только для новых событий. Worker работает независимо от окна.")
 
     def render():
-        nonlocal last, snapshot, last_launch
+        nonlocal last, snapshot, senreader_snapshot, last_launch
         try:
             last_launch = launch_queue.get_nowait()
         except queue.Empty:
@@ -773,6 +807,10 @@ def main():
                     snapshot = result["rows"]
                 else:
                     snapshot.update(result["rows"])
+                if result.get("senreader_online"):
+                    senreader_snapshot = result.get("senreader_rows", {})
+                else:
+                    senreader_snapshot.update(result.get("senreader_rows", {}))
                 for key, message, link in result["notices"]:
                     notify(key, message, link)
         except queue.Empty:
@@ -802,7 +840,7 @@ def main():
         view_repo = "Vetal12350/" + selected_project
         base = "https://github.com/" + view_repo
         view_rows = (snapshot if selected_project == "FunPayFlow" else
-                     project_status.project_rows(project_status.read_project_status(root), view_repo))
+                     {**senreader_snapshot, **project_status.project_rows(project_status.read_project_status(root), view_repo)})
         _, featured = featured_task(view_rows, (last or {}).get("live") if selected_project == "FunPayFlow" else None, time.time())
         row = view_rows.get(selected, featured or {})
         link = row.get("link", base)
