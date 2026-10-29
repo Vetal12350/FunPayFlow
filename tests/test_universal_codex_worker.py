@@ -66,7 +66,7 @@ def test_namespaced_migration_keeps_claimed_and_blocked(tmp_path):
     assert (tmp_path / worker.LEGACY_BACKUP).exists()
     assert worker.legacy.state_read(tmp_path / worker.LEGACY_BACKUP) == original
     assert worker.load_state(tmp_path) == next_state
-    assert "89" not in worker.load_state(tmp_path)
+    assert worker.load_state(tmp_path)["89"] == next_state[worker.task_key(FUNPAY, 89)]
 
 
 def test_corrupt_state_never_overwritten(tmp_path):
@@ -83,8 +83,16 @@ def test_mixed_state_detects_collision():
         "89": {"status": "started"},
         worker.task_key(FUNPAY, 89): {"status": "pr_created"},
     }
-    with pytest.raises(worker.legacy.WorkerError, match="Duplicate"):
+    with pytest.raises(worker.legacy.WorkerError, match="Conflicting"):
         worker.normalize_state(raw)
+
+
+def test_consistent_mirrored_ledger_is_idempotent():
+    value = {"status": "blocked", "reason": "no retry"}
+    state = {"89": value, worker.task_key(FUNPAY, 89): value.copy()}
+    next_state, changed = worker.normalize_state(state)
+    assert not changed
+    assert next_state["89"] == next_state[worker.task_key(FUNPAY, 89)]
 
 
 def test_status_keeps_funpay_legacy_compatibility_without_leaking_senreader_issue(tmp_path):
