@@ -12,7 +12,13 @@ import re
 import time
 from typing import Any
 
-from worker_projects import PROFILES
+import importlib.util
+
+_path = Path(__file__).with_name("worker_projects.py")
+_spec = importlib.util.spec_from_file_location("project_status_policies", _path)
+_policies = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_policies)
+PROFILES = _policies.PROFILES
 
 PHASES = frozenset({
     "waiting", "claimed", "clone", "dependencies", "codex_running",
