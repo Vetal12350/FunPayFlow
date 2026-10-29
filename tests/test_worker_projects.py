@@ -1,10 +1,20 @@
 """Offline policy tests for an opt-in universal worker: zero network or processes."""
+import importlib.util
+from pathlib import Path
+
 import pytest
 
-from scripts.worker_projects import (
-    PROFILES, allowed_path, choose_next_repo, migrate_funpay_ledger,
-    profile_for, task_key,
-)
+SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "worker_projects.py"
+spec = importlib.util.spec_from_file_location("worker_projects_tests", SCRIPT)
+project = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(project)
+
+PROFILES = project.PROFILES
+allowed_path = project.allowed_path
+choose_next_repo = project.choose_next_repo
+migrate_funpay_ledger = project.migrate_funpay_ledger
+profile_for = project.profile_for
+task_key = project.task_key
 
 FUNPAY = "Vetal12350/FunPayFlow"
 SEN = "Vetal12350/SenReader"
