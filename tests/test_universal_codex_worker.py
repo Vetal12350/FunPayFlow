@@ -28,6 +28,34 @@ def task(number, title="[Codex] test title", owner="Vetal12350", label="codex-lo
     }
 
 
+def test_queue_label_setup_is_explicit_and_repo_allowlisted(monkeypatch):
+    read_calls = []
+    writes = []
+    def labels(argv):
+        read_calls.append(argv)
+        return [{"name": "different-label"}]
+    monkeypatch.setattr(worker, "github_json", labels)
+    monkeypatch.setattr(worker.legacy, "run",
+                        lambda argv, **kwargs: writes.append(argv) or SimpleNamespace(stdout=""))
+    worker.ensure_labels()
+    assert len(read_calls) == 2 and len(writes) == 2
+    assert {args[5] for args in read_calls} == {FUNPAY, SEN}
+    assert all(args[:4] == ["gh", "label", "create", "codex-local"] for args in writes)
+    assert all("-R" in args for args in writes)
+
+
+def test_label_setup_has_no_writes_when_already_present(monkeypatch):
+    monkeypatch.setattr(worker, "github_json", lambda argv: [{"name": "codex-local"}])
+    monkeypatch.setattr(worker.legacy, "run", lambda *args, **kwargs: pytest.fail("unexpected write"))
+    worker.ensure_labels()
+
+
+def test_label_setup_rejects_malformed_github_data(monkeypatch):
+    monkeypatch.setattr(worker, "github_json", lambda _: {"invalid": True})
+    with pytest.raises(worker.legacy.WorkerError):
+        worker.ensure_labels()
+
+
 def test_queue_per_repo_and_owner_validation(monkeypatch):
     observed = []
     def fake_query(argv):
