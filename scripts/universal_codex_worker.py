@@ -189,7 +189,71 @@ class MultiStatus:
             "timestamp": now, "phase_started": now, "heartbeat": now,
             "jobs": {}, "events": [], "project_jobs": {}, "current_repo": None,
         }
+        self._restore_history()
         self.thread = threading.Thread(target=self._heartbeat, daemon=True)
+
+    def _restore_history(self) -> None:
+        """Retain verified history across restarts; never revive an active job.
+
+        Only known repo identifiers, phases and trusted PR URLs are accepted.
+        Corrupted telemetry is ignored and can never alter the durable ledger.
+        """
+        try:
+            if not self.path.exists():
+                return
+            with self.path.open("rb") as stream:
+                blob = stream.read(65537)
+            if len(blob) > 65536:
+                return
+            previous = json.loads(blob)
+            if not isinstance(previous, dict) or previous.get("version") != 1:
+                return
+            original = previous.get("jobs", {})
+            extended = previous.get("project_jobs", {})
+            if not isinstance(original, dict) or not isinstance(extended, dict):
+                return
+            history = {}
+            for key, value in list(original.items())[-100:]:
+                if (not isinstance(key, str) or
+                        not re.fullmatch(r"[1-9][0-9]{0,14}", key) or
+                        not isinstance(value, dict) or value.get("phase") not in STATES):
+                    continue
+                phase = value["phase"]
+                item = {"phase": "blocked" if phase in ACTIVE else phase}
+                verified = pr_link(profile_for(legacy.REPO), value.get("pr_url"))
+                if verified:
+                    item["pr_url"] = verified
+                history[key] = item
+                self.data["jobs"][key] = item.copy()
+            for key, value in list(extended.items())[-100:]:
+                if not isinstance(key, str) or not isinstance(value, dict):
+                    continue
+                pieces = key.rsplit("#", 1)
+                if len(pieces) != 2 or not re.fullmatch(r"[1-9][0-9]{0,14}", pieces[1]):
+                    continue
+                try:
+                    profile = profile_for(pieces[0])
+                    if task_key(pieces[0], int(pieces[1])) != key:
+                        continue
+                except ValueError:
+                    continue
+                phase = value.get("phase")
+                if phase not in STATES:
+                    continue
+                item = {"phase": "blocked" if phase in ACTIVE else phase}
+                verified = pr_link(profile, value.get("pr_url"))
+                if verified:
+                    item["pr_url"] = verified
+                if pieces[0] == legacy.REPO and pieces[1] in history:
+                    # Legacy numeric history takes precedence if both exist.
+                    item = history[pieces[1]]
+                self.data["project_jobs"][key] = item
+            for issue, item in history.items():
+                self.data["project_jobs"][task_key(legacy.REPO, int(issue))] = item.copy()
+            self.data["project_jobs"] = dict(list(self.data["project_jobs"].items())[-100:])
+        except (OSError, ValueError, TypeError, AttributeError):
+            # GUI history is non-authoritative: durable state.json remains intact.
+            return
 
     def publish(self, phase: str | None = None, repo: str | None = None,
                 issue: int | None = None, url: str = "") -> None:
