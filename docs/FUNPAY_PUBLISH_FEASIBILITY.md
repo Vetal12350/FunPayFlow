@@ -1,5 +1,96 @@
 # Создание лота FunPay: evidence и блокер
 
+## Текущий результат issue 144, 2026-10-30: PREVIEW + свежий GET, POST OFF
+
+**Рабочий live publisher не поставлен.** Реализован предусмотренный задачей
+fallback: owner-only PREVIEW сохранённого `GAME_KEY`, Elden Ring, category 274,
+COMMON node 986, ровно три явных SELECT, quantity=1, без Variant. Цена и полные
+RU/EN берутся из сохранённого draft; валюта RUB/USD/EUR выбирается владельцем
+отдельно, без defaults из настроек. Ручная выдача показана как запрошенная,
+видимость и соответствие валюты/выдачи серверу — как недоказанные.
+
+Новые кнопки/actions:
+
+- В «Мои черновики»: `👁 PREVIEW · Elden Ring` → `prd:pubopen:<draft>:<revision>`.
+- В открытом сохранённом подходящем draft: `👁 PREVIEW публикации` → `prd:pubpreview:<preview-token>`.
+- PREVIEW: `RUB`, `USD`, `EUR` → `prd:pub:<token>:<currency>`, `Полный RU/EN`
+  → `prd:pub:<token>:ru/en`, `❌ Отмена проверки` → `prd:pub:<token>:cancel`.
+- После явного выбора валюты: `🔎 Проверить NEW-форму (GET)` →
+  `prd:pub:<token>:inspect`. Намерение одноразовое, TTL 300 с; смена валюты
+  заменяет token, уход с экрана/cancel/restart инвалидирует его.
+
+`Опубликовать 1 лот` **недоступно**. Нет live POST transport, переключателя,
+startup/background publication или автоматической попытки после GET. Прежний
+`confirm_synthetic` остаётся только offline harness; `assemble_new_request`
+не объявлен live-контрактом. Их fake-success не доказывает работу с FunPay.
+
+Свежая проверка не использует NodeForm cache или EDIT. Под тем же Account RLock
+и restart gate повторяются owner/runtime/account instance/route/catalog/revision,
+SAFE_MODE и durable attempt checks до и после GET. Нативный `Account.method`
+1.1.0 не умеет запретить redirects и не владеет `requests.Session`: новый узкий
+GET adapter использует аутентификацию **того же Account**, по прочитанному
+исходнику установленной версии. Он принимает только нативный Account 1.1.0,
+не создаёт Account, сохраняет runtime extra-cookie wrapper и не меняет Account.method,
+вызывает только фиксированный HTTPS NEW
+URL, `allow_redirects=False`, `verify=True`, без retry. Connect/read timeouts
+5/10 с, streaming limit 2 MB, дополнительная проверка времени чтения 15 с.
+Это не абсолютный deadline ожидания Account lock/всего вызова; общая блокировка
+может задержать polling. Обновление библиотеки требует повторного review adapter.
+Raw HTML, auth/CSRF, payload не сохраняются и не логируются.
+
+Parser требует authenticated document userId, проверяет exact node, EDIT identity,
+актуальную схему/опции; матрица показывает action/method, blank identity, CSRF,
+inventory и selects как структурные наблюдения. Любое отсутствие/неоднозначность
+не даёт разрешения на запись. Фиксированные блокеры:
+`NEW_SEMANTICS`, `MANUAL_MAPPING`, `CURRENCY_MAPPING`, `VISIBILITY_MAPPING`,
+`SUBMIT_CONTROLS`, `RESPONSE_ID`, `OWNER_READBACK`; при несовпадении трёх выборов
+добавляется `SELECTS`. Ни одно скрытое значение не подставляется по догадке.
+FunPayAPI 1.1.0 `save_lot` работает через EDIT и не возвращает новый ID;
+`get_lot_fields` возвращает ID аргумента, что не является независимым owner proof.
+До доказательства этих свойств POST отсутствует, success не сообщается.
+
+GET не создаёт write claim. Существующий `lot_publish_attempts` проверяется,
+UNKNOWN после restart/изменения revision не снимается. Инструкция владельцу:
+не повторять отправку/не клонировать draft для обхода, проверить свои лоты
+только чтением (точный ID, владелец, node, цена, количество, выдача), не очищать
+таблицу. Будущий POST потребует claim до dispatch и независимый read-back.
+
+После **отдельно разрешённого deployment** в уже работающем боте:
+`📦 Лоты → 📝 Мои черновики → 👁 PREVIEW · Elden Ring → валюта → GET`.
+PREVIEW из списка не вызывает прежний cached NodeForm GET. Если кнопки нет,
+нужен сохранённый подходящий draft с тремя актуальными Node Fields; legacy draft,
+другой node/Variant/quantity не получают поддержку публикации.
+
+Чеклист одного supervised лота (не выполнялся worker):
+
+1. Владелец сверяет route, три выбора, полные RU/EN, цену/валюту, quantity=1,
+   ручную выдачу и допустимость предложения; отдельно разрешает read-only GET.
+2. Получает фиксированную диагностику; при любом блокере останавливается.
+   **Текущая сборка заканчивает проверку здесь, POST не разрешён.**
+3. Только после отдельной реализации/review NEW семантики, submit/manual/currency/
+   visibility, response ID и независимого read-back: отдельный owner opt-in,
+   одноразовое `Опубликовать 1 лот`, claim до единственного POST, redirects/retry OFF.
+4. Проверить один новый ID, владельца/node/все данные/выдачу и сохранность остальных
+   лотов. Timeout/redirect/неясный ID/ошибка read-back → постоянный UNKNOWN, без retry.
+   Снятие/изменение созданного лота требует отдельного разрешения.
+
+Офлайн-проверки issue 144: **669 passed** для `test_publication_preview.py`,
+`test_lot_publisher.py`, `test_create_wire_contract.py`, `test_telegram_products.py`,
+`test_node_form.py`, `test_node_products.py`, `test_node_form_owner_diagnostics.py`.
+Итоговый общий `pytest -q tests`: **2095 passed, 3 deselected, 448 subtests passed**.
+Три исключённых теста сначала запускались и упали по sandbox-причинам:
+`test_linux_syntax_and_permission_strategy` (Git Bash signal pipe Win32 error 5),
+`test_start_reports_second_instance_without_running_production_bot` и
+`test_extracted_runtime_windows_and_linux_install_files` (доступ к внешнему uv cache).
+Не заявляется их PASS. Scratch/TEMP/TMP/cache — только `tests/.offline-tmp-144/`;
+pytest запущен через process-only замену mkdir mode 0700 → 0777 из-за Windows
+sandbox permissions, без изменения приложения/pytest fixtures. 102 Python-файла
+скомпилированы через `py_compile`; `git diff --check` чистый. Сетевые вызовы fake;
+новая регрессия включает настоящий `FunPayClient` с synthetic auth и fake HTTP,
+проверяя совместимость Account.method/extra-cookie wrappers. Live не проверялся.
+
+Ниже — исторический аудит прежней GET-кнопки; ограничения новой проверки описаны выше.
+
 ## Один GET → ограниченная contract matrix, 2026-10-27
 
 `prove_new_form_contract(html, response_url, node_id=986)` — чистая offline

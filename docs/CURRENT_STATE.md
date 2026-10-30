@@ -1,8 +1,8 @@
 # Текущее состояние: snapshot, не changelog
 
-Обновлено: **2026-10-21**. Перед новой задачей перепроверь Git; документ не заменяет текущий HEAD/status.
+Обновлено: **2026-10-30**. Перед новой задачей перепроверь Git; документ не заменяет текущий HEAD/status.
 
-- Publish feasibility: offline evidence не подтверждает NEW identity, manual mode и exact-ID read-back; publisher skeleton не добавлен, Publish OFF.
+- Issue 144: owner-only PREVIEW из сохранённых Elden Ring GAME_KEY drafts (274 / COMMON 986, три SELECT, quantity=1, без Variant), явная валюта, одноразовая fresh NEW GET-проверка через тот же Account/RLock с redirects OFF. Live POST отсутствует: NEW semantics, submit/manual/currency/visibility, response ID и независимый owner read-back не доказаны. Synthetic publisher остаётся offline-only; durable UNKNOWN не снимается. Deployment/live проверка не выполнялись.
   [Таблица доказательств и будущий owner-supervised one-lot протокол](FUNPAY_PUBLISH_FEASIBILITY.md).
 
 - Source checkout от `bb0462c`: в тот же LOCAL DRAFT selector добавлены opt-in `DLC_CONTENT`, `GAME_CURRENCY`, `GAMING_SUBSCRIPTION`. Требуют фактические сведения о предложении и заявление владельца о разрешённой передаче; категория и Node Fields выбираются прежним явным flow. DLC не включает базовую игру, объём валюты отделён от quantity, срок / номинал подписки / карты вводится владельцем. Это не автоматическая проверка правил провайдера. Старые пресеты и их пользовательские правки сохраняются, schema/dependencies и production не меняются. Подробнее [PRODUCT_TEMPLATES](PRODUCT_TEMPLATES.md).
