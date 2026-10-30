@@ -9,12 +9,15 @@ from copy import deepcopy
 import hashlib
 from html.parser import HTMLParser
 import json
+from importlib.metadata import version
 import re
 import time
 from urllib.parse import parse_qs, urlsplit
 import uuid
 
 from bs4 import BeautifulSoup
+import requests
+from FunPayAPI import Account
 from requests.exceptions import RequestException
 from FunPayAPI.common.exceptions import RequestFailedError, UnauthorizedError
 
@@ -47,6 +50,7 @@ _SENSITIVE_PLAIN = re.compile(
 _REASONS = frozenset('''UNEXPECTED PARSER_UNEXPECTED REQUEST_INVALID ACCOUNT_SCOPE ACCOUNT_UNINITIALIZED
 HTTP_AUTH HTTP_STATUS HTTP_REDIRECT REQUEST_TRANSPORT REQUEST_FAILED URL_INVALID URL_HOST URL_PATH URL_NODE URL_OFFER URL_AUTH
 CONTENT_TYPE CONTENT_SIZE CONTENT_ENCODING PARSER_INPUT APP_DATA_JSON APP_DATA_SHAPE APP_USER_TYPE APP_USER_INVALID APP_USER_SCOPE
+TRANSPORT_UNSUPPORTED AUTH_CONTEXT_MISSING
 LOGIN_PAGE ERROR_PAGE FORM_COUNT FORM_HIDDEN FORM_ACTION NODE_CONTEXT OFFER_CONTEXT SELECT_GROUP FIELD_NAME_MISSING
 FIELD_NAME_UNSUPPORTED FIELD_DUPLICATE SELECT_MULTIPLE SELECT_NESTED SELECT_STRUCTURE LABEL_COUNT LABEL_TEXT
 TEXT_INVALID FIELD_ID OPTION_TEXT OPTION_VALUE OPTION_STRUCTURE OPTION_VALUE_OR_LABEL OPTIONS_COUNT SELECTED_COUNT SELECT_SIZE FIELDS_COUNT EMPTY_EDITOR'''.split())
@@ -677,6 +681,89 @@ def _parse(html, node_id, account_id=None, *, evidence=None):
 def parse_node_form(html, node_id):
     """Parse safe metadata only; never expose server text in an exception."""
     return _parse(html, node_id)
+
+
+def _fresh_new_editor(account):
+    """One GET using the existing Account's authentication, never Account.method.
+
+    The installed 1.1.0 Account has no requests.Session and its method cannot
+    disable redirects. Mirror only its inspected GET authentication boundary,
+    with requests' default zero-retry adapter, TLS verification and no redirects.
+    This adapter deliberately has no method, endpoint or payload argument.
+    Authentication and response bytes remain transient; exceptions omit both.
+    """
+    response = None
+    try:
+        # Runtime wraps account.method for Runner/autobump; this GET neither
+        # calls nor replaces those wrappers. Authentication attributes belong
+        # to the inspected Account class, independent of its method wrapper.
+        if version('FunPayAPI') != '1.1.0' or type(account) is not Account:
+            raise NodeFormError('TRANSPORT_UNSUPPORTED')
+        if account.is_initiated is not True:
+            raise NodeFormError('ACCOUNT_UNINITIALIZED')
+        headers = {'accept-language': 'ru', 'accept': 'text/html',
+                   'cookie': f'golden_key={account.golden_key}'}
+        if account.phpsessid:
+            headers['cookie'] += f'; PHPSESSID={account.phpsessid}'
+        if account.user_agent:
+            headers['user-agent'] = account.user_agent
+        response = requests.get('https://funpay.com/lots/offerEdit?node=986',
+            headers=headers, proxies=account.proxy or {}, timeout=(5, 10),
+            allow_redirects=False, verify=True, stream=True)
+        if response.status_code != 200:
+            raise NodeFormError(_http_reason(response.status_code))
+        if response.history or response.url != 'https://funpay.com/lots/offerEdit?node=986':
+            raise NodeFormError('HTTP_REDIRECT')
+        chunks, size, started = [], 0, time.monotonic()
+        for chunk in response.iter_content(65536):
+            size += len(chunk)
+            if size > _MAX_HTML:
+                raise NodeFormError('CONTENT_SIZE')
+            if time.monotonic() - started > 15:
+                raise NodeFormError('REQUEST_TRANSPORT')
+            chunks.append(chunk)
+        return b''.join(chunks)
+    except NodeFormError:
+        raise
+    except Exception:
+        raise NodeFormError('REQUEST_TRANSPORT') from None
+    finally:
+        if response is not None:
+            try:
+                response.close()
+            except Exception:
+                pass
+
+
+def inspect_fresh_new_form(client, store, fingerprint, selections):
+    """Uncached, scoped NEW inspection; only fixed facts leave this call.
+
+    Presence of a blank identity/CSRF is an observation, never authorization to
+    create. Manual/currency/visibility and NEW response semantics stay unproven.
+    No raw form, hidden values, payload or updated schema is saved or returned.
+    """
+    with client._account_lock:
+        account = client.account
+        if (account.id != store.account_id or client.review_state is not store.store
+                or getattr(account, 'is_initiated', False) is not True):
+            raise NodeFormError('ACCOUNT_SCOPE')
+        try:
+            html = _fresh_new_editor(account).decode('utf-8')
+        except UnicodeError:
+            raise NodeFormError('CONTENT_ENCODING') from None
+        schema = _parse(html, 986, account_id=account.id)
+        body = BeautifulSoup(html, 'html.parser').find('body')
+        if body is None or not body.has_attr('data-app-data'):
+            raise NodeFormError('AUTH_CONTEXT_MISSING')
+        proof = prove_new_form_contract(html, 'https://funpay.com/lots/offerEdit?node=986')
+        fields = schema['fields']
+        matching = (schema['fingerprint'] == fingerprint and len(fields) == len(selections) == 3
+                    and all(not f['disabled'] and f['html_name'] == name
+                        and any(o['value'] == value and not o['disabled'] for o in f['options'])
+                        for f, (name, value) in zip(fields, selections)))
+        if client.account is not account or account.id != store.account_id:
+            raise NodeFormError('ACCOUNT_SCOPE')
+        return proof, matching
 
 
 class NodeFormService:

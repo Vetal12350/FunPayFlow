@@ -1,4 +1,4 @@
-"""One saved GAME_KEY draft -> synthetic NEW submission, never live HTTP.
+"""Saved GAME_KEY review and live read-only NEW inspection; POST stays disabled.
 
 The service controls and receipt below are an OFFLINE protocol, not a claim
 about FunPay's wire format. The transport has no implementation. Only tests
@@ -15,11 +15,12 @@ import time
 from FunPayAPI import Account
 from FunPayAPI.common.enums import SubCategoryTypes
 
-from .node_form import is_safe_node_binding_name
+from .node_form import is_safe_node_binding_name, inspect_fresh_new_form, safe_contract_proof
 from .node_products import selected_fields
 from .product_drafts import validate_price
 from .product_templates import GAME_KEY, safe_text
 from .runtime_control import automatic_action_gate
+from .game_routes import RouteService, RouteError
 
 
 REASONS = frozenset({
@@ -86,6 +87,39 @@ class PreparedLot:
         """Fixed metadata only: safe for a report, never content or controls."""
         return {'mode': 'synthetic', 'live_enabled': False, 'node': 986,
                 'quantity': 1, 'state': 'PREPARED'}
+
+
+@dataclass(frozen=True, repr=False)
+class PublicationReview:
+    owner_id: str
+    account_id: int
+    account_instance: int
+    draft_id: str
+    revision: int
+    route_id: str
+    route_revision: int
+    template_id: str
+    template_revision: int
+    fingerprint: str
+    currency: str | None
+    price: str
+    selections: tuple
+    content: tuple
+    fetched_at: float = field(compare=False)
+
+
+# Fixed diagnostics only. A complete structural observation still cannot prove
+# server-side NEW semantics or an independent read-back in FunPayAPI 1.1.0.
+PUBLICATION_BLOCKERS = {
+    'NEW_SEMANTICS': 'Не доказано, что наблюдаемая identity создаёт NEW, а не изменяет лот.',
+    'MANUAL_MAPPING': 'Не доказано значение ручной выдачи из семантики формы.',
+    'CURRENCY_MAPPING': 'Не доказана валюта цены из семантики формы.',
+    'VISIBILITY_MAPPING': 'Не доказано состояние видимости из семантики формы.',
+    'SUBMIT_CONTROLS': 'Не доказана полная семантика submit-кнопок и служебных controls.',
+    'RESPONSE_ID': 'Нет подтверждённого контракта ровно одного нового offer ID в ответе.',
+    'OWNER_READBACK': 'Нет независимого read-back владельца, node, данных и ручной выдачи.',
+    'SELECTS': 'Три явных выбора не совпадают с актуальной схемой NEW-формы.',
+}
 
 
 @dataclass(frozen=True)
@@ -189,6 +223,94 @@ class LotPublisher:
         self.client, self.store = client, store
         self.late_check = late_check or (lambda: False)
         self.clock = clock
+
+    def review(self, draft_id, revision, currency):
+        """Review saved data without GET, synthetic provenance or currency defaults.
+
+        Old schema timestamps are allowed for PREVIEW only. Confirmation must
+        compare the schema/options against a fresh response, never the cache.
+        """
+        try:
+            with closing(self.store.store._connect()) as db:
+                db.execute('BEGIN')
+                d = self.store._get(db, 'product_drafts', draft_id)
+                require(d is not None, 'SCOPE')
+                r = self.store._get(db, 'game_routes', d['route_id'])
+                t = self.store._get(db, 'product_templates', d['template_id'])
+                require(r is not None and t is not None and t['name'] == GAME_KEY
+                    and not d.get('variant_id') and r['metadata'] == {'category_id': 274, 'type': 'COMMON'}
+                    and r['node_id'] == d['node'] == 986
+                    and r['game_name'].casefold() == d['game'].casefold() == 'elden ring'
+                    and d['template_id'] == r['template_id'] == t['id'], 'SCOPE')
+                require(type(revision) is int and d['revision'] == revision
+                    and d.get('status') != 'cancelled' and d['route_snapshot'] == r
+                    and d['template_snapshot'] == t and d['route_revision'] == r['revision']
+                    and d['template_revision'] == t['revision'], 'REVISION')
+                schema, rows, payload = d['node_schema'], d['node_fields'], d['payload']
+                fields = schema['fields']
+                names = [f['html_name'] for f in fields]
+                require(schema['node_id'] == 986 and len(names) == len(set(names)) == len(rows) == 3
+                    and all(is_safe_node_binding_name(n) for n in names)
+                    and all(f['kind'] == 'select' and f['disabled'] is False for f in fields)
+                    and {row['html_name'] for row in rows} == set(names)
+                    and selected_fields(schema, {row['html_name']: row['value'] for row in rows}) == rows, 'SCHEMA')
+                safe = [dict(html_name=f['html_name'], kind=f['kind'], label=f['label'],
+                    required=f['required'], disabled=f['disabled'], order=f['order'],
+                    options=[{k: o[k] for k in ('value', 'label', 'order', 'disabled')}
+                             for o in f['options']]) for f in fields]
+                digest = hashlib.sha256(json.dumps(safe, ensure_ascii=False, sort_keys=True,
+                    separators=(',', ':')).encode('utf-8')).hexdigest()
+                require(digest == schema['fingerprint'], 'SCHEMA')
+                require(set(payload) == {*TEXT_FIELDS, 'price', 'amount'}, 'CONTENT')
+                require(type(payload['amount']) is int and payload['amount'] == 1, 'QUANTITY')
+                require(currency is None or (type(currency) is str and currency in {'RUB', 'USD', 'EUR'}), 'PRICE')
+                price = validate_price(payload['price'])
+                content = tuple((k, safe_text(payload[k], k,
+                    200 if k.startswith('title') else 10000)) for k in TEXT_FIELDS)
+                return PublicationReview(self.store.owner_id, self.store.account_id,
+                    id(self.client.account), d['id'], revision, r['id'], r['revision'], t['id'],
+                    t['revision'], digest, currency, price,
+                    tuple((row['html_name'], row['value'], row['display_label'], row['option_label'])
+                          for row in rows), content, self.clock())
+        except PublisherError:
+            raise
+        except (KeyError, TypeError, ValueError):
+            raise PublisherError('SCHEMA') from None
+        except Exception:
+            raise PublisherError('DATABASE') from None
+
+    def inspect_new(self, review):
+        """Consume an owner intent at the UI boundary; GET only, no claim/POST.
+
+        The durable guard is consulted even though this path cannot submit.
+        A read-only failure must not create a misleading UNKNOWN write attempt.
+        """
+        require(type(review) is PublicationReview, 'INVALID')
+        require(review.currency in {'RUB', 'USD', 'EUR'}, 'PRICE')
+        account = self.client.account
+        def route_current():
+            try:
+                route = RouteService(self.client, self.store).resolve_route(review.route_id)
+                require(route['revision'] == review.route_revision, 'REVISION')
+            except RouteError:
+                raise PublisherError('SCOPE') from None
+        with self.client._account_lock, automatic_action_gate() as allowed:
+            require(allowed, 'GATE')
+            self._scope_gate(account, review)
+            require(self.outcome(review.draft_id) is None, 'ALREADY_CLAIMED')
+            require(self.review(review.draft_id, review.revision, review.currency) == review, 'REVISION')
+            route_current()
+            proof, matches = inspect_fresh_new_form(self.client, self.store, review.fingerprint,
+                tuple((name, value) for name, value, _, _ in review.selections))
+            self._scope_gate(account, review)
+            require(self.review(review.draft_id, review.revision, review.currency) == review, 'REVISION')
+            route_current()
+            require(self.outcome(review.draft_id) is None, 'ALREADY_CLAIMED')
+            proof = safe_contract_proof(proof)
+            blockers = [key for key in PUBLICATION_BLOCKERS if key != 'SELECTS']
+            if not matches:
+                blockers.append('SELECTS')
+            return proof, tuple(blockers)
 
     def _build(self, db, draft_id, revision, form, price, currency):
         draft = self.store._get(db, 'product_drafts', draft_id)

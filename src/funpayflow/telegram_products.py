@@ -17,6 +17,7 @@ from .node_form import NodeFormError, NodeFormService, safe_form_evidence, safe_
 from . import telegram_node_fields as node_ui
 from .product_variants import VariantService
 from .state import StateError
+from .lot_publisher import LotPublisher, PublisherError, PUBLICATION_BLOCKERS, _fresh
 
 
 _flows: dict[int, dict] = {}
@@ -309,6 +310,109 @@ def _draft_label(row):
     return ' · '.join(part for part in parts if part)[:64]
 
 
+def _publication_candidate(body):
+    """Display filter only; the service revalidates the saved rows and scope."""
+    return (body.get('node') == 986 and body.get('game', '').casefold() == 'elden ring'
+            and body.get('template_snapshot', {}).get('name') == 'GAME_KEY'
+            and not body.get('variant_id') and body.get('status') != 'cancelled'
+            and body.get('payload', {}).get('amount') == 1 and len(body.get('node_fields', [])) == 3)
+
+
+async def _publication_screen(callback, state):
+    review = state['review']
+    token = state['token']
+    text = ('👁 <b>PREVIEW · новый лот Elden Ring</b>\n'
+        'GAME_KEY · category 274 · COMMON node 986\n'
+        f'Draft revision: {review.revision}\n'
+        + '\n'.join(escape(label[:65]) + ': ' + escape(option[:120])
+                    for _, _, label, option in review.selections)
+        + f'\nЦена: {escape(review.price)} {review.currency or "— выберите валюту"}'
+        '\nКоличество: 1\nВыдача: ручная (запрошена; соответствие форме ещё не доказано).\n'
+        'Видимость: не доказана.\n\n'
+        '<b>Live POST отключён.</b> Следующий шаг — один свежий GET NEW-формы '
+        'без редиректов. Проверка ничего не публикует. '
+        '«Опубликовать 1 лот» недоступно до доказательства NEW-контракта и read-back.')
+    rows = [[(currency, f'prd:pub:{token}:{currency}') for currency in ('RUB', 'USD', 'EUR')],
+            [('Полный RU', f'prd:pub:{token}:ru'), ('Полный EN', f'prd:pub:{token}:en')]]
+    if review.currency:
+        rows.append([('🔎 Проверить NEW-форму (GET)', f'prd:pub:{token}:inspect')])
+    rows += [[('❌ Отмена проверки', f'prd:pub:{token}:cancel')], [('📝 Мои черновики', 'prd:drafts:0')]]
+    if any(len(label) > 65 or len(option) > 120 for _, _, label, option in review.selections):
+        await _plain_chunks(callback.message, '\n'.join(label + ': ' + option
+            for _, _, label, option in review.selections))
+    await _show(callback, text, _menu(rows))
+
+
+async def _publication_callback(callback, user_id, parts, store, routes):
+    """Read-only fallback. No live submission capability is reachable here."""
+    command = parts[1]
+    if command in {'pubopen', 'pubpreview'}:
+        if command == 'pubopen':
+            if len(parts) != 4:
+                raise ValueError('Экран устарел.')
+            draft_id, revision = parts[2], int(parts[3])
+        else:
+            flow = _active(user_id)
+            if (len(parts) != 3 or parts[2] != flow.get('preview_token')
+                    or not flow.get('stored_id') or flow.get('dirty')):
+                raise ValueError('Экран устарел.')
+            draft_id, revision = flow['stored_id'], flow['stored_revision']
+        publisher = LotPublisher(routes.client, store)
+        review = await asyncio.to_thread(publisher.review, draft_id, revision, None)
+        if await asyncio.to_thread(publisher.outcome, draft_id) is not None:
+            raise PublisherError('ALREADY_CLAIMED')
+        state = {'review': review, 'token': uuid.uuid4().hex[:12],
+                 'context': _catalog_context(routes, store, review.template_id)}
+        _flows[user_id] = {'publication': state}
+        _ui()._interaction_state.pop(user_id, None)
+        await _publication_screen(callback, state)
+        return
+    flow = _active(user_id)
+    state = flow.get('publication')
+    if (len(parts) != 4 or not state or not state['token'] or parts[2] != state['token']
+            or state['context'] != _catalog_context(routes, store, state['review'].template_id)):
+        raise ValueError('Экран устарел.')
+    operation = parts[3]
+    if operation == 'cancel':
+        discard_session(user_id)
+        await _show(callback, *_home())
+        return
+    review = state['review']
+    def current():
+        return (_flows.get(user_id) is flow and flow.get('publication') is state
+            and _ui()._runtime_client is routes.client and _ui()._owner_id(user_id)
+            and state['context'] == _catalog_context(routes, store, review.template_id)
+            and not _ui().is_safe_mode_enabled())
+    publisher = LotPublisher(routes.client, store, late_check=current)
+    _fresh(review.fetched_at, publisher.clock())
+    if await asyncio.to_thread(publisher.review, review.draft_id, review.revision, review.currency) != review:
+        raise PublisherError('REVISION')
+    if operation in {'RUB', 'USD', 'EUR'}:
+        state['review'] = await asyncio.to_thread(publisher.review, review.draft_id, review.revision, operation)
+        state['token'] = uuid.uuid4().hex[:12]
+        await _publication_screen(callback, state)
+    elif operation in {'ru', 'en'}:
+        content = dict(review.content)
+        await _plain_chunks(callback.message, content['title_' + operation] + '\n\n' + content['description_' + operation])
+    elif operation == 'inspect':
+        # Consume before waiting for the Account lock or making any request.
+        state['token'] = None
+        proof, blockers = await asyncio.to_thread(publisher.inspect_new, review)
+        if not current():
+            return
+        lines = ['🔒 Публикация заблокирована. Выполнена только свежая GET-проверка.',
+                 'Наблюдения формы (verified = структура, не разрешение на POST):']
+        lines += [f'{key}: {proof[key]}' for key in (
+            'editor_url', 'document_markup', 'form_subtree', 'submission', 'blank_identity',
+            'node_identity', 'csrf_presence', 'control_inventory', 'select_names')]
+        lines += [PUBLICATION_BLOCKERS[key] for key in blockers]
+        lines += ['POST не выполнялся; попытка публикации не создавалась. '
+                  'Не используйте save_lot или offer_id=0 как обход. Нужен review NEW-контракта.']
+        await _show(callback, escape('\n'.join(lines)), _menu([[('📝 Мои черновики', 'prd:drafts:0')]]))
+    else:
+        raise ValueError('Экран устарел.')
+
+
 def _route_screen(row, check_token=None):
     text = ('🗺 <b>Game Route</b>\n'
             f"Категория каталога (legacy game_name): {escape(row['game_name'][:150])}\n"
@@ -472,6 +576,8 @@ def _preview_screen(flow):
             rows.insert(0, [('🔗 Связать поля', 'prd:bindings')])
     if flow.get('stored_id') and not flow.get('dirty') and body.get('status') != 'cancelled':
         rows.insert(0, [('📑 Создать похожий', 'prd:clone')])
+        if _publication_candidate(body):
+            rows.insert(0, [('👁 PREVIEW публикации', 'prd:pubpreview:' + token)])
     if flow.get('similar') and not flow.get('stored_id'):
         rows.insert(0, [('📝 Параметры', _local_action(flow, 'menu'))])
     rows = [[(label, action + ':' + token if action.startswith('prd:') and action.split(':')[1] in {'save', 'edit', 'text', 'discard', 'clone', 'bindings'}
@@ -794,6 +900,11 @@ async def _products_callback(callback, action, user_id):
             return True
         if user_id in _flows:
             _flows[user_id].pop('route_form', None)
+        if command in {'pubopen', 'pubpreview', 'pub'}:
+            await _publication_callback(callback, user_id, parts, store, routes)
+            return True
+        if user_id in _flows:
+            _flows[user_id].pop('publication', None)
         if command == 'preset':
             flow = _active(user_id)
             if (len(parts) != 4 or parts[2] != flow.get('type_token')
@@ -1220,7 +1331,11 @@ async def _products_callback(callback, action, user_id):
             await _plain_chunks(callback.message, json.dumps(flow['template_edit'], ensure_ascii=False, indent=2))
         elif command == 'drafts':
             offset = int(parts[2]); rows = await asyncio.to_thread(store.list_drafts, limit=_PAGE + 1, offset=offset)
-            keyboard = [[((_draft_label(r)), f"prd:open:{r['id']}")] for r in rows[:_PAGE]]
+            keyboard = []
+            for row in rows[:_PAGE]:
+                keyboard.append([(_draft_label(row), f"prd:open:{row['id']}")])
+                if _publication_candidate(row):
+                    keyboard.append([('👁 PREVIEW · Elden Ring', f"prd:pubopen:{row['id']}:{row['revision']}")])
             keyboard += _page_buttons('prd:drafts', offset, len(rows) > _PAGE)
             keyboard.append([('Лоты', 'products')])
             await _show(callback, '📝 <b>Сохранённые product drafts</b>', _menu(keyboard))
@@ -1279,6 +1394,17 @@ async def _products_callback(callback, action, user_id):
             await _show(callback, *_home())
         else:
             raise ValueError('Действие устарело.')
+    except PublisherError as cause:
+        if cause.reason == 'ALREADY_CLAIMED':
+            text = ('🔒 Для этого draft уже есть постоянный барьер попытки. Результат может быть UNKNOWN. '
+                    'Не повторяйте отправку и не создавайте копию для обхода. Проверьте свои лоты '
+                    'на сайте только чтением: ID, владельца, node 986, цену, количество и выдачу. '
+                    'Не очищайте lot_publish_attempts; автоматического retry нет.')
+        else:
+            text = ('🔒 PREVIEW / проверка отклонены: ' + cause.reason
+                    + '. Откройте сохранённый draft заново; проверьте owner/account, route, '
+                    'revision, три выбора, quantity=1 и SAFE_MODE. POST не выполнялся.')
+        await callback.message.answer(text)
     except NodeSelectionError:
         if user_id in _flows and _flows[user_id].get('node_state'):
             await node_ui.error(callback.message, user_id, _flows[user_id], STALE_WARNING)
