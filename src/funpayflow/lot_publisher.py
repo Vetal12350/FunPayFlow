@@ -1,8 +1,9 @@
 """Saved GAME_KEY review and live read-only NEW inspection; POST stays disabled.
 
 The service controls and receipt below are an OFFLINE protocol, not a claim
-about FunPay's wire format. The transport has no implementation. Only tests
-replace its method; no setting, environment variable or Telegram hook enables it.
+about FunPay's wire format. SyntheticTransport has no implementation. The dormant
+create_wire_contract exchange also rejects unverified contracts; neither has a
+setting, environment variable or Telegram hook enabling live submission.
 """
 from contextlib import closing
 from copy import deepcopy
@@ -112,14 +113,40 @@ class PublicationReview:
 # server-side NEW semantics or an independent read-back in FunPayAPI 1.1.0.
 PUBLICATION_BLOCKERS = {
     'NEW_SEMANTICS': 'Не доказано, что наблюдаемая identity создаёт NEW, а не изменяет лот.',
-    'MANUAL_MAPPING': 'Не доказано значение ручной выдачи из семантики формы.',
-    'CURRENCY_MAPPING': 'Не доказана валюта цены из семантики формы.',
-    'VISIBILITY_MAPPING': 'Не доказано состояние видимости из семантики формы.',
-    'SUBMIT_CONTROLS': 'Не доказана полная семантика submit-кнопок и служебных controls.',
-    'RESPONSE_ID': 'Нет подтверждённого контракта ровно одного нового offer ID в ответе.',
-    'OWNER_READBACK': 'Нет независимого read-back владельца, node, данных и ручной выдачи.',
+    'MANUAL_MAPPING': 'MANUAL_MAPPING: fpx не проверяет ручную выдачу; отсутствие secrets не доказывает режим выдачи.',
+    'CURRENCY_MAPPING': 'CURRENCY_MAPPING: не доказана связь RUB/USD/EUR с price в NEW-форме; fpx не задаёт и не проверяет валюту цены.',
+    'VISIBILITY_MAPPING': 'VISIBILITY_MAPPING: active=on в fpx не доказывает видимость с учётом настроек аккаунта.',
+    'SUBMIT_CONTROLS': 'SUBMIT_CONTROLS: значения form_created_at/location/deleted и submit-controls требуют отдельной проверки; defaults из fpx не используются.',
+    'RESPONSE_ID': 'RESPONSE_ID: fpx возвращает True по HTTP 200, без доказательства нового offer ID.',
+    'OWNER_READBACK': 'OWNER_READBACK: нет независимого подтверждения владельца, данных нового ID и сохранности остальных лотов.',
     'SELECTS': 'Три явных выбора не совпадают с актуальной схемой NEW-формы.',
+    'FORM_STRUCTURE': 'FORM_STRUCTURE: NEW-форма или её HTTPS action/method неоднозначны.',
+    'CONTROL_INVENTORY': 'CONTROL_INVENTORY: есть неизвестные, повторные или неподдержанные controls.',
+    'NEW_IDENTITY': 'NEW_IDENTITY: нет единственных проверенных blank offer_id и node_id=986.',
+    'CSRF': 'CSRF: не наблюдается единственный непустой CSRF control.',
 }
+
+
+def publication_blockers(proof, matches):
+    """Precise fixed structural failures plus the remaining semantic evidence.
+
+    Source evidence establishes transport shape, never server-side defaults.
+    No matrix (including a forged positive one) can enable a final POST button.
+    """
+    proof = safe_contract_proof(proof)
+    blockers = [key for key in PUBLICATION_BLOCKERS if key in {
+        'NEW_SEMANTICS', 'MANUAL_MAPPING', 'CURRENCY_MAPPING', 'VISIBILITY_MAPPING',
+        'SUBMIT_CONTROLS', 'RESPONSE_ID', 'OWNER_READBACK'}]
+    for code, predicates in (
+            ('FORM_STRUCTURE', ('editor_url', 'form_subtree', 'submission')),
+            ('CONTROL_INVENTORY', ('control_inventory',)),
+            ('NEW_IDENTITY', ('blank_identity', 'node_identity')),
+            ('CSRF', ('csrf_presence',))):
+        if any(proof[key] != 'verified' for key in predicates):
+            blockers.append(code)
+    if not matches:
+        blockers.append('SELECTS')
+    return tuple(blockers)
 
 
 @dataclass(frozen=True)
@@ -307,10 +334,7 @@ class LotPublisher:
             route_current()
             require(self.outcome(review.draft_id) is None, 'ALREADY_CLAIMED')
             proof = safe_contract_proof(proof)
-            blockers = [key for key in PUBLICATION_BLOCKERS if key != 'SELECTS']
-            if not matches:
-                blockers.append('SELECTS')
-            return proof, tuple(blockers)
+            return proof, publication_blockers(proof, matches)
 
     def _build(self, db, draft_id, revision, form, price, currency):
         draft = self.store._get(db, 'product_drafts', draft_id)

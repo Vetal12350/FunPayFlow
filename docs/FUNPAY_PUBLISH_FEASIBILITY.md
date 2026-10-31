@@ -1,6 +1,71 @@
 # Создание лота FunPay: evidence и блокер
 
-## Текущий результат issue 144, 2026-10-30: PREVIEW + свежий GET, POST OFF
+## Issue 146, 2026-10-31: транспорт проверен офлайн, live-контракт не доказан
+
+**Реальная публикация остаётся заблокированной.** Это ограниченный fallback,
+а не завершённый live publisher. Конкретный первый пробел — `CURRENCY_MAPPING`:
+нет доказательства, как выбранные владельцем RUB/USD/EUR определяют валюту
+`price` именно в NEW-форме node 986. Наличие произвольного одноимённого hidden
+control или выбор в Telegram такого доказательства не дают. Нужна наблюдаемая
+семантика currency/price в актуальной authenticated форме и её обработчике,
+либо документированный серверный контракт; account defaults не подставляются.
+Worker не получал live-форму и не обращался к FunPay/Telegram.
+
+Прочитаны публичные исходники fpx на commit
+`77d6d589b64b2a342059578c8511cb8bd2dd4b8f`:
+
+- [`_client.create_lot`, строки 175–196](https://github.com/funpayx/fpx/blob/77d6d589b64b2a342059578c8511cb8bd2dd4b8f/fpx/_api/_client.py#L175-L196):
+  фиксированный offerSave POST, AJAX, Origin/NEW Referer; копирование наблюдаемых
+  service fields, удаление query и установка active. Это подтверждает форму
+  транспорта, но не валюту, ручную выдачу или глобальную видимость аккаунта.
+  `_csrf_token`, извлечённый LotManager, здесь явно не добавляется: механическое
+  копирование этого payload не доказывает корректность CSRF-контракта.
+- [`LotManager.get_node_editor_data/create_lot`, строки 119–181](https://github.com/funpayx/fpx/blob/77d6d589b64b2a342059578c8511cb8bd2dd4b8f/fpx/classes/account/subclasses/lot.py#L119-L181):
+  данные берутся с NEW editor; успех определяется HTTP 200, новый ID не извлекается.
+- [`parse_create_lot_page`, от строки 148](https://github.com/funpayx/fpx/blob/77d6d589b64b2a342059578c8511cb8bd2dd4b8f/fpx/_parsers/_lots.py#L148):
+  hidden/select/input/textarea превращаются в словарь, теряющий дубликаты;
+  отдельная обработка checkbox в create parser отсутствует. Поэтому отсутствие
+  secrets/auto_delivery не подтверждает ручную выдачу.
+- [Документация fpx 0.7.2](https://fpx.readthedocs.io/ru/v0.7.2/lot_creator/):
+  динамические options и boolean-результат; схемы receipt с новым ID нет.
+
+Добавлен `NewOfferTransport`: публичный `submit_once` всегда отклоняет текущий
+неверифицированный контракт **до claim и HTTP**. Приватный `_exchange` также имеет
+закрытый live-contract gate: только тесты заменяют его синтетическим proof seam.
+Он не вызывается runtime/Telegram и не включается настройками. Он использует
+существующие Account/RLock, runtime/late scope gates,
+атомарный permanent claim и повторную проверку сохранённых revisions до dispatch.
+Транспорт фиксирует HTTPS endpoint, AJAX headers, redirects OFF, TLS ON, один
+вызов без retry, timeout 5/10 с, максимум 256 KiB ответа и проверку времени
+streaming 15 с (не абсолютный deadline ожидания lock/всего вызова). Account.method
+и runtime extra-cookie wrapper сохраняются; второй Account не создаётся.
+Ответ закрывается и отбрасывается, HTTP 200 даёт receipt без ID; claim остаётся
+UNKNOWN. Ни новый экземпляр транспорта, ни restart/revision не разрешают повтор.
+
+**Требуются также** подтверждение manual/submit/visibility и независимый read-back
+одного нового ID, владельца, node, RU/EN, цены/валюты, количества/выдачи и остальных
+лотов. FunPayAPI request-echo ID не подходит. До этого нет live compiler payload,
+response-ID parser или кнопки «Опубликовать 1 лот»; `save_lot` не используется.
+Диагностика показывает отдельно ошибки структуры/identity/CSRF/inventory и
+наблюдаемое отсутствие currency control, сохраняя семантические блокеры.
+Это не новая GET-only функция и не разрешение выполнить POST: добавлена и
+протестирована будущая транспортная граница с закрытым публичным входом.
+
+`CURRENT_STATE` оценён: production не менялся; snapshot вне разрешённого scope,
+поэтому новая запись не добавлялась. Результаты текущих проверок приведены ниже.
+
+Офлайн-регрессии: **699 passed** (`test_new_offer_transport.py`,
+`test_publication_preview.py`, `test_create_wire_contract.py`,
+`test_lot_publisher.py`, `test_telegram_products.py`, `test_node_form.py`,
+`test_node_products.py`, `test_node_form_owner_diagnostics.py`). После усиления
+проверок crash/restart/revision и отсутствия секретов в SQLite транспортный
+модуль повторён: **30 passed**. `git diff --check` чистый. Использован локальный
+`.venv/Scripts/python.exe`, pytest scratch/TEMP/TMP/cache только
+`tests/.offline-tmp-146/`; process-only mkdir mode 0700 → 0777 для Windows sandbox,
+без изменения application/fixtures. Все HTTP вызовы транспорта перехвачены mocks;
+нативный Account в тестах имеет только synthetic auth. Общий suite/live не запускались.
+
+## Результат issue 144, 2026-10-30: PREVIEW + свежий GET, POST OFF (история)
 
 **Рабочий live publisher не поставлен.** Реализован предусмотренный задачей
 fallback: owner-only PREVIEW сохранённого `GAME_KEY`, Elden Ring, category 274,
