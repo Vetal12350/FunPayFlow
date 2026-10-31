@@ -404,7 +404,8 @@ async def _publication_callback(callback, user_id, parts, store, routes):
                  'Наблюдения формы (verified = структура, не разрешение на POST):']
         lines += [f'{key}: {proof[key]}' for key in (
             'editor_url', 'document_markup', 'form_subtree', 'submission', 'blank_identity',
-            'node_identity', 'csrf_presence', 'control_inventory', 'select_names')]
+            'node_identity', 'csrf_presence', 'control_inventory', 'select_names',
+            'currency_control', 'currency', 'manual_control', 'manual_delivery')]
         lines += [PUBLICATION_BLOCKERS[key] for key in blockers]
         lines += ['POST не выполнялся; попытка публикации не создавалась. '
                   'Не используйте save_lot или offer_id=0 как обход. Нужен review NEW-контракта.']
