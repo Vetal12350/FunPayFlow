@@ -13,7 +13,8 @@ from .product_store import ProductStore
 from .product_templates import TemplateService, default_template, validate_overrides, validate_variable_value, BUILTIN_TYPES
 from .product_drafts import validate_price
 from .node_products import NodeDraftService, LEGACY_NODE_VARIABLES, LEGACY_WARNING, STALE_WARNING, NodeSelectionError, NodeVariantConflictError, VARIANT_WARNING
-from .node_form import NodeFormError, NodeFormService, safe_form_evidence, safe_contract_proof
+from .node_form import (NodeFormError, NodeFormService, safe_form_evidence, safe_contract_proof,
+                        safe_new_form_diagnostics)
 from . import telegram_node_fields as node_ui
 from .product_variants import VariantService
 from .state import StateError
@@ -397,7 +398,8 @@ async def _publication_callback(callback, user_id, parts, store, routes):
     elif operation == 'inspect':
         # Consume before waiting for the Account lock or making any request.
         state['token'] = None
-        proof, blockers = await asyncio.to_thread(publisher.inspect_new, review)
+        diagnostics = {}
+        proof, blockers = await asyncio.to_thread(publisher.inspect_new, review, diagnostics=diagnostics)
         if not current():
             return
         lines = ['🔒 Публикация заблокирована. Выполнена только свежая GET-проверка.',
@@ -410,8 +412,33 @@ async def _publication_callback(callback, user_id, parts, store, routes):
         lines += ['POST не выполнялся; попытка публикации не создавалась. '
                   'Не используйте save_lot или offer_id=0 как обход. Нужен review NEW-контракта.']
         await _show(callback, escape('\n'.join(lines)), _menu([[('📝 Мои черновики', 'prd:drafts:0')]]))
+        if current():
+            await callback.message.answer(escape(_publication_diagnostics_text(diagnostics, review.currency)))
     else:
         raise ValueError('Экран устарел.')
+
+
+def _publication_diagnostics_text(value, requested_currency):
+    d = safe_new_form_diagnostics(value)
+    chosen = requested_currency if type(requested_currency) is str and requested_currency in {'RUB', 'USD', 'EUR'} else 'UNKNOWN'
+    comparable = [d[k] for k in ('selector_currency', 'price_currency') if d[k] != 'UNKNOWN']
+    relation = ('UNKNOWN' if not comparable or chosen == 'UNKNOWN' else
+                'OBSERVED_MATCH' if all(c == chosen for c in comparable) else 'OBSERVED_CONFLICT')
+    return ('Данные формы / диагностика\n'
+        f"Контекст: {d['context']}\n"
+        f"Валюта: selector={d['currency_selector']} / {d['selector_currency']} ({d['selector_reason']}); "
+        f"price={d['price_currency']} ({d['price_reason']}, {d['marker_count']}); "
+        f"account={d['account_currency']} ({d['account_reason']})\n"
+        f"Между наблюдениями: {d['currency_relation']}; выбор PREVIEW {chosen}: {relation}\n"
+        f"auto_delivery={d['auto_delivery']}; secrets={d['secrets']}; active={d['active']}\n"
+        f"Action={d['action']}; method={d['method']}; submit={d['submit']} ({d['submit_count']})\n"
+        'Hidden presence: ' + '; '.join(name + '=' + d[name + '_hidden'] for name in (
+            'node_id', 'offer_id', 'csrf_token', 'form_created_at', 'location', 'deleted'))
+        + '\nYES/NO — только checked; ABSENT — нет control; HIDDEN — только тип. '
+        'UNKNOWN — безопасного наблюдения нет.\n'
+        'Это наблюдения, не доказательство валюты сервера, выдачи или видимости. POST OFF.\n'
+        'Следующий шаг: для разбора неоднозначности пришлите скриншоты только видимых '
+        'секций цены и ручной выдачи. Без DevTools/HAR, заголовков, cookies, payload, CSRF и скрытых полей.')
 
 
 def _route_screen(row, check_token=None):

@@ -1,5 +1,60 @@
 # Создание лота FunPay: evidence и блокер
 
+## Issue 148, 2026-11-01: диагностика существующего GET, POST OFF
+
+После **отдельно согласованного deployment** путь владельца:
+`📦 Лоты → 📝 Мои черновики → 👁 PREVIEW · Elden Ring → currency → GET`
+(кнопка `🔎 Проверить NEW-форму (GET)`). После единственного GET добавлено сообщение
+«Данные формы / диагностика». Второй GET, Account/session, фоновые задачи и кнопки
+публикации не добавлены. Owner/token/TTL/revisions/account instance/category 274/
+COMMON node 986/три SELECT/SAFE_MODE/restart/RLock/late gates сохранены.
+
+В transient parser наблюдаются только фиксированные enum/counts: явный `currency`
+SELECT и его явно выбранный allowlisted label, маркер RUB/USD/EUR в связанном с
+единственным `price` label либо непосредственном `input-group-addon`, checked
+checkbox `auto_delivery`/`active`, форма control `secrets`, action/method, один
+неназванный button/input submit, наличие единственных hidden `node_id`, `offer_id`,
+`csrf_token`, `form_created_at`, `location`, `deleted`. Значения hidden/inputs,
+содержимое secrets, raw HTML/DOM и произвольные имена/тексты не выходят из parser,
+не сохраняются и не логируются. Диагностика не попадает в schema/cache/SQLite.
+Дубликаты, скрытые/disabled controls, overrides, неподдержанные shapes, несколько
+маркеров или конфликт дают фиксированные причины; нераспознанная привязка — UNKNOWN.
+Недоверенная структура, неверный node/account/EDIT и stale callback закрываются.
+
+Проверены **локальные исходники установленного FunPayAPI 1.1.0** (`account.py`,
+`Account.__init__`/`get`, `common/enums.py`): атрибута валюты аккаунта нет.
+`Currency` используется в withdraw, что не определяет валюту price. Поэтому
+`account=UNKNOWN (PINNED_API_UNAVAILABLE)`; произвольный `.currency`, app_data и
+неявный RUB fallback не используются. Сравнение наблюдений/выбора PREVIEW может
+дать OBSERVED_MATCH/OBSERVED_CONFLICT, но не доказывает серверный mapping.
+
+Пример **синтетического**, очищенного фрагмента сообщения:
+
+```text
+Данные формы / диагностика
+Контекст: OBSERVED
+Валюта: selector=ABSENT / UNKNOWN (NO_SELECTOR); price=RUB (UNIQUE_ANCHORED_MARKER, 1); account=UNKNOWN (PINNED_API_UNAVAILABLE)
+Между наблюдениями: UNKNOWN; выбор PREVIEW USD: OBSERVED_CONFLICT
+auto_delivery=CHECKBOX_NO; secrets=ABSENT; active=ABSENT
+Action=OFFER_SAVE_RELATIVE; method=POST; submit=BUTTON_SUBMIT (1)
+```
+
+**Реальный POST OFF.** Наблюдения не доказывают ручную выдачу, видимость, server
+currency mapping, submit/NEW semantics или независимый новый ID/owner read-back;
+все соответствующие blockers сохранены. Одна следующая нужная улика при UNKNOWN —
+скриншоты **только видимых секций цены и ручной выдачи** актуальной NEW-формы,
+чтобы проверить привязку валютного маркера/checkbox к этим секциям. Не нужны
+DevTools/HAR, headers/cookies, payload, CSRF или скрытые поля. Даже эти скриншоты
+не заменяют доказательства серверного контракта и read-back.
+
+Worker выполняет только offline mock/fake проверки; live evidence не получено.
+`CURRENT_STATE` оценён: production не менялся, файл вне scope; handoff зафиксирован здесь.
+Проверки: **800 passed** — `test_new_form_diagnostics.py` (101) и прежний набор
+из восьми модулей issue 146/#147 (699, перечислен ниже); AST четырёх изменённых
+Python-файлов и `git diff --check` чистые. Использован `.venv/Scripts/python.exe`,
+pytest с `-p no:cacheprovider`, TEMP/TMP/basetemp только `tests/.offline-tmp-148/`,
+process-only mkdir 0700 → 0777 для Windows sandbox. Общий suite/live не запускались.
+
 ## Issue 146, 2026-10-31: транспорт проверен офлайн, live-контракт не доказан
 
 **Реальная публикация остаётся заблокированной.** Это ограниченный fallback,

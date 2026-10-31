@@ -16,7 +16,8 @@ import time
 from FunPayAPI import Account
 from FunPayAPI.common.enums import SubCategoryTypes
 
-from .node_form import is_safe_node_binding_name, inspect_fresh_new_form, safe_contract_proof
+from .node_form import (is_safe_node_binding_name, inspect_fresh_new_form, safe_contract_proof,
+                        safe_new_form_diagnostics)
 from .node_products import selected_fields
 from .product_drafts import validate_price
 from .product_templates import GAME_KEY, safe_text
@@ -306,12 +307,15 @@ class LotPublisher:
         except Exception:
             raise PublisherError('DATABASE') from None
 
-    def inspect_new(self, review):
+    def inspect_new(self, review, *, diagnostics=None):
         """Consume an owner intent at the UI boundary; GET only, no claim/POST.
 
         The durable guard is consulted even though this path cannot submit.
         A read-only failure must not create a misleading UNKNOWN write attempt.
         """
+        if type(diagnostics) is dict:
+            diagnostics.clear()
+            diagnostics.update(safe_new_form_diagnostics())
         require(type(review) is PublicationReview, 'INVALID')
         require(review.currency in {'RUB', 'USD', 'EUR'}, 'PRICE')
         account = self.client.account
@@ -327,13 +331,16 @@ class LotPublisher:
             require(self.outcome(review.draft_id) is None, 'ALREADY_CLAIMED')
             require(self.review(review.draft_id, review.revision, review.currency) == review, 'REVISION')
             route_current()
+            observed = {}
             proof, matches = inspect_fresh_new_form(self.client, self.store, review.fingerprint,
-                tuple((name, value) for name, value, _, _ in review.selections))
+                tuple((name, value) for name, value, _, _ in review.selections), diagnostics=observed)
             self._scope_gate(account, review)
             require(self.review(review.draft_id, review.revision, review.currency) == review, 'REVISION')
             route_current()
             require(self.outcome(review.draft_id) is None, 'ALREADY_CLAIMED')
             proof = safe_contract_proof(proof)
+            if type(diagnostics) is dict:
+                diagnostics.update(safe_new_form_diagnostics(observed))
             return proof, publication_blockers(proof, matches)
 
     def _build(self, db, draft_id, revision, form, price, currency):
