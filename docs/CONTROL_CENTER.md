@@ -171,11 +171,22 @@ DISABLED. No workflow configuration is changed by this feature.
 
 ## Notifications and boundaries
 
-Notifications are **sound-only**: a single short `app.bell()` on the UI main thread
-for each new PR-created, CI/QA-failure, all-four-green or worker-blocked event. No popup,
+**If Windows sounds stopped:** keep Control Center open while the Worker runs;
+check Windows output device and app volume. The previous Tk bell could be silent
+on Windows; the native beep fixes that without new dependencies. Check that the
+notification status does not say its dedup store is unavailable. Already-seen PR
+and CI events do not ring again (even after relaunch), by design. Restart the UI
+after updating its local source; running Worker and production bots remain unchanged.
+
+
+Notifications are **sound-only**: a single short native Windows `winsound.Beep(880, 180)`
+(on other systems or when the Windows sound device is unavailable: best-effort `app.bell()`)
+on the UI main thread for each new PR-created, CI/QA-failure, all-four-green
+or worker-blocked event. **PR created** is the Worker completion cue; this is not
+an alert for every `codex exec` subprocess exit. No popup,
 Toplevel, modal dialog, focus steal, automatic browser opening, toast, tray or background
 service exists. An unavailable audio device fails quietly; audibility depends on desktop
-sound settings. Closing the GUI stops notification delivery; an already running Worker
+sound settings, the selected output device and Windows volume mixer. Closing the GUI stops notification delivery; an already running Worker
 remains independent. Reopening can announce an event first observed since the last session,
 but cannot replay a previously claimed event.
 

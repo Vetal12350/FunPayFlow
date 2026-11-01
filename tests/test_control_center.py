@@ -515,12 +515,52 @@ def test_lifecycle_requires_trusted_pr_identity(monkeypatch, tmp_path, field, va
 
 
 @pytest.mark.parametrize("key", ["pr:88", "green:88:" + SHA, "failure:88:" + SHA, "blocked:42"])
-def test_sound_once_per_event_across_restart(tmp_path, key):
+def test_sound_once_per_event_across_restart(monkeypatch, tmp_path, key):
+    monkeypatch.setattr(cc, "WINDOWS", False)  # Exercise the Tk fallback on all CI platforms.
     calls = []
     app = SimpleNamespace(bell=lambda: calls.append("bell"))
     assert cc.sound_notification(app, cc.Notifications(tmp_path), key)
     assert not cc.sound_notification(app, cc.Notifications(tmp_path), key)
     assert calls == ["bell"]
+
+
+def test_windows_native_sound_on_pr_completion(monkeypatch, tmp_path):
+    import sys
+    monkeypatch.setattr(cc, "WINDOWS", True)
+    tones = []
+    bells = []
+    monkeypatch.setitem(sys.modules, "winsound",
+                        SimpleNamespace(Beep=lambda frequency, duration:
+                                        tones.append((frequency, duration))))
+    app = SimpleNamespace(bell=lambda: bells.append("fallback"))
+    assert cc.sound_notification(app, cc.Notifications(tmp_path), "pr:90")
+    assert not cc.sound_notification(app, cc.Notifications(tmp_path), "pr:90")
+    assert tones == [(880, 180)]
+    assert bells == []
+
+
+def test_windows_missing_sound_device_falls_back_to_tk(monkeypatch, tmp_path):
+    import sys
+    monkeypatch.setattr(cc, "WINDOWS", True)
+    def fail(*args):
+        raise OSError("Audio unavailable")
+    monkeypatch.setitem(sys.modules, "winsound", SimpleNamespace(Beep=fail))
+    bells = []
+    app = SimpleNamespace(bell=lambda: bells.append("bell"))
+    assert cc.sound_notification(app, cc.Notifications(tmp_path), "green:90:" + SHA)
+    assert not cc.sound_notification(app, cc.Notifications(tmp_path), "green:90:" + SHA)
+    assert bells == ["bell"]
+
+
+def test_windows_both_audio_paths_unavailable_does_not_replay(monkeypatch, tmp_path):
+    import sys
+    monkeypatch.setattr(cc, "WINDOWS", True)
+    def fail(*args):
+        raise OSError("Audio unavailable")
+    monkeypatch.setitem(sys.modules, "winsound", SimpleNamespace(Beep=fail))
+    app = SimpleNamespace(bell=fail)
+    assert cc.sound_notification(app, cc.Notifications(tmp_path), "blocked:90")
+    assert not cc.sound_notification(app, cc.Notifications(tmp_path), "blocked:90")
 
 
 def test_audio_failure_is_quiet_and_never_replayed(tmp_path):
@@ -576,6 +616,7 @@ def test_fresh_waiting_health_is_distinct_from_running():
 
 def test_ctk_ui_refresh_is_sound_only_and_worker_stays_disabled(monkeypatch, tmp_path):
     """Exercise startup, queue consumption, refresh and close with a headless CTk fake."""
+    monkeypatch.setattr(cc, "WINDOWS", False)  # Fake UI asserts the Tk fallback, even on Windows.
     import queue
     import sys
     widgets = []
