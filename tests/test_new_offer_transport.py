@@ -177,13 +177,15 @@ def test_a_new_transport_instance_cannot_use_finished_attempt(exchange):
     c.post.assert_not_called()
 
 
-def test_runtime_has_no_call_to_dormant_transport():
+def test_transport_calls_are_limited_to_guarded_integration():
     for path in Path('src/funpayflow').glob('*.py'):
         tree = ast.parse(path.read_text(encoding='utf-8'))
         for node in ast.walk(tree):
             if isinstance(node, ast.Call):
-                assert not (isinstance(node.func, ast.Attribute) and node.func.attr == '_exchange')
-                assert not (isinstance(node.func, ast.Name) and node.func.id == 'NewOfferTransport')
+                if isinstance(node.func, ast.Attribute) and node.func.attr == '_exchange':
+                    assert path.name == 'create_wire_contract.py'
+                if isinstance(node.func, ast.Name) and node.func.id == 'NewOfferTransport':
+                    assert path.name == 'lot_publisher.py'
 
 
 @pytest.mark.parametrize('old,new,code', [
