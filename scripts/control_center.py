@@ -429,14 +429,31 @@ def start_worker(root):
         raise Unavailable("Worker active or startup safety check unavailable") from None
 
 
+def play_notification_sound(app):
+    """Audible Windows completion cue; Tk bell is a best-effort fallback.
+
+    On Windows the Tk bell is frequently silent (terminal/sound scheme dependent).
+    Use the built-in winsound tone instead: no external files, installation,
+    subprocesses or notification windows. Only invoked for a claimed event.
+    """
+    if WINDOWS:
+        try:
+            import winsound
+            winsound.Beep(880, 180)
+            return
+        except (ImportError, OSError, RuntimeError):
+            pass  # No audio device/driver: try Tk's bell instead.
+    app.bell()
+
+
 def sound_notification(app, store, key):
-    """Called only by the UI thread; claim before a best-effort, single short bell."""
+    """Called only by the UI thread; claim before a best-effort, single short cue."""
     if threading.current_thread() is not threading.main_thread():
         raise RuntimeError("Notifications require the UI main thread")
     if not store.claim(key):
         return False
     try:
-        app.bell()
+        play_notification_sound(app)
     except Exception:
         pass  # Desktop audio/Tk can be unavailable. Never replay a claimed event.
     return True
