@@ -286,7 +286,176 @@ class _EditorMarkup(_EvidenceMarkup):
             super().handle_data(data)
 
 
-def prove_new_form_contract(html, response_url, node_id=986):
+_CONTROL_AMBIGUITIES = ('DUPLICATE_CONTROL', 'HIDDEN_OR_DISABLED', 'OVERRIDE_OR_NESTED', 'UNSUPPORTED_SHAPE')
+_DIAGNOSTIC_ENUMS = {
+    'context': ('NOT_INSPECTED', 'OBSERVED', 'UNSAFE_STRUCTURE', 'RESPONSE_CONTEXT', 'SELECT_CONTEXT'),
+    'currency_selector': ('UNKNOWN', 'ABSENT', 'SELECT', 'OTHER_CONTROL', *_CONTROL_AMBIGUITIES),
+    'selector_reason': ('NOT_INSPECTED', 'NO_SELECTOR', 'UNRECOGNIZED_LABELS_OR_SELECTION', 'EXPLICIT_ENUM_LABEL'),
+    'selector_currency': ('UNKNOWN', 'RUB', 'USD', 'EUR'),
+    'price_currency': ('UNKNOWN', 'RUB', 'USD', 'EUR'),
+    'price_reason': ('NOT_INSPECTED', 'PRICE_CONTROL_AMBIGUOUS', 'NO_ANCHORED_MARKER',
+                     'MULTIPLE_MARKERS', 'CONFLICTING_MARKERS', 'UNIQUE_ANCHORED_MARKER'),
+    # Pinned FunPayAPI 1.1.0 Account.__init__/get expose no account currency.
+    # Do not probe arbitrary attributes/app_data or infer it from the price UI.
+    'account_currency': ('UNKNOWN',),
+    'account_reason': ('PINNED_API_UNAVAILABLE',),
+    'currency_relation': ('UNKNOWN', 'OBSERVED_MATCH', 'OBSERVED_CONFLICT'),
+    'auto_delivery': ('UNKNOWN', 'ABSENT', 'CHECKBOX_YES', 'CHECKBOX_NO', 'HIDDEN', *_CONTROL_AMBIGUITIES),
+    'secrets': ('UNKNOWN', 'ABSENT', 'TEXTAREA', 'INPUT', 'HIDDEN', *_CONTROL_AMBIGUITIES),
+    'active': ('UNKNOWN', 'ABSENT', 'CHECKBOX_YES', 'CHECKBOX_NO', 'HIDDEN', *_CONTROL_AMBIGUITIES),
+    'action': ('UNKNOWN', 'ABSENT', 'OFFER_SAVE_RELATIVE', 'OFFER_SAVE_HTTPS', 'UNSUPPORTED_ACTION'),
+    'method': ('UNKNOWN', 'ABSENT', 'POST', 'GET', 'UNSUPPORTED_METHOD'),
+    'submit': ('UNKNOWN', 'ABSENT', 'BUTTON_SUBMIT', 'INPUT_SUBMIT', 'MULTIPLE_SUBMITS', *_CONTROL_AMBIGUITIES),
+    **{name + '_hidden': ('UNKNOWN', 'ABSENT', 'PRESENT', *_CONTROL_AMBIGUITIES) for name in (
+        'node_id', 'offer_id', 'csrf_token', 'form_created_at', 'location', 'deleted')},
+}
+_DIAGNOSTIC_COUNTS = ('marker_count', 'submit_count')
+
+
+def safe_new_form_diagnostics(value=None):
+    """Separate observation boundary; never expands the contract proof/capability."""
+    empty = {key: choices[0] for key, choices in _DIAGNOSTIC_ENUMS.items()}
+    empty.update(dict.fromkeys(_DIAGNOSTIC_COUNTS, 0))
+    if (type(value) is not dict or value.keys() != empty.keys()
+            or any(type(value[k]) is not str or value[k] not in choices
+                   for k, choices in _DIAGNOSTIC_ENUMS.items())
+            or any(type(value[k]) is not int or not 0 <= value[k] <= 1001 for k in _DIAGNOSTIC_COUNTS)):
+        return empty
+    return dict(value)
+
+
+def _new_form_diagnostics(form, soup):
+    """Only fixed enums/counts escape this transient, already validated subtree.
+
+    Checkbox YES/NO describes the checked attribute, not delivery/visibility.
+    Hidden observations never read values. Option *labels* and price UI markers
+    can yield currency enums, never server mapping or an implicit default.
+    """
+    result = safe_new_form_diagnostics()
+    result['context'] = 'OBSERVED'
+    controls = form.find_all(['input', 'select', 'textarea', 'button'])
+
+    def named(name):
+        return [c for c in controls if c.get('name') == name]
+
+    def usable(c):
+        return not (_hidden(c) or _disabled(c) or c.find_parent(['input', 'select', 'textarea', 'button'])
+                    or any(c.has_attr(k) for k in ('formaction', 'formmethod', 'formenctype', 'formtarget')))
+
+    def shape_problem(found):
+        if len(found) != 1:
+            return 'DUPLICATE_CONTROL'
+        c = found[0]
+        if _hidden(c) or _disabled(c):
+            return 'HIDDEN_OR_DISABLED'
+        return 'OVERRIDE_OR_NESTED' if not usable(c) else 'UNSUPPORTED_SHAPE'
+
+    for name in ('auto_delivery', 'active', 'secrets'):
+        found = named(name)
+        state = 'ABSENT' if not found else shape_problem(found)
+        if len(found) == 1 and usable(found[0]):
+            c = found[0]
+            kind = c.get('type', 'text').lower()
+            if c.name == 'input' and kind == 'hidden':
+                state = 'HIDDEN'
+            elif name != 'secrets' and c.name == 'input' and kind == 'checkbox':
+                state = 'CHECKBOX_YES' if c.has_attr('checked') else 'CHECKBOX_NO'
+            elif name == 'secrets' and c.name == 'textarea':
+                state = 'TEXTAREA'
+            elif name == 'secrets' and c.name == 'input' and kind == 'text':
+                state = 'INPUT'
+        result[name] = state
+    for key in (k for k in _DIAGNOSTIC_ENUMS if k.endswith('_hidden')):
+        found = named(key[:-7])
+        result[key] = 'ABSENT' if not found else shape_problem(found)
+        if (len(found) == 1 and found[0].name == 'input'
+                and found[0].get('type', '').lower() == 'hidden' and usable(found[0])):
+            result[key] = 'PRESENT'
+
+    found = named('currency')
+    result['currency_selector'] = 'ABSENT' if not found else shape_problem(found)
+    result['selector_reason'] = 'NO_SELECTOR' if not found else 'UNRECOGNIZED_LABELS_OR_SELECTION'
+    if len(found) == 1 and usable(found[0]):
+        c = found[0]
+        result['currency_selector'] = 'OTHER_CONTROL'
+        if (c.name == 'select' and not c.has_attr('multiple')
+                and not c.find(lambda tag: tag.name not in {'option', 'optgroup'})):
+            result['currency_selector'] = 'SELECT'
+            options = c.find_all('option')
+            selected = [o for o in options if o.has_attr('selected')]
+            labels = [o.get_text(strip=True) for o in options]
+            if (len(options) in (2, 3) and len(set(labels)) == len(labels)
+                    and all(label in {'RUB', 'USD', 'EUR'} for label in labels)
+                    and all(not o.find(True) for o in options)
+                    and len(selected) == 1
+                    and not _hidden(selected[0]) and not _disabled(selected[0])
+                    and not any(p.name == 'optgroup' and p.has_attr('disabled') for p in selected[0].parents)):
+                result['selector_currency'] = selected[0].get_text(strip=True)
+                result['selector_reason'] = 'EXPLICIT_ENUM_LABEL'
+
+    prices = named('price')
+    result['price_reason'] = 'PRICE_CONTROL_AMBIGUOUS'
+    if (len(prices) == 1 and prices[0].name == 'input' and usable(prices[0])
+            and prices[0].get('type', 'text').lower() in {'text', 'number'}):
+        price = prices[0]
+        # Exact for/id association, wrapping label, or a local input-group addon.
+        # Never scan arbitrary surrounding/page text or input values.
+        labels = [label for label in form.find_all('label')
+                  if (price in label.descendants or (price.get('id') and label.get('for') == price['id']
+                      and len(soup.find_all(id=price['id'])) == 1))]
+        group = price.parent
+        addons = []
+        if ('input-group' in group.get('class', [])
+                and group.find_all(['input', 'select', 'textarea', 'button']) == [price]):
+            addons = group.find_all(class_='input-group-addon', recursive=False)
+        markers = []
+        for tag in [*labels, *addons]:
+            if _hidden(tag) or tag.find_all(['input', 'select', 'textarea', 'button']) not in ([], [price]):
+                continue
+            text = ' '.join(tag.get_text(' ', strip=True).split())
+            # A narrow visible label grammar; unmatched text is simply UNKNOWN.
+            text = re.sub(r'^(?:Цена|Стоимость|Price)\s*[:;,]?\s*', '', text, flags=re.I)
+            text = text.strip(' ()[]:')
+            tokens = re.findall(r'RUB|USD|EUR|₽|\$|€', text)
+            if tokens and re.sub(r'RUB|USD|EUR|₽|\$|€|[\s/(),;:]', '', text) == '':
+                markers += [{'₽': 'RUB', '$': 'USD', '€': 'EUR'}.get(t, t) for t in tokens]
+        result['marker_count'] = min(len(markers), 1001)
+        result['price_reason'] = ('NO_ANCHORED_MARKER' if not markers else
+            'CONFLICTING_MARKERS' if len(set(markers)) > 1 else
+            'MULTIPLE_MARKERS' if len(markers) > 1 else 'UNIQUE_ANCHORED_MARKER')
+        if len(markers) == 1:
+            result['price_currency'] = markers[0]
+    observed = [result[k] for k in ('selector_currency', 'price_currency', 'account_currency')
+                if result[k] != 'UNKNOWN']
+    if len(observed) >= 2:
+        result['currency_relation'] = 'OBSERVED_MATCH' if len(set(observed)) == 1 else 'OBSERVED_CONFLICT'
+
+    action_text = form.get('action', '')
+    action = urlsplit(action_text)
+    result['action'] = 'ABSENT' if not action_text else 'UNSUPPORTED_ACTION'
+    if (action.path in {'/lots/offerSave', '/en/lots/offerSave', '/uk/lots/offerSave'}
+            and not re.search(r'[\s\\\x00-\x1f\x7f]', action_text)
+            and not action.query and not action.fragment):
+        if not action.netloc and not action.scheme:
+            result['action'] = 'OFFER_SAVE_RELATIVE'
+        elif action.scheme == 'https' and action.netloc == 'funpay.com':
+            result['action'] = 'OFFER_SAVE_HTTPS'
+    method = form.get('method', '').upper()
+    result['method'] = method if method in {'GET', 'POST'} else 'UNSUPPORTED_METHOD' if method else 'ABSENT'
+    submits = [c for c in controls if (c.name == 'button' and c.get('type', 'submit').lower() == 'submit')
+               or (c.name == 'input' and c.get('type', '').lower() in {'submit', 'image'})]
+    result['submit_count'] = min(len(submits), 1001)
+    result['submit'] = 'ABSENT' if not submits else 'MULTIPLE_SUBMITS' if len(submits) > 1 else shape_problem(submits)
+    if len(submits) == 1 and usable(submits[0]) and not submits[0].has_attr('name'):
+        c = submits[0]
+        if not c.has_attr('value') and c.name == 'button':
+            result['submit'] = 'BUTTON_SUBMIT'
+        elif c.name == 'input' and c.get('type', '').lower() == 'submit':
+            result['submit'] = 'INPUT_SUBMIT'
+    return safe_new_form_diagnostics(result)
+
+
+def prove_new_form_contract(html, response_url, node_id=986, *, diagnostics=None):
     """Pure offline proof of observations for node 986, not NEW wire semantics.
 
     The three names come from the ordinary safe SELECT parser, never a guessed
@@ -294,6 +463,9 @@ def prove_new_form_contract(html, response_url, node_id=986):
     All DOM/values are transient; the result contains only fixed enums/counts.
     """
     result = safe_contract_proof()
+    if type(diagnostics) is dict:
+        diagnostics.clear()
+        diagnostics.update(safe_new_form_diagnostics())
     if node_id != 986 or type(node_id) is not int:
         return result
     result['availability'] = 'response'
@@ -323,6 +495,12 @@ def prove_new_form_contract(html, response_url, node_id=986):
                  and not any(tag.has_attr('form') for tag in soup.find_all(['input', 'select', 'textarea', 'button']))
                  and not any(k.startswith('on') for tag in [form, *form.find_all(True)] for k in tag.attrs))
         result['form_subtree'] = 'verified' if valid else 'ambiguous'
+        if type(diagnostics) is dict:
+            context = ('RESPONSE_CONTEXT' if result['editor_url'] != 'verified' else
+                       'UNSAFE_STRUCTURE' if not valid or result['document_markup'] != 'verified' else
+                       'SELECT_CONTEXT' if len(schema['fields']) != 3 else 'OBSERVED')
+            diagnostics.update(_new_form_diagnostics(form, soup) if context == 'OBSERVED' else
+                               dict(safe_new_form_diagnostics(), context=context))
         if not valid:
             return safe_contract_proof(result)
         controls = form.find_all(['input', 'select', 'textarea', 'button'])
@@ -385,6 +563,8 @@ def prove_new_form_contract(html, response_url, node_id=986):
             and len(form.find_all('select')) == 3) else 'ambiguous'
     except Exception:
         # Never expose input or exception messages, including malformed URLs.
+        if type(diagnostics) is dict:
+            diagnostics.update(dict(safe_new_form_diagnostics(), context='UNSAFE_STRUCTURE'))
         return dict(safe_contract_proof(), availability='response', editor_url=result['editor_url'],
                     form_subtree='ambiguous')
     return safe_contract_proof(result)
@@ -735,13 +915,16 @@ def _fresh_new_editor(account):
                 pass
 
 
-def inspect_fresh_new_form(client, store, fingerprint, selections):
+def inspect_fresh_new_form(client, store, fingerprint, selections, *, diagnostics=None):
     """Uncached, scoped NEW inspection; only fixed facts leave this call.
 
     Presence of a blank identity/CSRF is an observation, never authorization to
     create. Manual/currency/visibility and NEW response semantics stay unproven.
     No raw form, hidden values, payload or updated schema is saved or returned.
     """
+    if type(diagnostics) is dict:
+        diagnostics.clear()
+        diagnostics.update(safe_new_form_diagnostics())
     with client._account_lock:
         account = client.account
         if (account.id != store.account_id or client.review_state is not store.store
@@ -755,7 +938,9 @@ def inspect_fresh_new_form(client, store, fingerprint, selections):
         body = BeautifulSoup(html, 'html.parser').find('body')
         if body is None or not body.has_attr('data-app-data'):
             raise NodeFormError('AUTH_CONTEXT_MISSING')
-        proof = prove_new_form_contract(html, 'https://funpay.com/lots/offerEdit?node=986')
+        observed = {}
+        proof = prove_new_form_contract(html, 'https://funpay.com/lots/offerEdit?node=986',
+                                        diagnostics=observed)
         fields = schema['fields']
         matching = (schema['fingerprint'] == fingerprint and len(fields) == len(selections) == 3
                     and all(not f['disabled'] and f['html_name'] == name
@@ -763,6 +948,8 @@ def inspect_fresh_new_form(client, store, fingerprint, selections):
                         for f, (name, value) in zip(fields, selections)))
         if client.account is not account or account.id != store.account_id:
             raise NodeFormError('ACCOUNT_SCOPE')
+        if type(diagnostics) is dict:
+            diagnostics.update(safe_new_form_diagnostics(observed))
         return proof, matching
 
 
