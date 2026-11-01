@@ -1,5 +1,53 @@
 # Создание лота FunPay: evidence и блокер
 
+## Issue 151, Stage 1: независимый GET-only own-inventory read-back
+
+`LotPublisher.capture_own_inventory(review)` создаёт transient baseline;
+`verify_new_own_offer(review, baseline_result)` предназначен для проверки после
+будущего единственного POST. Submit-response ID не принимается. READY/UNKNOWN/
+CONFIRMED и причины — enum; ID возвращается только при единственном новом
+совпадающем offer в разности инвентарей. Вызовы не изменяют SQLite, включая
+durable UNKNOWN; baseline одноразовый, привязан к publisher/review/Account и
+годен 60 секунд. Публикация и UI не включены.
+
+Проверен установленный FunPayAPI **1.1.0**: `get_my_subcategory_lots` отсутствует;
+`get_lot_fields` парсит editor JSON, но `LotFields.lot_id` копирует аргумент.
+В [публичной Cardinal lineage](https://github.com/sidor0912/FunPayCardinal/blob/main/FunPayAPI/account.py)
+own inventory читается из `lots/{node}/trade`: `data-offer`, `tc-price[data-s]`,
+`unit`, `tc-amount`, `auto-dlv-icon`. Поэтому адаптер читает только trade node 986
+и editor JSON с authentication существующего Account 1.1.0, под общим RLock и
+runtime/late/scope gates. Account.method не используется из-за redirects.
+Новых Account, POST, retries, sleep или background worker нет.
+
+Подтверждаются response `body[data-app-data].userId`, явная ссылка NEW editor
+node 986, editor `offer_id`/`node_id`, цена/валюта/amount из trade, ручная выдача
+по inventory-индикатору, RU/EN summary/description и выбранные поля из editor.
+Один editor ID сам по себе ничего не доказывает. Fingerprints прежних лотов
+включают наблюдаемые business/editor и inventory поля; trade перечитывается
+в конце каждого snapshot. Проверяется только node 986, не весь аккаунт.
+
+В pinned API нет собственного inventory метода, структурированных owner/currency/
+manual свойств LotFields и гарантии атомарного snapshot или cache freshness.
+Адаптер требует описанную remote структуру; отсутствие данных, pagination,
+противоречия, явный HTTP Age, redirects, нестабильность, 0/2+ новых ID дают UNKNOWN.
+Нет inference валюты из Account или manual режима из отсутствия secrets.
+До 20 лотов / 22 GET на snapshot, byte limit 2 MB/ответ, timeout (5,10),
+30-секундный бюджет между запросами и 15-секундный бюджет чтения ответа;
+это не жёсткий wall-clock deadline для блокирующего HTTP. HTML/credentials/
+CSRF/secrets не входят в snapshots/result/logs. Live совместимость этих
+строгих требований и фактическая свежесть remote inventory офлайн не доказаны.
+Stage 2, owner final confirmation и live POST остаются OFF.
+
+Для Stage 2 вызывающий publisher должен удерживать тот же Account RLock через
+baseline / единственный dispatch / read-back, сохранив durable claim и все late
+gates. Текущий read-back доступен из publisher, но не подключён к POST/UI.
+Офлайн: **340 passed** в `test_own_offer_readback.py`, `test_lot_publisher.py`,
+`test_publication_preview.py`, `test_new_form_diagnostics.py`,
+`test_new_offer_transport.py`, `test_create_wire_contract.py`; AST обоих
+Python-файлов и `git diff --check` прошли. Pytest запускался с
+`-p no:cacheprovider`, TEMP/TMP/basetemp в `tests/.offline-tmp-151/` и
+process-only mkdir 0700 → 0777 из-за Windows sandbox ACL. Полный suite/live не запускались.
+
 ## Issue 148, 2026-11-01: диагностика существующего GET, POST OFF
 
 После **отдельно согласованного deployment** путь владельца:

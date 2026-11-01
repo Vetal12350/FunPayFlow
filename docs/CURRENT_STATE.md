@@ -1,6 +1,8 @@
 # Текущее состояние: snapshot, не changelog
 
-Обновлено: **2026-10-30**. Перед новой задачей перепроверь Git; документ не заменяет текущий HEAD/status.
+Обновлено: **2026-11-01**. Перед новой задачей перепроверь Git; документ не заменяет текущий HEAD/status.
+
+- Issue 151, Stage 1: добавлены GET-only own-inventory baseline/read-back методы LotPublisher для Elden Ring 274 / COMMON 986. Единственный новый ID определяется разностью authenticated trade-инвентарей, проверяются remote business поля и fingerprints прежних лотов; неполные/неоднозначные данные дают UNKNOWN. Установленный FunPayAPI 1.1.0 не имеет `get_my_subcategory_lots`, поэтому используется узкий адаптер с тем же Account/RLock/runtime gates. SQLite UNKNOWN не снимается, POST/UI не включены, live evidence нет. Ограничения и handoff: [FUNPAY_PUBLISH_FEASIBILITY](FUNPAY_PUBLISH_FEASIBILITY.md#issue-151-stage-1-независимый-get-only-own-inventory-read-back).
 
 - Issue 144: owner-only PREVIEW из сохранённых Elden Ring GAME_KEY drafts (274 / COMMON 986, три SELECT, quantity=1, без Variant), явная валюта, одноразовая fresh NEW GET-проверка через тот же Account/RLock с redirects OFF. Live POST отсутствует: NEW semantics, submit/manual/currency/visibility, response ID и независимый owner read-back не доказаны. Synthetic publisher остаётся offline-only; durable UNKNOWN не снимается. Deployment/live проверка не выполнялись.
   [Таблица доказательств и будущий owner-supervised one-lot протокол](FUNPAY_PUBLISH_FEASIBILITY.md).

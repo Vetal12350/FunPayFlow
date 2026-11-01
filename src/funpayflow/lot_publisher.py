@@ -8,16 +8,21 @@ setting, environment variable or Telegram hook enabling live submission.
 from contextlib import closing
 from copy import deepcopy
 from dataclasses import dataclass, field
+from enum import Enum
+from importlib.metadata import version
 import hashlib
 import json
 import math
 import time
 
+from bs4 import BeautifulSoup
+import requests
+
 from FunPayAPI import Account
 from FunPayAPI.common.enums import SubCategoryTypes
 
 from .node_form import (is_safe_node_binding_name, inspect_fresh_new_form, safe_contract_proof,
-                        safe_new_form_diagnostics)
+                        safe_new_form_diagnostics, _EvidenceMarkup)
 from .node_products import selected_fields
 from .product_drafts import validate_price
 from .product_templates import GAME_KEY, safe_text
@@ -37,6 +42,189 @@ TEXT_FIELDS = {
     'description_ru': 'fields[desc][ru]', 'description_en': 'fields[desc][en]',
 }
 FORM_TTL = 300
+
+
+class InventoryStatus(str, Enum):
+    READY = 'READY'
+    UNKNOWN = 'UNKNOWN'
+    CONFIRMED = 'CONFIRMED'
+
+
+class InventoryReason(str, Enum):
+    SNAPSHOT = 'SNAPSHOT'
+    VERIFIED = 'VERIFIED'
+    SCOPE = 'SCOPE'
+    UNAVAILABLE = 'UNAVAILABLE'
+    INCOMPLETE = 'INCOMPLETE'
+    STALE = 'STALE'
+    NEW_IDS = 'NEW_IDS'
+    EXISTING_CHANGED = 'EXISTING_CHANGED'
+    MISMATCH = 'MISMATCH'
+
+
+@dataclass(frozen=True)
+class OwnOffer:
+    offer_id: int
+    fingerprint: str
+    matches: bool
+
+
+@dataclass(frozen=True)
+class OwnInventory:
+    """Transient, node-986-only evidence; no HTML, controls or offer text."""
+    owner_id: str
+    account_id: int
+    account_instance: int
+    review_digest: str
+    fetched_at: float
+    offers: tuple[OwnOffer, ...]
+
+
+@dataclass(frozen=True)
+class InventoryResult:
+    status: InventoryStatus
+    reason: InventoryReason
+    snapshot: OwnInventory | None = field(default=None, repr=False)
+    remote_id: int | None = None
+
+
+def _inventory_digest(value):
+    return hashlib.sha256(json.dumps(value, ensure_ascii=False, sort_keys=True,
+        separators=(',', ':')).encode('utf-8')).hexdigest()
+
+
+def _inventory_get(account, offer_id=None):
+    """Pinned 1.1.0 authentication, bounded GET only, no redirects/retries.
+
+    1.1.0 has no get_my_subcategory_lots or Session. Its get_lot_fields echoes
+    the requested ID and Account.method follows redirects. Read the lineage's
+    own trade endpoint and editor JSON directly with the SAME Account instead.
+    This function has no caller-controlled URL, method or payload.
+    """
+    require(version('FunPayAPI') == '1.1.0' and type(account) is Account, 'READBACK')
+    require(offer_id is None or (type(offer_id) is int and offer_id > 0), 'READBACK')
+    url = 'https://funpay.com/' + ('lots/986/trade' if offer_id is None
+                                 else f'lots/offerEdit?offer={offer_id}')
+    headers = {'accept': '*/*', 'cookie': f'golden_key={account.golden_key}',
+               'cache-control': 'no-cache', 'pragma': 'no-cache'}
+    if account.phpsessid:
+        headers['cookie'] += f'; PHPSESSID={account.phpsessid}'
+    if account.user_agent:
+        headers['user-agent'] = account.user_agent
+    if offer_id is not None:
+        headers['x-requested-with'] = 'XMLHttpRequest'
+    response = None
+    try:
+        response = requests.get(url, headers=headers, proxies=account.proxy or {},
+            timeout=(5, 10), allow_redirects=False, verify=True, stream=True)
+        require(response.status_code == 200 and not response.history
+                and response.url == url, 'READBACK')
+        # Reject an explicitly cached response; repeated inventories below also
+        # detect concurrent changes. No claim of atomic remote snapshots.
+        require(response.headers.get('Age', '0') == '0', 'READBACK')
+        chunks, size, started = [], 0, time.monotonic()
+        for chunk in response.iter_content(65536):
+            size += len(chunk)
+            require(size <= 2_000_000 and time.monotonic() - started <= 15, 'READBACK')
+            chunks.append(chunk)
+        raw = b''.join(chunks).decode('utf-8')
+        if offer_id is not None:
+            raw = json.loads(raw)['html']
+        require(type(raw) is str and len(raw) <= 2_000_000, 'READBACK')
+        return raw
+    finally:
+        if response is not None:
+            response.close()
+
+
+def _trade_inventory(html, account_id):
+    markup = _EvidenceMarkup()
+    markup.feed(html)
+    markup.close()
+    require(markup.valid and not markup.stack, 'READBACK')
+    soup = BeautifulSoup(html, 'html.parser')
+    bodies = soup.find_all('body')
+    require(len(bodies) == 1 and soup.select_one('.user-link-name') is not None, 'READBACK')
+    identity = json.loads(bodies[0]['data-app-data']).get('userId')
+    require(type(identity) is int and identity == account_id, 'SCOPE')
+    # Require explicit remote node context even for an empty inventory. A
+    # generic authenticated page at the requested URL is not an empty baseline.
+    require(soup.select_one('a[href="/lots/offerEdit?node=986"], '
+                            'a[href="https://funpay.com/lots/offerEdit?node=986"]') is not None,
+            'READBACK')
+    # Partial/paginated or filtered inventories cannot prove set difference.
+    require(not soup.select('.pagination, .load-more, [data-next-page]'), 'READBACK')
+    result = {}
+    rows = soup.select('a.tc-item')
+    require(len(rows) <= 50, 'READBACK')
+    for row in rows:
+        raw_id = row.get('data-offer', '')
+        require(raw_id.isascii() and raw_id.isdigit() and 0 < int(raw_id) < 2**63, 'READBACK')
+        offer_id = int(raw_id)
+        require(offer_id not in result, 'READBACK')
+        descriptions = row.select('.tc-desc-text')
+        require(len(descriptions) == 1, 'READBACK')
+        prices, amounts = row.select('.tc-price'), row.select('.tc-amount')
+        require(len(prices) == len(amounts) == 1, 'READBACK')
+        price = validate_price(prices[0]['data-s'])
+        units = prices[0].select('.unit')
+        require(len(units) == 1, 'READBACK')
+        currency = {'₽': 'RUB', 'руб.': 'RUB', '$': 'USD', '€': 'EUR',
+                    'RUB': 'RUB', 'USD': 'USD', 'EUR': 'EUR'}.get(units[0].get_text(strip=True))
+        require(currency is not None, 'READBACK')
+        amount = amounts[0].get_text(strip=True).replace(' ', '')
+        require(amount.isascii() and amount.isdigit() and int(amount) > 0, 'READBACK')
+        # Same explicit inventory indicator used by Cardinal's own-lot parser;
+        # absence of editor secrets is NEVER used as a delivery-mode assertion.
+        result[offer_id] = (price, currency, int(amount),
+            bool(prices[0].select('.auto-dlv-icon')), 'warning' not in row.get('class', []),
+            _inventory_digest(tuple(tag.get_text() for tag in row.select(
+                '.tc-desc-text, .tc-server, .tc-side'))),
+            _inventory_digest(descriptions[0].get_text()))
+    return result
+
+
+def _editor_inventory(html, offer_id, review):
+    markup = _EvidenceMarkup()
+    markup.feed(html)
+    markup.close()
+    require(markup.valid and not markup.stack, 'READBACK')
+    soup = BeautifulSoup(html, 'html.parser')
+    forms = soup.find_all('form')
+    require(len(forms) == 1 and not forms[0].find('form'), 'READBACK')
+    values = {}
+    wanted = {*TEXT_FIELDS.values(), 'price', 'amount', 'active',
+              'deactivate_after_sale', 'auto_delivery', 'offer_id', 'node_id', 'user_id', 'currency'}
+    for control in soup.select('input[name], textarea[name], select[name]'):
+        name = control['name']
+        if name not in wanted and not is_safe_node_binding_name(name):
+            continue
+        require(control.find_parent('form') is forms[0], 'READBACK')
+        require(name not in values and not control.has_attr('disabled'), 'READBACK')
+        if control.name == 'textarea':
+            value = control.get_text()
+        elif control.name == 'select':
+            selected = control.select('option[selected]')
+            require(len(selected) == 1, 'READBACK')
+            value = selected[0].get('value')
+        elif control.get('type') == 'checkbox':
+            value = 'on' if control.has_attr('checked') else ''
+        else:
+            value = control.get('value', '')
+        require(type(value) is str and len(value) <= 10000, 'READBACK')
+        values[name] = value
+    require(values.pop('offer_id', None) == str(offer_id)
+            and values.pop('node_id', None) == '986', 'READBACK')
+    if 'user_id' in values:
+        require(values.pop('user_id') == str(review.account_id), 'SCOPE')
+    required = {*TEXT_FIELDS.values(), 'price', 'amount',
+                *(name for name, *_ in review.selections)}
+    require(required <= values.keys(), 'READBACK')
+    values['price'] = validate_price(values['price'])
+    expected = {TEXT_FIELDS[name]: value for name, value in review.content}
+    expected.update((name, value) for name, value, *_ in review.selections)
+    expected.update(price=review.price, amount='1')
+    return values, all(values.get(k) == v for k, v in expected.items())
 
 
 class PublisherError(ValueError):
@@ -251,6 +439,106 @@ class LotPublisher:
         self.client, self.store = client, store
         self.late_check = late_check or (lambda: False)
         self.clock = clock
+        self._own_inventory_baseline = None
+
+    def _read_own_inventory(self, review, account):
+        """Caller holds runtime gate and Account RLock throughout the snapshot."""
+        started = time.monotonic()
+
+        def check():
+            self._scope_gate(account, review)
+            require(time.monotonic() - started <= 30, 'READBACK')
+
+        check()
+        require(self.review(review.draft_id, review.revision, review.currency) == review, 'REVISION')
+        node = account.get_subcategory(SubCategoryTypes.COMMON, 986)
+        require(node.id == 986 and node.category.id == 274
+                and node.type is SubCategoryTypes.COMMON, 'SCOPE')
+        inventory = _trade_inventory(_inventory_get(account), review.account_id)
+        require(len(inventory) <= 20, 'READBACK')
+        offers = []
+        for offer_id, observed in sorted(inventory.items()):
+            check()
+            fields, matches = _editor_inventory(_inventory_get(account, offer_id), offer_id, review)
+            check()
+            price, currency, amount, automatic, active, _, summary_digest = observed
+            require(fields['price'] == price and fields['amount'] == str(amount), 'READBACK')
+            if 'currency' in fields:
+                require(fields['currency'] == currency, 'READBACK')
+            # A contradictory explicit editor flag invalidates the observation.
+            if 'auto_delivery' in fields:
+                require(fields['auto_delivery'] in {'', 'on'}, 'READBACK')
+                require((fields['auto_delivery'] == 'on') == automatic, 'READBACK')
+            matches = matches and currency == review.currency and amount == 1 and not automatic and active
+            matches = matches and summary_digest in {
+                _inventory_digest(value) for name, value in review.content if name.startswith('title_')}
+            offers.append(OwnOffer(offer_id, _inventory_digest((observed, fields)), matches))
+        check()
+        require(_trade_inventory(_inventory_get(account), review.account_id) == inventory, 'READBACK')
+        check()
+        require(self.review(review.draft_id, review.revision, review.currency) == review, 'REVISION')
+        return OwnInventory(review.owner_id, review.account_id, id(account),
+            _inventory_digest(review.__dict__), self.clock(), tuple(offers))
+
+    def capture_own_inventory(self, review):
+        """Before a future single POST: transient baseline, no claim or write.
+
+        Stage 1 does not dispatch anything. The caller must keep its eventual
+        durable UNKNOWN claim; these read-only results never clear that claim.
+        Only the latest successful baseline from THIS publisher may be consumed.
+        """
+        with self.client._account_lock, automatic_action_gate() as allowed:
+            self._own_inventory_baseline = None
+            try:
+                require(allowed and type(review) is PublicationReview
+                        and review.currency in {'RUB', 'USD', 'EUR'}, 'SCOPE')
+                snapshot = self._read_own_inventory(review, self.client.account)
+                self._own_inventory_baseline = snapshot
+                return InventoryResult(InventoryStatus.READY, InventoryReason.SNAPSHOT, snapshot)
+            except PublisherError as error:
+                reason = InventoryReason.SCOPE if error.reason in {'SCOPE', 'GATE', 'REVISION'} else InventoryReason.INCOMPLETE
+            except Exception:
+                reason = InventoryReason.UNAVAILABLE
+            return InventoryResult(InventoryStatus.UNKNOWN, reason)
+
+    def verify_new_own_offer(self, review, before):
+        """After a future single POST: independent set difference, no receipt ID.
+
+        Baselines expire after 60 seconds and are single-use, even on failure.
+        At most 22 GETs per snapshot (20 editor reads + two trade reads), no
+        sleeps/retries. Never persists CONFIRMED or permits another POST.
+        """
+        with self.client._account_lock, automatic_action_gate() as allowed:
+            baseline, self._own_inventory_baseline = self._own_inventory_baseline, None
+            try:
+                require(allowed and type(review) is PublicationReview
+                        and type(before) is InventoryResult and before.status is InventoryStatus.READY
+                        and baseline is not None and before.snapshot is baseline, 'SCOPE')
+                self._scope_gate(self.client.account, review)
+                require(baseline.review_digest == _inventory_digest(review.__dict__), 'SCOPE')
+                age = self.clock() - baseline.fetched_at
+                if not math.isfinite(age) or not 0 <= age <= 60:
+                    return InventoryResult(InventoryStatus.UNKNOWN, InventoryReason.STALE)
+                after = self._read_own_inventory(review, self.client.account)
+                if not 0 <= self.clock() - baseline.fetched_at <= 60:
+                    return InventoryResult(InventoryStatus.UNKNOWN, InventoryReason.STALE)
+                old = {offer.offer_id: offer for offer in baseline.offers}
+                new = {offer.offer_id: offer for offer in after.offers}
+                if not old.keys() <= new.keys() or any(new[k] != v for k, v in old.items()):
+                    return InventoryResult(InventoryStatus.UNKNOWN, InventoryReason.EXISTING_CHANGED)
+                added = new.keys() - old.keys()
+                if len(added) != 1:
+                    return InventoryResult(InventoryStatus.UNKNOWN, InventoryReason.NEW_IDS)
+                candidate = new[added.pop()]
+                if not candidate.matches:
+                    return InventoryResult(InventoryStatus.UNKNOWN, InventoryReason.MISMATCH)
+                return InventoryResult(InventoryStatus.CONFIRMED, InventoryReason.VERIFIED,
+                                       remote_id=candidate.offer_id)
+            except PublisherError as error:
+                reason = InventoryReason.SCOPE if error.reason in {'SCOPE', 'GATE', 'REVISION'} else InventoryReason.INCOMPLETE
+            except Exception:
+                reason = InventoryReason.UNAVAILABLE
+            return InventoryResult(InventoryStatus.UNKNOWN, reason)
 
     def review(self, draft_id, revision, currency):
         """Review saved data without GET, synthetic provenance or currency defaults.
