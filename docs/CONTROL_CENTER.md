@@ -1,5 +1,37 @@
 # Windows Control Center 3.0 · optional CustomTkinter UI
 
+## CI-internal pinned FunPayAPI wheel helper
+
+`scripts/build_pinned_funpayapi_wheel.py` is a source-only preparation helper,
+not an updater, installer or VPS tool. Workflow integration is a separate change;
+the GUI `Подготовить обновление` remains disabled until a secure installer exists.
+Only a disposable **Linux GitHub-hosted runner, non-root**, with **no secrets**,
+a least-privilege read-only GitHub token and checkout credential persistence disabled
+may run it. CI markers are refusal guards, not a sandbox or proof of those conditions;
+the job owner must provision that environment. Third-party build hooks execute code
+with the runner user's privileges. Never run this helper on production or a persistent
+self-hosted runner. No workflow is added by this change.
+
+Provision `pip`, `setuptools` and `wheel` in the CI Python environment beforehand
+(these are CI tools, not new project dependencies). Run
+`python scripts/build_pinned_funpayapi_wheel.py` there. The sole optional positional
+argument is an existing empty absolute output directory under `RUNNER_TEMP`; without
+it, the helper creates `RUNNER_TEMP/funpayapi-wheel` and refuses nonempty output.
+It checks the fixed URL/size/SHA-256 against checkout `uv.lock`, performs one bounded
+HTTPS GET without auth, proxies or redirects, verifies bytes before safe extraction,
+then uses pip's conventional setuptools backend without indexes, dependency installs
+or build isolation. Unsupported backends or missing build tools fail closed. Hooks
+receive a minimal environment and temporary HOME; their raw logs are suppressed.
+
+Only one validated wheel and `manifest.json` are published to that output directory.
+The manifest records the exact source and wheel SHA-256, built filename, package,
+version and validated WHEEL tags matching the filename. It is neither an attestation
+nor a claim of bit-for-bit reproducibility. Archive, metadata and write-boundary
+regressions use synthetic inputs and mocked HTTPS/subprocess only, in
+`tests/test_build_pinned_funpayapi_wheel.py`. No real source download or wheel build
+is performed by these tests; the future disposable CI job must establish real build
+compatibility before anyone relies on its artifact.
+
 The primary workflow is **ChatGPT → GitHub Issue → existing local Codex Worker →
 Windows monitor**. Tell ChatGPT the requested source change. Its separately authorized
 GitHub connector must create an owner-authored `[Codex] ...` issue with `codex-local`
