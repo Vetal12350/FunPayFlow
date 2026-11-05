@@ -1,0 +1,118 @@
+name: Approved VPS deployment
+
+# After successful CI for a push to main, request the Environment approval.
+# NEVER exposes SSH secrets on pull_request or a Codex issue.
+# No job runs until FUNPAY_DEPLOY_ARMED is intentionally enabled.
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: funpayflow-production
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    name: Verify reviewed main and repeat offline tests
+    if: >-
+      ${{ vars.FUNPAY_DEPLOY_ARMED == 'true' &&
+          github.repository == 'Vetal12350/FunPayFlow' &&
+          github.event.workflow_run.event == 'push' &&
+          github.event.workflow_run.conclusion == 'success' &&
+          github.event.workflow_run.head_repository.full_name == 'Vetal12350/FunPayFlow' &&
+          github.event.workflow_run.head_branch == 'main' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      sha: ${{ steps.pin.outputs.sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Pin exact current main and require successful main CI
+        id: pin
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXPECTED_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
+          sha="$(git rev-parse HEAD)"
+          [[ "$sha" =~ ^[0-9a-f]{40}$ ]]
+          [ "$sha" = "$EXPECTED_SHA" ] || { echo "BLOCKED: checked-out SHA mismatch"; exit 1; }
+          head="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq '.object.sha')"
+          [ "$sha" = "$head" ] || { echo "BLOCKED: main advanced since run began"; exit 1; }
+          matches="$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?branch=main&event=push&head_sha=$sha&per_page=20" --jq "[.workflow_runs[] | select(.head_sha == \"$sha\" and .event == \"push\" and .head_branch == \"main\" and .status == \"completed\" and .conclusion == \"success\")] | length")"
+          [ "$matches" -ge 1 ] || { echo "BLOCKED: exact main SHA has no successful CI"; exit 1; }
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          python-version: '3.13'
+
+      - name: Repeat full offline tests (no production access)
+        run: |
+          uv sync --locked --dev
+          uv run --no-sync pytest -q
+          uv run --no-sync python scripts/qa_smoke.py --suite product
+          uv run --no-sync python scripts/qa_smoke.py --suite core
+
+  deploy:
+    name: Owner-approved restricted SSH update
+    needs: [verify]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # Configure a REQUIRED REVIEWER for this Environment. An Environment
+    # without required reviewers is NOT the intended approval protection.
+    environment:
+      name: production
+    steps:
+      - name: Verify main has not advanced while waiting for owner approval
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ needs.verify.outputs.sha }}
+        run: |
+          set -euo pipefail
+          [[ "$SHA" =~ ^[0-9a-f]{40}$ ]]
+          head="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq '.object.sha')"
+          [ "$SHA" = "$head" ] || { echo "BLOCKED: current main differs from reviewed SHA"; exit 1; }
+
+      - name: Deploy exact SHA using a dedicated restricted forced-command key
+        shell: bash
+        env:
+          SHA: ${{ needs.verify.outputs.sha }}
+          DEPLOY_HOST: ${{ secrets.FUNPAY_DEPLOY_HOST }}
+          DEPLOY_KEY: ${{ secrets.FUNPAY_DEPLOY_SSH_KEY }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.FUNPAY_DEPLOY_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          if [ -z "$DEPLOY_HOST" ] || [ -z "$DEPLOY_KEY" ] || [ -z "$DEPLOY_KNOWN_HOSTS" ]; then
+            echo "BLOCKED: missing dedicated production environment secrets"
+            exit 1
+          fi
+          python3 - "$DEPLOY_HOST" <<'PY'
+          import ipaddress
+          import sys
+          ip = ipaddress.ip_address(sys.argv[1])
+          if ip.version != 4 or ip.is_private or ip.is_loopback or ip.is_multicast or ip.is_unspecified:
+              raise SystemExit('BLOCKED: deploy host is not a public IPv4 address')
+          PY
+          [[ "$SHA" =~ ^[0-9a-f]{40}$ ]]
+          tmp="$(mktemp -d)"
+          trap 'rm -f "$tmp/key" "$tmp/known_hosts"; rmdir "$tmp"' EXIT
+          umask 077
+          printf '%s\n' "$DEPLOY_KEY" > "$tmp/key"
+          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > "$tmp/known_hosts"
+          chmod 600 "$tmp/key" "$tmp/known_hosts"
+
+          ssh -T -i "$tmp/key" -o IdentitiesOnly=yes -o BatchMode=yes \
+            -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$tmp/known_hosts" \
+            -o ForwardAgent=no -o ClearAllForwardings=yes \
+            -o ConnectTimeout=15 -o ServerAliveInterval=15 -o ServerAliveCountMax=2 \
+            -o ProxyCommand=none "root@$DEPLOY_HOST" "deploy $SHA"
