@@ -345,7 +345,7 @@ async def _publication_screen(callback, state):
 
 
 async def _publication_callback(callback, user_id, parts, store, routes):
-    """Read-only fallback. No live submission capability is reachable here."""
+    """Owner intent; the private runtime form proof remains fail closed."""
     command = parts[1]
     if command in {'pubopen', 'pubpreview'}:
         if command == 'pubopen':
@@ -384,6 +384,29 @@ async def _publication_callback(callback, user_id, parts, store, routes):
             and _ui()._runtime_client is routes.client and _ui()._owner_id(user_id)
             and state['context'] == _catalog_context(routes, store, review.template_id)
             and not _ui().is_safe_mode_enabled())
+    if operation == 'publish':
+        # Consume before any await or lock wait. The publisher also consumes
+        # its in-memory intent; a restart cannot reconstruct either capability.
+        state['token'] = None
+        publisher = state.pop('publisher', None)
+        if publisher is None:
+            raise PublisherError('CONTRACT_UNVERIFIED')
+        publisher.late_check = current
+        try:
+            result = await asyncio.to_thread(publisher.confirm_new, review)
+        except Exception:
+            result = await asyncio.to_thread(publisher.outcome, review.draft_id)
+            if result is None:
+                raise PublisherError('CONTRACT_UNVERIFIED') from None
+        if result['state'] == 'CONFIRMED':
+            text = f"✅ Независимо подтверждён новый лот ID {result['remote_id']}."
+        else:
+            text = ('🔒 UNKNOWN: отправку не повторять. Проверьте свои лоты на сайте '
+                    'только чтением: новый ID, владелец, node 986, все тексты, три выбора, '
+                    'цена/валюта, количество 1 и ручная выдача. '
+                    'Не очищайте lot_publish_attempts и не обходите барьер копией draft.')
+        await _show(callback, text, _menu([[('📝 Мои черновики', 'prd:drafts:0')]]))
+        return
     publisher = LotPublisher(routes.client, store, late_check=current)
     _fresh(review.fetched_at, publisher.clock())
     if await asyncio.to_thread(publisher.review, review.draft_id, review.revision, review.currency) != review:
@@ -401,6 +424,34 @@ async def _publication_callback(callback, user_id, parts, store, routes):
         diagnostics = {}
         proof, blockers = await asyncio.to_thread(publisher.inspect_new, review, diagnostics=diagnostics)
         if not current():
+            return
+        try:
+            # Diagnostics alone cannot arm publication. Only the unavailable
+            # runtime profile adapter may prove a fresh, bounded live contract.
+            await asyncio.to_thread(publisher.stage_new, review)
+        except PublisherError as error:
+            if error.reason != 'CONTRACT_UNVERIFIED':
+                raise
+        else:
+            if not current():
+                return
+            content = dict(review.content)
+            await _plain_chunks(callback.message,
+                'Финальное подтверждение · Elden Ring · GAME_KEY\n'
+                'Владелец Telegram: ' + review.owner_id + '; FunPay: ' + str(review.account_id)
+                + '\ncategory 274 · COMMON node 986\n'
+                + '\n'.join(label + ': ' + option for _, _, label, option in review.selections)
+                + f'\nЦена: {review.price} {review.currency}\nКоличество: 1\n'
+                'Выдача: ручная · Видимость: активен\n'
+                + '\n\n'.join(language.upper() + '\n' + content['title_' + language]
+                    + '\n' + content['description_' + language] for language in ('ru', 'en')))
+            if not current():
+                return
+            state['publisher'] = publisher
+            state['token'] = uuid.uuid4().hex[:12]
+            await _show(callback, 'Одна попытка. При UNKNOWN повтор запрещён.', _menu([
+                [('Опубликовать 1 лот', f"prd:pub:{state['token']}:publish")],
+                [('❌ Отмена', f"prd:pub:{state['token']}:cancel")]]))
             return
         lines = ['🔒 Публикация заблокирована. Выполнена только свежая GET-проверка.',
                  'Наблюдения формы (verified = структура, не разрешение на POST):']
