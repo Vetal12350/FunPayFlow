@@ -1,0 +1,26 @@
+﻿sku,top15_rank,category,denomination,region,sample_min_display,sample_median_display,sample_n,display_currency,seller_price_confirmed,recommended_seller_price,supplier_public_quote_usd,quote_status,supplier_source_ids,offer_urls,delivery,automation_complexity,demand_7d,demand_30d,demand_status,notes,checked_at
+PUBG60,1,PUBG Mobile,60 UC,Global pending confirmation,1.08,1.09,3,USD,,,0.90,QUOTE_PUBLIC,RSCPU,https://funpay.com/lots/offer?id=74143931;https://funpay.com/lots/offer?id=75795729;https://funpay.com/lots/offer?id=64547337,ID,Medium,,,NO_ROLLING_SKU_COUNTS,Лучший старт по полноте данных; реальная маржа не установлена,2026-11-13
+FFWEEK,2,Free Fire,Weekly Membership,CIS,152.2,152.91,3,RUB,,,1.54,QUOTE_PUBLIC,RSCFF,,ID,Medium,,,NO_ROLLING_SKU_COUNTS,Сопоставимость регионов у WereFoxLM/Faithy1 требует проверки,2026-11-13
+ML86,3,Mobile Legends,78+8 Diamonds,Not MY/SG/PH/ID/RU/BR,,,0,,,,1.08,QUOTE_PUBLIC,RSCML,,ID+Zone,Medium,,,NO_ROLLING_SKU_COUNTS,Не продавать как любой регион; RU запрещён этим SKU,2026-11-13
+ROB10,4,Roblox,US $10 gift card,US,,,0,,,,9.10,QUOTE_PUBLIC,RSCROB,,Code,Low-medium,,,NO_ROLLING_SKU_COUNTS,Коды не равны фиксированному количеству Robux; спрос только на уровне категории,2026-11-13
+STARS100,5,Telegram Stars,100 Stars,By username; eligibility pending,,,0,,,,,FROM_PRICE_ONLY,IFR;KRAB;TGS,,Username,Medium,,,NO_ROLLING_SKU_COUNTS,iFragment рекламирует от1.65USD; KRAB нужен live quote; личный допуск неизвестен,2026-11-13
+PUBG325,6,PUBG Mobile,325 UC,Global pending,,,0,,,,4.45,QUOTE_PUBLIC,RSCPU,,ID,Medium,,,NO_ROLLING_SKU_COUNTS,Сопоставимая розница не получена,2026-11-13
+ML172,7,Mobile Legends,156+16 Diamonds,Not MY/SG/PH/ID/RU/BR,,,0,,,,2.13,QUOTE_PUBLIC,RSCML,,ID+Zone,Medium,,,NO_ROLLING_SKU_COUNTS,"Те же региональные исключения, что86",2026-11-13
+FF110,8,Free Fire,110 Diamonds,CIS,,,0,,,,0.78,QUOTE_PUBLIC,RSCFF,,ID,Medium,,,NO_ROLLING_SKU_COUNTS,Не подменять100Diamonds,2026-11-13
+EXIT8UA,9,Steam Auto Gifts,The Exit 8 exact edition pending,UA,2.99,2.99,1,USD,,,,QUOTE_REQUIRED,GGSTEAM;NERV;DESS,https://funpay.com/lots/offer?id=66402754,Invite link,High,,,NO_ROLLING_SKU_COUNTS,Nervixy Bybit funding; Binance/USDT route не подтверждён; не менять регион,2026-11-13
+ROB50RU,10,Roblox,50 Robux denomination in card category,RU,1.07,1.31,3,USD,,,,QUOTE_REQUIRED,GGROB,https://funpay.com/lots/offer?id=76711545;https://funpay.com/lots/offer?id=75626123;https://funpay.com/lots/offer?id=76355255,Unknown,Unknown,,,NO_ROLLING_SKU_COUNTS,Guddi наблюдается; exact redemption mechanism не установлен,2026-11-13
+DELTA,11,Delta Force,Nominal pending catalog,Global; Garena separate,,,0,,,,,QUOTE_REQUIRED,PKDELTA;PKGAMES,,ID,Medium,,,NO_ROLLING_SKU_COUNTS,Подтверждена поставка в каталоге; спрос/цены рынка не установлены,2026-11-13
+ARENA66,12,Arena Breakout,66 Bonds,"Global mobile, not Infinite PC",,,0,,,,,QUOTE_REQUIRED,PKARENA,,UID,Medium,,,NO_ROLLING_SKU_COUNTS,Не смешивать с Arena Breakout Infinite,2026-11-13
+BLOOD,13,Blood Strike,Nominal pending catalog,Global; MENA separate,,,0,,,,,QUOTE_REQUIRED,PKGAMES,,UID,Medium,,,NO_ROLLING_SKU_COUNTS,Тариф/спрос не установлены; без расчёта прибыли,2026-11-13
+HOK,14,Honor of Kings,Nominal pending catalog,Global,,,0,,,,,QUOTE_REQUIRED,PKGAMES,,UID,Medium,,,NO_ROLLING_SKU_COUNTS,Подтверждён ассортимент поставщика; не подтверждены продажи,2026-11-13
+WHITE99,15,Whiteout Survival,99 Frost Stars,Global pending,175.09,175.09,1,RUB,,,,QUOTE_REQUIRED,FPWHITE,,ID,Medium,,,NO_ROLLING_SKU_COUNTS,Дополнительный товар у Roymi; не Telegram Stars,2026-11-13
+PUBG660,,PUBG Mobile,660 UC,Global pending,,,0,,,,9.00,QUOTE_PUBLIC,RSCPU,,ID,Medium,,,NO_ROLLING_SKU_COUNTS,Variant,2026-11-13
+ML257,,Mobile Legends,234+23 Diamonds,Not MY/SG/PH/ID/RU/BR,,,0,,,,3.09,QUOTE_PUBLIC,RSCML,,ID+Zone,Medium,,,NO_ROLLING_SKU_COUNTS,Variant,2026-11-13
+FF341,,Free Fire,341 Diamonds,CIS,,,0,,,,2.36,QUOTE_PUBLIC,RSCFF,,ID,Medium,,,NO_ROLLING_SKU_COUNTS,Не подменять310,2026-11-13
+FF572,,Free Fire,572 Diamonds,CIS,,,0,,,,3.84,QUOTE_PUBLIC,RSCFF,,ID,Medium,,,NO_ROLLING_SKU_COUNTS,Не подменять520,2026-11-13
+ROB25,,Roblox,US $25 gift card,US,,,0,,,,22.50,QUOTE_PUBLIC,RSCROB,,Code,Low-medium,,,NO_ROLLING_SKU_COUNTS,"Variant; stock4 at public observation, not guaranteed",2026-11-13
+STARS500,,Telegram Stars,500 Stars,By username; eligibility pending,,,0,,,,,FROM_PRICE_ONLY,IFR,,Username,Medium,,,NO_ROLLING_SKU_COUNTS,"Рекламный минимум8.25USD, не live quote",2026-11-13
+EXIT8RU,,Steam Auto Gifts,The Exit 8 edition pending,RU,2.8,2.8,1,USD,,,,QUOTE_REQUIRED,GGSTEAM;NERV,https://funpay.com/lots/offer?id=66465316,Invite link,High,,,NO_ROLLING_SKU_COUNTS,Variant; delivery eligibility exact title must be confirmed,2026-11-13
+EXIT8KZ,,Steam Auto Gifts,The Exit 8 edition pending,KZ,3.54,3.54,1,USD,,,,QUOTE_REQUIRED,GGSTEAM;NERV,https://funpay.com/lots/offer?id=66465319,Invite link,High,,,NO_ROLLING_SKU_COUNTS,Variant,2026-11-13
+STEAM1000,,Steam Wallet,1000 RUB,RU,,,0,,,,,QUOTE_REQUIRED,PW;NERV;DESS;NS;YARD,,Login,Medium,,,NO_ROLLING_SKU_COUNTS,Не Steam Gift; Bybit routes do not establish Binance compatibility,2026-11-13
+PUBGPRIME,,PUBG Mobile,Prime 1 month,Global pending,88.78,88.78,1,RUB,,,0.88,QUOTE_PUBLIC,RSCPU,,ID,Medium,,,NO_ROLLING_SKU_COUNTS,Дополнительный товар конкурента; ежедневные начисления отдельно от instantUC,2026-11-13
