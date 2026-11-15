@@ -1,0 +1,182 @@
+name: Deploy to VPS
+
+# Manual only: phone (GitHub app -> Actions -> Run workflow) or the Windows
+# Control Center (`gh workflow run deploy.yml -f sha=<sha> -f action=deploy`).
+# Only the current head of main can be installed, so the owner's merge is the
+# decision; `production` may additionally require reviewers. Secrets live only in
+# that environment. See docs/VPS_AUTO_UPDATE.md.
+on:
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: "Exact main commit SHA (40 lowercase hex)"
+        required: true
+        type: string
+      action:
+        description: "deploy = install this SHA; rollback = this SHA is current, go back"
+        required: true
+        default: deploy
+        type: choice
+        options: [deploy, rollback]
+
+permissions:
+  contents: read
+  checks: read
+
+concurrency:
+  group: production-deploy
+  cancel-in-progress: false
+
+env:
+  SHA: ${{ inputs.sha }}
+  ACTION: ${{ inputs.action }}
+
+jobs:
+  verify:
+    if: inputs.action == 'deploy'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - name: Validate input
+        run: |
+          [[ "$SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::sha must be 40 lowercase hex"; exit 1; }
+          [[ "$GITHUB_REF" == "refs/heads/main" ]] || { echo "::error::run the workflow from main"; exit 1; }
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Require the current head of main
+        run: |
+          git fetch --quiet origin main
+          [[ "$(git rev-parse origin/main)" == "$SHA" ]] || { echo "::error::sha is not the current head of main"; exit 1; }
+          [[ "$(git rev-parse HEAD)" == "$SHA" ]]
+      - name: Require green CI for this commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          runs=$(gh api "repos/$GITHUB_REPOSITORY/commits/$SHA/check-runs?per_page=100" \
+            --jq '[.check_runs[] | select(.name | startswith("offline-tests"))]')
+          total=$(jq length <<<"$runs")
+          ok=$(jq '[.[] | select(.conclusion == "success")] | length' <<<"$runs")
+          [[ "$total" -ge 2 && "$ok" == "$total" ]] || { echo "::error::CI offline-tests not green for $SHA"; exit 1; }
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          python-version: "3.13"
+      - name: Offline tests and compile
+        run: |
+          uv sync --locked --dev
+          uv run --no-sync pytest -q
+          uv run --no-sync python -m compileall -q src/funpayflow scripts
+      - name: Build release archive
+        id: build
+        run: |
+          uv venv --python 3.13 "$RUNNER_TEMP/build-env"
+          uv pip install --python "$RUNNER_TEMP/build-env" pip
+          "$RUNNER_TEMP/build-env/bin/python" scripts/build_deploy_release.py \
+            --sha "$SHA" --out "$RUNNER_TEMP/release" | tee "$RUNNER_TEMP/build.out"
+          digest=$(sed -n 's/^DIGEST=\([0-9a-f]\{64\}\)$/\1/p' "$RUNNER_TEMP/build.out")
+          [[ -n "$digest" ]]
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          echo "Release $SHA digest $digest" >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ inputs.sha }}
+          path: ${{ runner.temp }}/release/release.tar
+          retention-days: 7
+          if-no-files-found: error
+
+  deploy:
+    needs: verify
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment: production
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-${{ inputs.sha }}
+          path: release
+      - name: Check approved digest
+        env:
+          DIGEST: ${{ needs.verify.outputs.digest }}
+        run: |
+          [[ "$(sha256sum release/release.tar | cut -d' ' -f1)" == "$DIGEST" ]] || { echo "::error::artifact digest changed"; exit 1; }
+      - name: Configure SSH
+        env:
+          KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        run: |
+          umask 077
+          mkdir -p "$RUNNER_TEMP/ssh"
+          printf '%s\n' "$KEY" > "$RUNNER_TEMP/ssh/key"
+          printf '%s\n' "$KNOWN_HOSTS" > "$RUNNER_TEMP/ssh/known_hosts"
+      - name: Upload and start deployment (sent once, never retried)
+        id: send
+        env:
+          HOST: ${{ secrets.DEPLOY_HOST }}
+          USER: ${{ secrets.DEPLOY_USER }}
+          DIGEST: ${{ needs.verify.outputs.digest }}
+        run: |
+          set +e
+          out=$(ssh -T -o BatchMode=yes -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes \
+                -o UserKnownHostsFile="$RUNNER_TEMP/ssh/known_hosts" -o ConnectTimeout=20 \
+                -o ServerAliveInterval=15 -i "$RUNNER_TEMP/ssh/key" "$USER@$HOST" \
+                "deploy $SHA $DIGEST" < release/release.tar)
+          echo "Agent: ${out:-<no answer>}"
+          case "$out" in
+            ACCEPTED|ALREADY_DEPLOYED) echo "result=$out" >> "$GITHUB_OUTPUT" ;;
+            REJECTED*) echo "::error::$out"; exit 1 ;;
+            *) echo "::warning::no clear answer; checking status only"; echo "result=UNKNOWN" >> "$GITHUB_OUTPUT" ;;
+          esac
+      - name: Wait for result (read-only status polling)
+        if: steps.send.outputs.result != 'ALREADY_DEPLOYED'
+        env:
+          HOST: ${{ secrets.DEPLOY_HOST }}
+          USER: ${{ secrets.DEPLOY_USER }}
+        run: |
+          for i in $(seq 1 60); do
+            sleep 10
+            out=$(ssh -T -o BatchMode=yes -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes \
+                  -o UserKnownHostsFile="$RUNNER_TEMP/ssh/known_hosts" -o ConnectTimeout=20 \
+                  -i "$RUNNER_TEMP/ssh/key" "$USER@$HOST" "status $SHA" </dev/null) || continue
+            echo "[$i] $out"
+            case "$out" in
+              DEPLOYED*|ALREADY_DEPLOYED) echo "DEPLOYED $SHA" >> "$GITHUB_STEP_SUMMARY"; exit 0 ;;
+              UNKNOWN_JOB) echo "::error::deployment was not accepted; nothing changed, safe to run again"; exit 1 ;;
+              ROLLED_BACK*|FAILED*|NEEDS_OWNER*|REJECTED*)
+                echo "$out" >> "$GITHUB_STEP_SUMMARY"; echo "::error::$out"; exit 1 ;;
+            esac
+          done
+          echo "::error::UNKNOWN: no final status in 10 minutes. Do not re-run deploy; run only status checks."
+          exit 1
+      - name: Remove key
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/ssh"
+
+  rollback:
+    if: inputs.action == 'rollback'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment: production
+    steps:
+      - name: Validate input
+        run: '[[ "$SHA" =~ ^[0-9a-f]{40}$ ]]'
+      - name: Roll back (current release must equal sha)
+        env:
+          KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+          HOST: ${{ secrets.DEPLOY_HOST }}
+          USER: ${{ secrets.DEPLOY_USER }}
+        run: |
+          umask 077
+          d="$RUNNER_TEMP/ssh"; mkdir -p "$d"
+          trap 'rm -rf "$d"' EXIT
+          printf '%s\n' "$KEY" > "$d/key"; printf '%s\n' "$KNOWN_HOSTS" > "$d/known_hosts"
+          out=$(ssh -T -o BatchMode=yes -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes \
+                -o UserKnownHostsFile="$d/known_hosts" -o ConnectTimeout=20 -i "$d/key" \
+                "$USER@$HOST" "rollback $SHA" </dev/null) || true
+          echo "Agent: ${out:-<no answer>}"
+          echo "$out" >> "$GITHUB_STEP_SUMMARY"
+          [[ "$out" == "ROLLED_BACK" ]]

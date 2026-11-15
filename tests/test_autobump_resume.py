@@ -2,6 +2,7 @@
 import log_isolation
 import ast
 import asyncio
+from funpayflow.heartbeat import stop_heartbeat
 import copy
 import sqlite3
 import tempfile
@@ -535,6 +536,8 @@ class LoopPolicyTests(unittest.IsolatedAsyncioTestCase):
                                                 ('info', 'banner', 'success', 'error', 'warning')}),
                     'os': SimpleNamespace(name='posix'), 'RuntimeAction': RuntimeAction,
                     'set_runtime_status_context': lambda _: None,
+                    'start_heartbeat': lambda client: None,
+                    'stop_heartbeat': stop_heartbeat,
                     'clear_runtime_status_context': lambda: None,
                     '_supervise_tasks': supervise, 'get_all_recipients': lambda: [1],
                 }

@@ -3,6 +3,7 @@
 import log_isolation
 import ast
 import asyncio
+from funpayflow.heartbeat import stop_heartbeat
 import copy
 import os
 import sqlite3
@@ -407,6 +408,8 @@ class RestartLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 "_send_runtime_notice": notice,
                 "_supervise_tasks": supervise,
                 "set_runtime_status_context": lambda *args: None,
+                "start_heartbeat": lambda client: None,
+                "stop_heartbeat": stop_heartbeat,
                 "clear_runtime_status_context": lambda: None,
                 "os": SimpleNamespace(name="posix"),
                 "logger": SimpleNamespace(info=lambda *args: None,
