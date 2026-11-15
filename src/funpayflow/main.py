@@ -14,6 +14,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 from aiogram import Bot
 from .runtime_paths import runtime_file
+from .heartbeat import start_heartbeat, stop_heartbeat
 
 load_dotenv(runtime_file(".env"))
 
@@ -1065,7 +1066,11 @@ async def main():
             os.system("title FunPay Bot")
         logger.success("Бот подключен к Telegram. Запуск фоновых процессов...")
         set_runtime_status_context(client)
-        action = await _supervise_tasks(bot, client)
+        heartbeat = start_heartbeat(client)
+        try:
+            action = await _supervise_tasks(bot, client)
+        finally:
+            await stop_heartbeat(heartbeat)
     finally:
         clear_runtime_status_context()
         primary_type = sys.exc_info()[0]
