@@ -7,6 +7,7 @@ Envelopes contain transient secrets: never serialize them or persist their body.
 from dataclasses import dataclass, field
 from importlib.metadata import version
 import math
+import json
 import threading
 import time
 from typing import Literal
@@ -49,20 +50,35 @@ class RequestEnvelope:
 
 
 class NewOfferTransport:
-    """Not a live capability: submit_once rejects every current envelope.
+    """Bounded dispatch, unavailable until a runtime live profile is verified.
 
     fpx proves the endpoint/headers, but neither currency/manual semantics nor
     an ID receipt. No current envelope can pass the live contract gate.
-    _exchange is a private transport unit seam, with no application call sites.
-    A future integration must first implement the verified contract and keep
-    LotPublisher's durable claim, lock, scope/revision and late gates around it.
+    Telegram/LotPublisher integration preserves the permanent claim and gates.
+    Neither a synthetic envelope nor a public proof dict can enable dispatch.
     """
     def __init__(self):
         self._lock = threading.Lock()
         self._consumed = False
+        self._claimed = False
 
-    def submit_once(self, *args, **kwargs):
+    def _fresh_contract(self, publisher, review):
+        """Missing runtime proof boundary, deliberately unavailable.
+
+        Must eventually fetch under the current Account lock and derive the
+        prepared lot, FormContext and envelope from ONE verified live profile.
+        No API accepts HTML, provenance strings or owner-supplied proof here.
+        Blank offer_id, observed price currency, manual/active semantics and
+        exact successful hidden/submit controls have not been verified together.
+        Synthetic assembly below cannot satisfy this boundary.
+        """
         raise PublisherError('CONTRACT_UNVERIFIED')
+
+    def submit_once(self, publisher, prepared, form, envelope):
+        armed = getattr(publisher, '_dispatch_prepared', None)
+        publisher._dispatch_prepared = None
+        require(armed is prepared, 'CONTRACT_UNVERIFIED')
+        return self._exchange(publisher, prepared, form, envelope)
 
     def _require_live_contract(self, envelope):
         # No verified live profile exists. Never accept a provenance string,
@@ -84,6 +100,7 @@ class NewOfferTransport:
                     'SCHEMA')
             publisher._scope_gate(account, prepared)
             publisher._claim(prepared, form)
+            self._claimed = True
             require(publisher.prepare(prepared.draft_id, prepared.revision, form,
                 price=dict(prepared.business)['price'], currency=prepared.currency) == prepared,
                 'REVISION')
@@ -93,7 +110,7 @@ class NewOfferTransport:
     def __send(self, account, envelope):
         """Exactly one fixed-origin exchange; even HTTP 200 proves no new ID.
 
-        Only synthetic tests call this seam. It does not authorize publication
+        Only mocked tests can reach this seam currently. It does not authorize publication
         or replace the permanent SQLite claim. Never log/return response bytes.
         """
         response = None
@@ -137,11 +154,18 @@ class NewOfferTransport:
             require(type(response.status_code) is int and response.status_code == 200
                     and not response.history
                     and response.url == 'https://funpay.com/lots/offerSave', 'TRANSPORT_POLICY')
-            size, started = 0, time.monotonic()
+            chunks, size, started = [], 0, time.monotonic()
             for chunk in response.iter_content(65536):
                 size += len(chunk)
                 require(size <= 262_144 and time.monotonic() - started <= 15,
                         'TRANSPORT_UNKNOWN')
+                chunks.append(chunk)
+            # An error (or unknown receipt shape) cannot become success merely
+            # because an unrelated concurrent lot appears in the inventory.
+            receipt = json.loads(b''.join(chunks).decode('utf-8'))
+            require(type(receipt) is dict and receipt.get('success') is True
+                    and not any(receipt.get(k) for k in ('error', 'errors', 'message')),
+                    'TRANSPORT_UNKNOWN')
             # Do not infer an ID from JSON keys, URLs, HTML links or a boolean.
             return SubmitReceipt(None)
         except PublisherError:

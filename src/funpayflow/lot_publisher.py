@@ -1,9 +1,9 @@
-"""Saved GAME_KEY review and live read-only NEW inspection; POST stays disabled.
+"""Saved GAME_KEY owner confirmation; unverified live profiles stay disabled.
 
 The service controls and receipt below are an OFFLINE protocol, not a claim
 about FunPay's wire format. SyntheticTransport has no implementation. The dormant
 create_wire_contract exchange also rejects unverified contracts; neither has a
-setting, environment variable or Telegram hook enabling live submission.
+setting, environment variable or user-supplied proof enabling live submission.
 """
 from contextlib import closing
 from copy import deepcopy
@@ -440,6 +440,90 @@ class LotPublisher:
         self.late_check = late_check or (lambda: False)
         self.clock = clock
         self._own_inventory_baseline = None
+        self._confirmation_review = None
+
+    def _new_contract(self, review, transport):
+        """Private runtime adapter only; never accepts a caller's form/proof."""
+        prepared, form, envelope = transport._fresh_contract(self, review)
+        require(type(prepared) is PreparedLot and prepared.owner_id == review.owner_id
+                and prepared.account_id == review.account_id
+                and prepared.account_instance == review.account_instance
+                and prepared.draft_id == review.draft_id and prepared.revision == review.revision
+                and prepared.fingerprint == review.fingerprint, 'REVISION')
+        business = {TEXT_FIELDS[k]: v for k, v in review.content}
+        business.update((name, value) for name, value, *_ in review.selections)
+        business.update(price=review.price, currency=review.currency, amount='1')
+        require(dict(prepared.business) == business, 'SCHEMA')
+        require(self.prepare(review.draft_id, review.revision, form,
+                price=review.price, currency=review.currency) == prepared, 'REVISION')
+        transport._require_live_contract(envelope)
+        return prepared, form, envelope
+
+    def stage_new(self, review):
+        """Arm only this in-memory owner confirmation after a proven fresh GET.
+
+        Currently fails CONTRACT_UNVERIFIED: no live profile exists. The full
+        integration is exercised by replacing private proof boundaries OFFLINE.
+        Neither a green diagnostics dict nor synthetic provenance can arm it.
+        """
+        from .create_wire_contract import NewOfferTransport
+        self._confirmation_review = None
+        with self.client._account_lock, automatic_action_gate() as allowed:
+            require(allowed and type(review) is PublicationReview, 'GATE')
+            require(review.currency in {'RUB', 'USD', 'EUR'}, 'PRICE')
+            self._scope_gate(self.client.account, review)
+            require(self.outcome(review.draft_id) is None, 'ALREADY_CLAIMED')
+            require(self.review(review.draft_id, review.revision, review.currency) == review, 'REVISION')
+            self._new_contract(review, NewOfferTransport())
+            self._scope_gate(self.client.account, review)
+            self._confirmation_review = review
+
+    def confirm_new(self, review):
+        """One consumed owner intent, durable claim, one POST, independent ID.
+
+        No raw form survives the call. Exceptions after the transport's claim
+        leave UNKNOWN, including crash/cancellation; no automatic retry exists.
+        """
+        from .create_wire_contract import NewOfferTransport
+        with self.client._account_lock, automatic_action_gate() as allowed:
+            armed, self._confirmation_review = self._confirmation_review, None
+            require(armed is review, 'GATE')
+            require(allowed, 'GATE')
+            account = self.client.account
+            self._scope_gate(account, review)
+            require(self.outcome(review.draft_id) is None, 'ALREADY_CLAIMED')
+            require(self.review(review.draft_id, review.revision, review.currency) == review, 'REVISION')
+            route = RouteService(self.client, self.store).resolve_route(review.route_id)
+            require(route['revision'] == review.route_revision, 'REVISION')
+            before = self.capture_own_inventory(review)
+            require(before.status is InventoryStatus.READY, 'READBACK')
+            transport = NewOfferTransport()
+            try:
+                prepared, form, envelope = self._new_contract(review, transport)
+                self._scope_gate(account, review)
+                self._dispatch_prepared = prepared
+                receipt = transport.submit_once(self, prepared, form, envelope)
+                require(type(receipt) is SubmitReceipt and receipt.http_status == 200
+                        and receipt.redirects == 0 and receipt.attempts == 1, 'TRANSPORT_POLICY')
+                # HTTP/JSON IDs are not used as evidence; only Stage 1 set
+                # difference plus exact owner/business read-back can confirm.
+                verified = self.verify_new_own_offer(review, before)
+                require(verified.status is InventoryStatus.CONFIRMED, 'READBACK')
+                return self._finish(prepared, 'CONFIRMED', verified.remote_id)
+            except Exception as error:
+                # Never manufacture an attempt, or finish another invocation's
+                # claim if a competing process won the SQLite uniqueness race.
+                if not transport._claimed:
+                    if isinstance(error, PublisherError):
+                        raise
+                    raise PublisherError('TRANSPORT_UNKNOWN') from None
+                outcome = self.outcome(review.draft_id)
+                if outcome['state'] == 'UNKNOWN' and outcome['reason'] == 'CLAIMED':
+                    return self._finish(prepared, 'TRANSPORT_UNKNOWN')
+                return outcome
+            finally:
+                self._dispatch_prepared = None
+                self._own_inventory_baseline = None
 
     def _read_own_inventory(self, review, account):
         """Caller holds runtime gate and Account RLock throughout the snapshot."""
