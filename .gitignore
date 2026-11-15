@@ -32,6 +32,19 @@ bot_settings.json
 /secrets/
 /credentials.local.json
 /config.local.json
+# Databases, backups and key material anywhere in the tree
+*.sqlite3
+*.sqlite3-*
+*.db
+backups/
+*backup*.tar
+*backup*.tar.gz
+*backup*.tgz
+*.pem
+*.p12
+*.pfx
+id_rsa*
+id_ed25519*
 
 # Python
 __pycache__/
