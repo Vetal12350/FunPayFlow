@@ -94,8 +94,13 @@ def test_ambiguous_result_permanent_unknown_no_retry(dispatch, failure):
     if failure == 'timeout': c.post.side_effect = requests.Timeout('PRIVATE')
     elif failure == 'error_json':
         c.response.iter_content = lambda size: [b'{"success":true,"error":"PRIVATE"}']
-    elif failure == 'unknown_json': c.response.iter_content = lambda size: [b'{}']
-    elif failure == 'redirect': c.response.status_code = 302
+        c.after_post = lambda: c.remote.pop(72)
+    elif failure == 'unknown_json':
+        c.response.iter_content = lambda size: [b'{}']
+        c.after_post = lambda: c.remote.pop(72)
+    elif failure == 'redirect':
+        c.response.status_code = 302
+        c.after_post = lambda: c.remote.pop(72)
     elif failure == 'wrong_currency': c.after_post = lambda: c.remote[72].update(currency='EUR')
     elif failure == 'automatic': c.after_post = lambda: c.remote[72].update(auto=True)
     elif failure == 'wrong_id': c.after_post = lambda: c.editors.update({72: editor(c, 999)})
@@ -146,13 +151,24 @@ def test_telegram_late_owner_safe_mode_and_restart_reject_final_button(dispatch,
     assert persisted(c) is None
 
 
-def test_unpatched_runtime_profile_cannot_arm(inventory):
+@pytest.mark.parametrize('body', [b'{"error":"PRIVATE"}', b'{}', b'not json'])
+def test_unclear_response_but_lot_appeared_is_confirmed_by_readback_only(dispatch, body):
+    """The inventory difference is the evidence; the response never is."""
+    c = dispatch
+    c.response.iter_content = lambda size: [body]
+    c.publisher.stage_new(c.review)
+    assert c.publisher.confirm_new(c.review) == {
+        'state': 'CONFIRMED', 'reason': 'CONFIRMED', 'remote_id': 72}
+    assert c.post.call_count == 1
+
+
+def test_incomplete_synthetic_form_cannot_arm_real_profile(inventory):
+    """Real profile: a form without title/description/price controls is rejected."""
     c = inventory
-    with pytest.raises(PublisherError, match='CONTRACT_UNVERIFIED'):
+    with pytest.raises(PublisherError, match='SCHEMA'):
         c.publisher.stage_new(c.review)
     with pytest.raises(PublisherError): c.publisher.confirm_new(c.review)
-    assert c.publisher.outcome(c.draft['id']) is None
-    c.get.assert_not_called()
+    assert c.publisher.outcome(c.draft['id']) is None  # no claim, no POST
 
 
 def test_gate_closes_after_durable_claim_without_dispatch(dispatch, monkeypatch):

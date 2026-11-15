@@ -62,7 +62,10 @@ def test_one_bounded_post_existing_account_lock_durable_claim_no_id_guess(exchan
     assert c.post.call_count == 1
     args, kwargs = c.post.call_args
     assert args == ('https://funpay.com/lots/offerSave',)
-    assert kwargs['data'] == c.envelope.service + c.envelope.business
+    # Currency is verified against the form but never sent (as in save_lot).
+    assert kwargs['data'] == c.envelope.service + tuple(
+        p for p in c.envelope.business if p[0] != 'currency')
+    assert 'currency' in dict(c.envelope.business)
     assert kwargs['timeout'] == (5, 10)
     assert kwargs['allow_redirects'] is False and kwargs['verify'] is True
     assert kwargs['stream'] is True and kwargs['proxies'] == {}

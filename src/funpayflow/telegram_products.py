@@ -18,7 +18,21 @@ from .node_form import (NodeFormError, NodeFormService, safe_form_evidence, safe
 from . import telegram_node_fields as node_ui
 from .product_variants import VariantService
 from .state import StateError
-from .lot_publisher import LotPublisher, PublisherError, PUBLICATION_BLOCKERS, _fresh
+from .lot_publisher import LotPublisher, PublisherError, _fresh
+
+# Owner-facing reasons why the fresh form did not arm "Опубликовать 1 лот".
+PUBLISH_BLOCK_REASONS = {
+    'CONTRACT_UNVERIFIED': 'форма FunPay не загрузилась или её структура не распознана.',
+    'SCHEMA': 'поля формы не совпадают с черновиком (названия, описания, цена или три выбора).',
+    'PRICE': 'на форме не видна валюта цены или она отличается от выбранной.',
+    'NEW_IDENTITY': 'форма не похожа на создание НОВОГО лота.',
+    'CSRF': 'в форме нет защитного токена.',
+    'SCOPE': 'форма открыта не для этого аккаунта или не для Elden Ring (node 986).',
+    'FORM_STALE': 'проверка устарела, откройте черновик заново.',
+    'REVISION': 'черновик изменился, откройте его заново.',
+    'GATE': 'бот в SAFE_MODE или перезапускается.',
+    'ALREADY_CLAIMED': 'по этому черновику уже была попытка публикации.',
+}
 
 
 _flows: dict[int, dict] = {}
@@ -328,11 +342,10 @@ async def _publication_screen(callback, state):
         + '\n'.join(escape(label[:65]) + ': ' + escape(option[:120])
                     for _, _, label, option in review.selections)
         + f'\nЦена: {escape(review.price)} {review.currency or "— выберите валюту"}'
-        '\nКоличество: 1\nВыдача: ручная (запрошена; соответствие форме ещё не доказано).\n'
-        'Видимость: не доказана.\n\n'
-        '<b>Live POST отключён.</b> Следующий шаг — один свежий GET NEW-формы '
-        'без редиректов. Проверка ничего не публикует. '
-        '«Опубликовать 1 лот» недоступно до доказательства NEW-контракта и read-back.')
+        '\nКоличество: 1\nВыдача: ручная.\n'
+        'Видимость: лот создаётся <b>выключенным</b>; включите его на FunPay после проверки.\n\n'
+        'Следующий шаг — свежая проверка формы FunPay (только чтение). '
+        'Если форма подходит, появится отдельная кнопка «Опубликовать 1 лот».')
     rows = [[(currency, f'prd:pub:{token}:{currency}') for currency in ('RUB', 'USD', 'EUR')],
             [('Полный RU', f'prd:pub:{token}:ru'), ('Полный EN', f'prd:pub:{token}:en')]]
     if review.currency:
@@ -399,12 +412,16 @@ async def _publication_callback(callback, user_id, parts, store, routes):
             if result is None:
                 raise PublisherError('CONTRACT_UNVERIFIED') from None
         if result['state'] == 'CONFIRMED':
-            text = f"✅ Независимо подтверждён новый лот ID {result['remote_id']}."
+            text = (f"✅ Лот создан и найден в ваших лотах: ID {result['remote_id']}.\n"
+                    'Он ВЫКЛЮЧЕН. Проверьте его на FunPay и включите вручную.')
         else:
             text = ('🔒 UNKNOWN: отправку не повторять. Проверьте свои лоты на сайте '
                     'только чтением: новый ID, владелец, node 986, все тексты, три выбора, '
                     'цена/валюта, количество 1 и ручная выдача. '
                     'Не очищайте lot_publish_attempts и не обходите барьер копией draft.')
+            server_error = getattr(publisher, 'last_server_error', None)
+            if server_error:
+                text += '\nОтвет FunPay: ' + escape(server_error)
         await _show(callback, text, _menu([[('📝 Мои черновики', 'prd:drafts:0')]]))
         return
     publisher = LotPublisher(routes.client, store, late_check=current)
@@ -422,16 +439,16 @@ async def _publication_callback(callback, user_id, parts, store, routes):
         # Consume before waiting for the Account lock or making any request.
         state['token'] = None
         diagnostics = {}
-        proof, blockers = await asyncio.to_thread(publisher.inspect_new, review, diagnostics=diagnostics)
+        proof, _ = await asyncio.to_thread(publisher.inspect_new, review, diagnostics=diagnostics)
         if not current():
             return
+        blocked = None
         try:
-            # Diagnostics alone cannot arm publication. Only the unavailable
-            # runtime profile adapter may prove a fresh, bounded live contract.
+            # Diagnostics alone cannot arm publication: the transport re-reads
+            # one fresh form and validates it before the button appears.
             await asyncio.to_thread(publisher.stage_new, review)
         except PublisherError as error:
-            if error.reason != 'CONTRACT_UNVERIFIED':
-                raise
+            blocked = error.reason
         else:
             if not current():
                 return
@@ -442,7 +459,7 @@ async def _publication_callback(callback, user_id, parts, store, routes):
                 + '\ncategory 274 · COMMON node 986\n'
                 + '\n'.join(label + ': ' + option for _, _, label, option in review.selections)
                 + f'\nЦена: {review.price} {review.currency}\nКоличество: 1\n'
-                'Выдача: ручная · Видимость: активен\n'
+                'Выдача: ручная · Видимость: ВЫКЛЮЧЕН (включите на FunPay сами)\n'
                 + '\n\n'.join(language.upper() + '\n' + content['title_' + language]
                     + '\n' + content['description_' + language] for language in ('ru', 'en')))
             if not current():
@@ -453,15 +470,14 @@ async def _publication_callback(callback, user_id, parts, store, routes):
                 [('Опубликовать 1 лот', f"prd:pub:{state['token']}:publish")],
                 [('❌ Отмена', f"prd:pub:{state['token']}:cancel")]]))
             return
-        lines = ['🔒 Публикация заблокирована. Выполнена только свежая GET-проверка.',
-                 'Наблюдения формы (verified = структура, не разрешение на POST):']
+        lines = ['🔒 Публикация заблокирована. Выполнена только свежая проверка формы (чтение).',
+                 'Причина: ' + PUBLISH_BLOCK_REASONS.get(blocked, str(blocked)),
+                 'Наблюдения формы:']
         lines += [f'{key}: {proof[key]}' for key in (
             'editor_url', 'document_markup', 'form_subtree', 'submission', 'blank_identity',
             'node_identity', 'csrf_presence', 'control_inventory', 'select_names',
             'currency_control', 'currency', 'manual_control', 'manual_delivery')]
-        lines += [PUBLICATION_BLOCKERS[key] for key in blockers]
-        lines += ['POST не выполнялся; попытка публикации не создавалась. '
-                  'Не используйте save_lot или offer_id=0 как обход. Нужен review NEW-контракта.']
+        lines += ['POST не выполнялся; попытка публикации не создавалась.']
         await _show(callback, escape('\n'.join(lines)), _menu([[('📝 Мои черновики', 'prd:drafts:0')]]))
         if current():
             await callback.message.answer(escape(_publication_diagnostics_text(diagnostics, review.currency)))

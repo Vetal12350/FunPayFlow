@@ -42,6 +42,9 @@ TEXT_FIELDS = {
     'description_ru': 'fields[desc][ru]', 'description_en': 'fields[desc][en]',
 }
 FORM_TTL = 300
+# New lots are created INACTIVE (the form's 'active' checkbox is never sent):
+# the owner reviews the lot on FunPay and switches it on manually.
+PUBLISH_ACTIVE = False
 
 
 class InventoryStatus(str, Enum):
@@ -368,7 +371,7 @@ def build_new_offer(draft, route, template, form, *, owner_id, account_id,
     currency, so it must never be inferred from settings or an existing offer.
     """
     try:
-        require(type(form) is FormContext and form.provenance == 'synthetic-v1',
+        require(type(form) is FormContext and form.provenance in {'synthetic-v1', 'live-v1'},
                 'CONTRACT_UNVERIFIED')
         require(form.owner_id == str(owner_id) and type(account_id) is int
                 and account_id > 0 and type(form.account_id) is int
@@ -389,8 +392,14 @@ def build_new_offer(draft, route, template, form, *, owner_id, account_id,
                 and draft['template_snapshot'] == template, 'REVISION')
         schema = form.schema
         _fresh(schema['fetched_at'], now)
-        require(schema['node_id'] == 986 and draft['node_schema'] == {
-            k: schema[k] for k in ('node_id', 'fields', 'fingerprint', 'fetched_at')}, 'SCHEMA')
+        if form.provenance == 'live-v1':
+            # A freshly fetched form: same node and the same fingerprint as the
+            # saved draft schema; its own fetch time is the freshness anchor.
+            require(schema['node_id'] == 986
+                    and schema['fingerprint'] == draft['node_schema']['fingerprint'], 'SCHEMA')
+        else:
+            require(schema['node_id'] == 986 and draft['node_schema'] == {
+                k: schema[k] for k in ('node_id', 'fields', 'fingerprint', 'fetched_at')}, 'SCHEMA')
         fields = schema['fields']
         names = [f['html_name'] for f in fields]
         require(bool(names) and len(names) == len(set(names))
@@ -441,6 +450,8 @@ class LotPublisher:
         self.clock = clock
         self._own_inventory_baseline = None
         self._confirmation_review = None
+        # FunPay's own short error text from the last attempt (owner UI only).
+        self.last_server_error = None
 
     def _new_contract(self, review, transport):
         """Private runtime adapter only; never accepts a caller's form/proof."""
@@ -517,8 +528,19 @@ class LotPublisher:
                     if isinstance(error, PublisherError):
                         raise
                     raise PublisherError('TRANSPORT_UNKNOWN') from None
+                self.last_server_error = getattr(transport, 'server_error', None)
                 outcome = self.outcome(review.draft_id)
                 if outcome['state'] == 'UNKNOWN' and outcome['reason'] == 'CLAIMED':
+                    # Read-only: the request may still have created the lot. Only
+                    # the independent inventory difference can confirm it; there
+                    # is never a second POST.
+                    if self._own_inventory_baseline is not None:
+                        try:
+                            verified = self.verify_new_own_offer(review, before)
+                        except Exception:
+                            verified = None
+                        if verified is not None and verified.status is InventoryStatus.CONFIRMED:
+                            return self._finish(prepared, 'CONFIRMED', verified.remote_id)
                     return self._finish(prepared, 'TRANSPORT_UNKNOWN')
                 return outcome
             finally:
@@ -553,7 +575,7 @@ class LotPublisher:
             if 'auto_delivery' in fields:
                 require(fields['auto_delivery'] in {'', 'on'}, 'READBACK')
                 require((fields['auto_delivery'] == 'on') == automatic, 'READBACK')
-            matches = matches and currency == review.currency and amount == 1 and not automatic and active
+            matches = matches and currency == review.currency and amount == 1 and not automatic and active is PUBLISH_ACTIVE
             matches = matches and summary_digest in {
                 _inventory_digest(value) for name, value in review.content if name.startswith('title_')}
             offers.append(OwnOffer(offer_id, _inventory_digest((observed, fields)), matches))

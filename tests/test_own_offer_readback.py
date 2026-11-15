@@ -46,10 +46,13 @@ def changed_field(c, html, name, value):
 def trade(c):
     rows = []
     for offer_id, changes in c.remote.items():
-        data = dict(price='15', currency='$', amount='1', auto=False,
+        # FunPay marks inactive own offers with the 'warning' row class; new
+        # lots are published inactive, so that is the default here.
+        data = dict(price='15', currency='$', amount='1', auto=False, active=False,
                     title=escape(c.fields['fields[summary][ru]']))
         data.update(changes)
-        rows.append(f'<a class="tc-item" data-offer="{offer_id}">'
+        css = 'tc-item' if data['active'] else 'tc-item warning'
+        rows.append(f'<a class="{css}" data-offer="{offer_id}">'
             f'<div class="tc-desc-text">{data["title"]}</div>'
             f'<div class="tc-price" data-s="{data["price"]}">'
             f'<span class="unit">{data["currency"]}</span>'
@@ -310,3 +313,12 @@ def test_explicit_editor_conflicts_fail_closed(inventory, name, value):
         f'<input name="{name}" value="{value}"></form>')
     result = verify(c, baseline)
     assert result.status is InventoryStatus.UNKNOWN and result.remote_id is None
+
+
+def test_new_offer_that_came_out_active_is_not_confirmed(inventory):
+    """Lots are published inactive; an active new row is not our lot."""
+    c = inventory
+    baseline = before(c)
+    c.remote[72] = {'active': True}
+    result = verify(c, baseline)
+    assert (result.status, result.reason) == (InventoryStatus.UNKNOWN, InventoryReason.MISMATCH)
