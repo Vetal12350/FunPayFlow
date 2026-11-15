@@ -8,7 +8,7 @@ Issue #156. Код: [deploy_agent.py](../scripts/deploy_agent.py), [build_deploy
 
 1. Запуск: телефон (GitHub → Actions → *Deploy to VPS* → Run workflow) или ПК (`gh workflow run deploy.yml -f sha=<sha> -f action=deploy`). Указывается точный SHA текущего `main`.
 2. `verify` (без секретов): SHA = голова `main`, CI `offline-tests` зелёный, pytest + compileall, сборка wheels по хешам `uv.lock` (FunPayAPI собирается из проверенного sdist здесь, не на сервере), `release.tar` + digest.
-3. `deploy` ждёт **одного подтверждения владельца** в environment `production` (видны SHA и digest).
+3. `deploy` выполняется в environment `production` (секреты доступны только ему). **Решение владельца — merge в `main`**: установить можно только текущую голову `main`, поэтому отдельный Approve не требуется. При желании включить Required reviewers (см. шаг 8) — тогда добавится подтверждение в GitHub.
 4. SSH один раз отправляет `deploy <sha> <digest>` + архив. Агент проверяет digest, запускает отдельный worker (`systemd-run`) и отвечает `ACCEPTED`. Дальше CI только читает `status`.
 5. Worker: распаковка и проверка wheels → venv `releases/<sha>` → `pip install --no-index --only-binary` → проверки (legacy-служба выключена, unit без drop-in и указывает на `current`) → backup SQLite (backup API + integrity_check) → атомарный `current → releases/<sha>` → `systemctl restart` → здоровье (служба active, без автоперезапусков 20 с, `health.json` с этим SHA и `runner=ok`).
 6. Нездоров → автоматический откат на предыдущий релиз. Откат не удался → `NEEDS_OWNER`: новые операции блокируются до ручного разбора.
@@ -19,7 +19,7 @@ Issue #156. Код: [deploy_agent.py](../scripts/deploy_agent.py), [build_deploy
 | Нет ответа 10 минут | Итог UNKNOWN, job красный. Не перезапускать deploy; смотреть `status` |
 | Повторный запуск / параллельный | `BUSY` или `ALREADY_DEPLOYED`; GitHub `concurrency` не отменяет идущий |
 | Прерванный worker | Никогда не продолжается: до переключения → `FAILED` (production не тронут), после → `NEEDS_OWNER` |
-| Ручной откат | Workflow с `action=rollback` и SHA, который сейчас установлен; тоже через подтверждение |
+| Ручной откат | Workflow с `action=rollback` и SHA, который сейчас установлен |
 
 Хранятся последние 3 релиза; backups в каталоге `backups` не удаляются автоматически. Откат кода не откатывает базу: схема меняется только добавлением, а восстановление backup теряет заказы после обновления, поэтому оно только ручное.
 
@@ -50,7 +50,7 @@ Issue #156. Код: [deploy_agent.py](../scripts/deploy_agent.py), [build_deploy
    `restrict,command="sudo -n /usr/local/sbin/funpayflow-deploy-agent" ssh-ed25519 AAAA... funpayflow-deploy`
    Личный ключ `ubuntu` не использовать. Приватную часть после шага 8 удалить с ПК.
 7. **Unit на `current`**: в `/etc/systemd/system/funpayflow.service` заменить путь кода на `/opt/funpayflow/current` (`WorkingDirectory=/opt/funpayflow/current`, `ExecStart=/opt/funpayflow/current/venv/bin/python -m funpayflow.main`), затем **только** `sudo systemctl daemon-reload` (без restart: работающий процесс остаётся на старом коде до первого обновления). Старый каталог кода не удалять — это ручной откат первого обновления.
-8. **GitHub** → Settings → Environments → `production`: Required reviewers = вы; Deployment branches = только `main`. Секреты environment (не repository):
+8. **GitHub** → Settings → Environments → `production`: Deployment branches = только `main`. Required reviewers — не включать (выбран вариант «merge = решение владельца»); включить, если merge будет делать не только владелец. Секреты environment (не repository):
    `DEPLOY_SSH_KEY` (приватный ключ из шага 6), `DEPLOY_HOST`, `DEPLOY_USER=funpayflow-deploy`, `DEPLOY_KNOWN_HOSTS` (строка из `ssh-keyscan -t ed25519 <host>`, сверенная с отпечатком на сервере `ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub`).
 9. **Первое обновление**: Run workflow с SHA текущего `main`, подтвердить. Предыдущего релиза у агента ещё нет, поэтому при сбое будет `NEEDS_OWNER`: вернуть старый путь в unit, `daemon-reload`, `restart`, удалить `/var/lib/funpayflow-deploy/jobs/<sha>.json`.
 
@@ -60,7 +60,7 @@ Issue #156. Код: [deploy_agent.py](../scripts/deploy_agent.py), [build_deploy
 
 ## Остаточные риски
 
-- Ключ CI даёт только эти три команды, но любой, кто получит его **и** сможет собрать архив, запустит свой код в службе. Ключ хранится только в environment `production`, доступен лишь после вашего подтверждения.
+- Ключ CI даёт только эти три команды, но любой, кто получит его **и** сможет собрать архив, запустит свой код в службе. Ключ хранится только в environment `production` и доступен только workflow из `main`. Без Required reviewers обновить может любой, кто способен запустить workflow в репозитории: держите доступ на запись только у себя и merge делайте сами.
 - Служба по историческим данным работает от root; перевод на отдельного пользователя — отдельный шаг, не требуется для автообновления.
 - Ручной `rollback` выполняется в SSH-сессии; при обрыве во время него итог проверять по `status`.
 - `actions/upload-artifact@v4` / `download-artifact@v4` закреплены тегом, не SHA; закрепить при ревью.

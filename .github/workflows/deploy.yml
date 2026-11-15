@@ -2,8 +2,9 @@ name: Deploy to VPS
 
 # Manual only: phone (GitHub app -> Actions -> Run workflow) or the Windows
 # Control Center (`gh workflow run deploy.yml -f sha=<sha> -f action=deploy`).
-# The `production` environment must require the owner's approval; secrets live
-# only in that environment. See docs/VPS_AUTO_UPDATE.md.
+# Only the current head of main can be installed, so the owner's merge is the
+# decision; `production` may additionally require reviewers. Secrets live only in
+# that environment. See docs/VPS_AUTO_UPDATE.md.
 on:
   workflow_dispatch:
     inputs:
