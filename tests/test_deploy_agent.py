@@ -208,13 +208,18 @@ def test_rollback_failure_needs_owner_and_blocks_new_jobs(env):
 
 
 def test_automatic_restart_loop_counts_as_unhealthy(env):
+    """The new process crashes after start and systemd restarts it."""
     agent, host = env
     original = host.run
+    seen = {"polls": 0}
 
     def crashing(argv, timeout=300):
         rc, out = original(argv, timeout)
-        if argv[:2] == ["systemctl", "restart"] and host._current() == NEW:
-            host.restarts += 1
+        if argv[:2] == ["systemctl", "show"] and host._current() == NEW:
+            seen["polls"] += 1
+            if seen["polls"] == 3:          # crash + automatic restart
+                host.restarts += 1
+                host.pid += 1
         return rc, out
     host.run = crashing
     assert deploy(agent) == "ROLLED_BACK"
@@ -400,3 +405,19 @@ def test_drop_ins_are_fine_when_effective_execstart_uses_current(env):
     agent, host = env
     host.dropins = "/etc/systemd/system/funpayflow.service.d/97-x.conf /etc/systemd/system/funpayflow.service.d/99-funpayflow-autoupdate.conf"
     assert deploy(agent) == "DEPLOYED"
+
+
+def test_restart_counter_reset_by_explicit_restart_is_not_a_crash(env):
+    """Real server: NRestarts was >0 before; systemctl restart resets it to 0."""
+    agent, host = env
+    host.restarts = 3
+    original = host.run
+
+    def reset_on_restart(argv, timeout=300):
+        rc, out = original(argv, timeout)
+        if argv[:2] == ["systemctl", "restart"]:
+            host.restarts = 0
+        return rc, out
+    host.run = reset_on_restart
+    assert deploy(agent) == "DEPLOYED"
+    assert agent.current_sha() == NEW
