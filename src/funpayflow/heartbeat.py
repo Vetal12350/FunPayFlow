@@ -24,7 +24,12 @@ _SHA = re.compile(r"[0-9a-f]{40}")
 
 
 def release_sha(prefix: str | None = None) -> str | None:
-    venv = Path(prefix if prefix is not None else sys.prefix)
+    # The unit starts .../current/venv/bin/python where `current` is a symlink
+    # to releases/<sha>: resolve it, or the release would never be recognized.
+    try:
+        venv = Path(prefix if prefix is not None else sys.prefix).resolve()
+    except OSError:
+        return None
     if venv.name != "venv":
         return None
     name = venv.parent.name

@@ -23,36 +23,31 @@ Issue #156. Код: [deploy_agent.py](../scripts/deploy_agent.py), [build_deploy
 
 Хранятся последние 3 релиза; backups в каталоге `backups` не удаляются автоматически. Откат кода не откатывает базу: схема меняется только добавлением, а восстановление backup теряет заказы после обновления, поэтому оно только ручное.
 
-## Разовая настройка (владелец, вручную)
+## Разовая настройка (владелец, одна команда)
 
-Пути — пример; используйте фактические. Значения секретов никуда не копируйте, кроме указанных мест.
+Скрипт [vps_bootstrap.sh](../scripts/vps_bootstrap.sh) делает всё сам и **не перезапускает бота**,
+не читает `.env`, повторный запуск безопасен. `<COMMIT>` — коммит `main`, который назовёт агент.
 
-1. **Проверить сервер** по [PRODUCTION](PRODUCTION.md) «Что заново проверить»: одна служба `funpayflow.service`, `funpay-bot.service` выключена (`disable --now`), архитектура x86_64, есть Python 3.13 с модулем `venv`.
-2. **Пользователь для SSH** без пароля и прав: `sudo adduser --disabled-password --gecos "" funpayflow-deploy`.
-3. **Агент** (root-owned, после ревью кода из `main`):
-   `sudo install -o root -g root -m 0755 scripts/deploy_agent.py /usr/local/sbin/funpayflow-deploy-agent`
-4. **Конфиг** `/etc/funpayflow-deploy/config.json` (root, 0600):
-   ```json
-   {"root": "/var/lib/funpayflow-deploy", "releases": "/opt/funpayflow/releases",
-    "current": "/opt/funpayflow/current", "data_dir": "/root/FunPayFlow-data",
-    "backups": "/var/backups/funpayflow", "service": "funpayflow.service",
-    "forbidden_services": ["funpay-bot.service"], "python": "/usr/bin/python3.13",
-    "keep_releases": 3, "health_timeout": 180, "health_stable": 20,
-    "require_heartbeat": true, "min_free_mb": 1024}
+1. На сервере (под `ubuntu`):
+   ```bash
+   curl -fsSLo /tmp/fpf-bootstrap.sh https://raw.githubusercontent.com/Vetal12350/FunPayFlow/<COMMIT>/scripts/vps_bootstrap.sh
+   sudo bash /tmp/fpf-bootstrap.sh --ref <COMMIT>
    ```
-   `data_dir` — фактический `FUNPAY_BOT_DATA_DIR` службы.
-5. **sudo** (`sudo visudo -f /etc/sudoers.d/funpayflow-deploy`), ровно:
-   ```
-   Defaults!/usr/local/sbin/funpayflow-deploy-agent env_keep += "SSH_ORIGINAL_COMMAND"
-   funpayflow-deploy ALL=(root) NOPASSWD: /usr/local/sbin/funpayflow-deploy-agent ""
-   ```
-6. **Ключ только для CI**: на своём ПК `ssh-keygen -t ed25519 -N "" -C funpayflow-deploy -f funpayflow_deploy`. Публичную часть — в `/home/funpayflow-deploy/.ssh/authorized_keys` (владелец пользователь, 0600):
-   `restrict,command="sudo -n /usr/local/sbin/funpayflow-deploy-agent" ssh-ed25519 AAAA... funpayflow-deploy`
-   Личный ключ `ubuntu` не использовать. Приватную часть после шага 8 удалить с ПК.
-7. **Unit на `current`**: в `/etc/systemd/system/funpayflow.service` заменить путь кода на `/opt/funpayflow/current` (`WorkingDirectory=/opt/funpayflow/current`, `ExecStart=/opt/funpayflow/current/venv/bin/python -m funpayflow.main`), затем **только** `sudo systemctl daemon-reload` (без restart: работающий процесс остаётся на старом коде до первого обновления). Старый каталог кода не удалять — это ручной откат первого обновления.
-8. **GitHub** → Settings → Environments → `production`: Deployment branches = только `main`. Required reviewers — не включать (выбран вариант «merge = решение владельца»); включить, если merge будет делать не только владелец. Секреты environment (не repository):
-   `DEPLOY_SSH_KEY` (приватный ключ из шага 6), `DEPLOY_HOST`, `DEPLOY_USER=funpayflow-deploy`, `DEPLOY_KNOWN_HOSTS` (строка из `ssh-keyscan -t ed25519 <host>`, сверенная с отпечатком на сервере `ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub`).
-9. **Первое обновление**: Run workflow с SHA текущего `main`, подтвердить. Предыдущего релиза у агента ещё нет, поэтому при сбое будет `NEEDS_OWNER`: вернуть старый путь в unit, `daemon-reload`, `restart`, удалить `/var/lib/funpayflow-deploy/jobs/<sha>.json`.
+   Скрипт проверяет: одна `funpayflow.service`, `funpay-bot.service` не активна, нет drop-in,
+   `FUNPAY_BOT_DATA_DIR` задан, бот на Python 3.13, x86_64. Затем: пользователь
+   `funpayflow-deploy` с forced command, агент того же коммита, конфиг, правило sudo
+   (проверено `visudo`), текущий код регистрируется как первый релиз (цель отката даже
+   для первого обновления), в юните меняется **только** `ExecStart` на
+   `/opt/funpayflow/current/venv/bin/python` (копия `*.before-autoupdate`), `daemon-reload`.
+   В конце печатает 4 секрета.
+2. **GitHub** → Settings → Environments → `production` (создать): Deployment branches —
+   только `main`. Environment secrets: `DEPLOY_HOST`, `DEPLOY_USER`, `DEPLOY_KNOWN_HOSTS`,
+   `DEPLOY_SSH_KEY` — скопировать из вывода. Required reviewers не включать
+   (решение владельца — merge), включить, если merge делает не только владелец.
+3. Удалить приватный ключ с сервера командой, которую напечатал скрипт.
+4. Первое обновление — когда владелец рядом с ПК (первый перезапуск на новом пути).
+
+Откат настройки: `sudo cp <unit>.before-autoupdate <unit> && sudo systemctl daemon-reload`.
 
 ## Разбор `NEEDS_OWNER`
 

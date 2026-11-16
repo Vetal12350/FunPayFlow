@@ -98,3 +98,16 @@ def test_deploy_agent_accepts_application_heartbeat(tmp_path):
     assert not agent_mod.Agent.heartbeat_ok(agent, "d" * 40, 100.0)
     heartbeat.write_heartbeat(tmp_path / "health.json", SHA, "backoff", 200.0)
     assert not agent_mod.Agent.heartbeat_ok(agent, SHA, 100.0)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="symlink layout of the Linux deploy agent")
+def test_release_sha_follows_the_current_symlink(tmp_path):
+    release = tmp_path / "releases" / SHA / "venv"
+    release.mkdir(parents=True)
+    (tmp_path / "current").symlink_to(tmp_path / "releases" / SHA)
+    assert heartbeat.release_sha(str(tmp_path / "current" / "venv")) == SHA
+    old = tmp_path / "stage" / ".venv"
+    old.mkdir(parents=True)
+    (tmp_path / "releases" / ("0" * 40)).mkdir()
+    (tmp_path / "releases" / ("0" * 40) / "venv").symlink_to(old)
+    assert heartbeat.release_sha(str(tmp_path / "releases" / ("0" * 40) / "venv")) is None
