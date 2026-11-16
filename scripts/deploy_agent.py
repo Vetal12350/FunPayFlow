@@ -410,17 +410,25 @@ class Agent:
     def healthy(self, sha: str, before: dict, heartbeat: bool) -> bool:
         started = self.host.now()
         deadline = started + self.c["health_timeout"]
-        restarts = before.get("NRestarts") or "0"
+        # systemd resets NRestarts on an explicit restart, so the baseline is
+        # the first value seen AFTER our restart; any later increase means
+        # the new process crashed and was restarted automatically.
+        restarts = None
         stable_since = None
         pid = None
         while self.host.now() < deadline:
             s = self._service_state()
-            up = s["ActiveState"] == "active" and s["SubState"] == "running" \
-                and s["MainPID"] not in ("", "0") and s["NRestarts"] == restarts \
-                and s["ActiveEnterTimestampMonotonic"] != before.get(
-                    "ActiveEnterTimestampMonotonic")
-            if s["ActiveState"] == "failed" or s["NRestarts"] != restarts:
+            if s["ActiveState"] == "failed":
                 return False
+            entered = s["ActiveEnterTimestampMonotonic"] != before.get(
+                "ActiveEnterTimestampMonotonic")
+            if entered:
+                if restarts is None:
+                    restarts = s["NRestarts"]
+                elif s["NRestarts"] != restarts:
+                    return False
+            up = entered and s["ActiveState"] == "active" and s["SubState"] == "running" \
+                and s["MainPID"] not in ("", "0")
             if up and s["MainPID"] == pid:
                 if self.host.now() - stable_since >= self.c["health_stable"] and (
                         not heartbeat or self.heartbeat_ok(sha, started)):
