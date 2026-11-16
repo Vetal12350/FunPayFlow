@@ -409,6 +409,8 @@ class RestartLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 "_supervise_tasks": supervise,
                 "set_runtime_status_context": lambda *args: None,
                 "start_heartbeat": lambda client: None,
+                "plugins": __import__("funpayflow.plugins", fromlist=["host"]),
+                "is_safe_mode_enabled": lambda: False,
                 "stop_heartbeat": stop_heartbeat,
                 "clear_runtime_status_context": lambda: None,
                 "os": SimpleNamespace(name="posix"),

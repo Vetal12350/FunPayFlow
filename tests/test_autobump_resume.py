@@ -537,6 +537,8 @@ class LoopPolicyTests(unittest.IsolatedAsyncioTestCase):
                     'os': SimpleNamespace(name='posix'), 'RuntimeAction': RuntimeAction,
                     'set_runtime_status_context': lambda _: None,
                     'start_heartbeat': lambda client: None,
+                    'plugins': __import__('funpayflow.plugins', fromlist=['host']),
+                    'is_safe_mode_enabled': lambda: False,
                     'stop_heartbeat': stop_heartbeat,
                     'clear_runtime_status_context': lambda: None,
                     '_supervise_tasks': supervise, 'get_all_recipients': lambda: [1],

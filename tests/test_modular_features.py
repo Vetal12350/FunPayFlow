@@ -623,6 +623,7 @@ class WorkerGateTests(ModuleStateMixin, unittest.IsolatedAsyncioTestCase):
                      "ReviewCheckEvent": type("ReviewCheckEvent", (), {}),
                      "ActionKind": ActionKind, "module_enabled": ui.module_enabled,
                      "_order_observation": lambda event: None,
+                     "plugins": __import__("funpayflow.plugins", fromlist=["host"]),
                      "get_all_recipients": lambda: [100],
                      "get_user_settings": lambda uid: {"notifications_enabled": True,
                                                        "notify_message": True},

@@ -15,6 +15,7 @@ from dotenv import load_dotenv
 from aiogram import Bot
 from .runtime_paths import runtime_file
 from .heartbeat import start_heartbeat, stop_heartbeat
+from . import plugins
 
 load_dotenv(runtime_file(".env"))
 
@@ -733,6 +734,7 @@ async def notifications_loop(bot: Bot, client: FunPayClient):
                 await refill_backlog()
                 continue
 
+            plugins.host.dispatch(event)
             review_completion_gate = None
             observation = _order_observation(event)
             if observation is not None:
@@ -1067,9 +1069,14 @@ async def main():
         logger.success("Бот подключен к Telegram. Запуск фоновых процессов...")
         set_runtime_status_context(client)
         heartbeat = start_heartbeat(client)
+        plugins.load_from_env()
+        loop = asyncio.get_running_loop()
+        plugins.host.bind(client, lambda text: asyncio.run_coroutine_threadsafe(
+            _send_runtime_notice(bot, text), loop), is_safe_mode_enabled)
         try:
             action = await _supervise_tasks(bot, client)
         finally:
+            plugins.host.unbind()
             await stop_heartbeat(heartbeat)
     finally:
         clear_runtime_status_context()

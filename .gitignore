@@ -32,6 +32,8 @@ bot_settings.json
 /secrets/
 /credentials.local.json
 /config.local.json
+# Local optional plugins (kept outside version control)
+/plugins/
 # Databases, backups and key material anywhere in the tree
 *.sqlite3
 *.sqlite3-*
