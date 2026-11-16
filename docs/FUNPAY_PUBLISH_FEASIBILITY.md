@@ -1,5 +1,82 @@
 # Создание лота FunPay: evidence и блокер
 
+## 2026-11-15: живой профиль NEW-формы включён (поверх Issue 153)
+
+**LIVE POST REACHABLE: YES, после deployment и только по кнопке владельца.**
+`NewOfferTransport._fresh_contract` делает один свежий GET `lots/offerEdit?node=986`
+тем же Account под RLock и собирает отправку так же, как FunPayAPI 1.1.0
+`get_lot_fields` + `save_lot`: все собственные controls формы (CSRF, `offer_id`,
+`node_id`, `form_created_at` и т. п.) передаются без изменений, из черновика
+подставляются только RU/EN название и описание, цена, количество 1 и три выбора;
+`location=trade`. **Никогда не отправляются** `active`, `auto_delivery`,
+`deactivate_after_sale`, `secrets`, `currency`: лот создаётся **выключенным**
+с ручной выдачей, владелец проверяет и включает его на FunPay сам.
+
+Перед кнопкой и перед отправкой проверяются: структура формы (URL, action/method,
+разметка), NodeForm-парсер (NEW, node 986, userId), тот же fingerprint и три выбора,
+`offer_id` пустой или `0`, `node_id=986`, непустой CSRF, наличие полей текста/цены/
+количества и **валюта у поля цены** (`span.form-control-feedback`, addon или label):
+она должна совпасть с выбранной владельцем, иначе `PRICE`. `_require_live_contract`
+пропускает только конверт, собранный этим же экземпляром из свежей формы (≤ 300 с).
+
+Ответ сервера не считается доказательством. Явная ошибка FunPay сохраняется как
+короткий текст для владельца (только в Telegram). После любой отправки, в том числе
+при таймауте/ошибке/неясном ответе, выполняется одна независимая сверка
+своих лотов node 986: CONFIRMED только при ровно одном новом **неактивном** лоте
+с совпадающими данными; иначе постоянный UNKNOWN без повтора.
+
+Тесты: `tests/test_live_offer_form.py` (реалистичная форма, без подмены proof-границ),
+обновлены dispatch/preview/readback. Полный офлайн-набор: 2414 passed.
+Живой POST не выполнялся. Если реальная форма отличается (например, валюта не видна
+у цены), кнопка не появится, а Telegram покажет причину.
+
+## Issue 153, Stage 2: интеграция owner confirm → один dispatch → read-back
+
+**LIVE POST REACHABLE: NO.** Реальный профиль NEW-формы отсутствует:
+`NewOfferTransport._fresh_contract` и `_require_live_contract` отклоняют вызов
+с `CONTRACT_UNVERIFIED`. Нет флага, environment switch, synthetic provenance или
+пользовательского proof, включающего POST. Для открытия границы нужен проверенный
+runtime adapter одного свежего authenticated NEW GET: literal NEW identity,
+точные action/method/CSRF/hidden/submit controls, наблюдаемая валюта цены,
+явная ручная выдача и active visibility. Нельзя заменить это `offer_id=0`,
+отсутствием secrets или предполагаемым RUB. Проверка receipt JSON тоже пока
+консервативная: только literal success=true без error/errors/message; прочие
+ответы UNKNOWN. Это не заявление о реальном FunPay response contract.
+
+Добавлен фактический интегрированный путь `stage_new` / `confirm_new`: отдельный
+Telegram owner-confirm с полными RU/EN текстами и business summary, одноразовый
+in-memory intent, повторные scope/revision/route/runtime gates, independent
+inventory BEFORE, новый transient contract непосредственно перед dispatch,
+существующий SQLite UNKNOWN claim до transport и ровно один bounded POST.
+Только Stage 1 independent read-back может записать CONFIRMED и новый ID;
+ID из JSON игнорируется. Timeout/error/redirect/неполный inventory/изменение
+прежнего лота сохраняют постоянный UNKNOWN; retry и reset не добавлены.
+Кнопка «Опубликовать 1 лот» появляется только после успешного private runtime
+proof, поэтому в текущей сборке недоступна. Raw формы/CSRF не сохраняются в
+Telegram state, SQLite или отчёте. Scope остаётся 274 / COMMON 986 / GAME_KEY,
+три SELECT, quantity=1, manual; проверка остальных лотов ограничена node 986.
+
+Следующее действие владельца **после отдельно разрешённого будущего deployment**:
+открыть сохранённый Elden Ring draft → PREVIEW → явно выбрать валюту →
+«Проверить NEW-форму (GET)». В разделе «Данные формы / диагностика» проверить
+selector/price currency и OBSERVED_MATCH, auto_delivery/active, Action/method/submit
+и hidden presence. В самой видимой NEW-форме нужны секции цены с обозначением
+валюты, ручной выдачи и активности. Эти безопасные наблюдения нужны для review
+runtime mapping; они не разблокируют публикацию. Не присылать HTML, CSRF, cookies,
+HAR или credentials. Настоящий POST и live ID в этой source-only задаче не проверялись.
+
+Regression: `test_publication_dispatch.py` соединяет Telegram, настоящий parser
+Stage 1, temporary SQLite и mocked transport; обе private proof-границы заменены
+только в тесте. Проверяются ровно один POST, независимый ID, permanent claim,
+duplicates, late gates и UNKNOWN. Старые разделы ниже описывают предшествующие этапы.
+
+Проверки Stage 2: 620 targeted tests passed (dispatch/transport/preview/read-back/
+publisher/wire/Telegram/NodeForm), `git diff --check` и syntax parsing пройдены.
+Полный suite: 2293 passed, 3 failed из-за Windows sandbox (Git Bash signal pipe
+Win32 error 5; два installer/release smoke — отказ доступа к uv cache).
+Pytest scratch — только `tests/.offline-tmp/`; для Windows mkdir mode 0700
+заменён на 0777 только в тестовом процессе, без изменения приложения/тестов.
+
 ## Issue 151, Stage 1: независимый GET-only own-inventory read-back
 
 `LotPublisher.capture_own_inventory(review)` создаёт transient baseline;

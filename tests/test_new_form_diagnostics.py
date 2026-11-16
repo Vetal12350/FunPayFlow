@@ -206,7 +206,7 @@ def test_owner_get_diagnostic_redacted_transient_and_single_use(saved, caplog):
         assert 'inspect' not in str(cb.message.edit_text.call_args.kwargs['reply_markup'])
         replay = await send(request)
         assert 'Данные формы' not in str(replay.message.answer.call_args_list)
-        assert c.get.call_count == 1
+        assert c.get.call_count == 2  # diagnostics + contract check, replay makes none
     asyncio.run(run())
     assert database_snapshot(c) == before
     assert CANARY not in caplog.text

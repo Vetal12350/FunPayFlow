@@ -113,7 +113,7 @@ def test_saved_preview_explicit_currency_fresh_inspection_no_false_success(saved
         text = cb.message.edit_text.call_args.args[0]
         for expected in ('Elden Ring', '274', '986', 'PC', 'Европа', c.draft['payload']['price'] + ' USD', 'Количество: 1', 'ручная'):
             assert expected in text
-        assert 'Live POST отключён' in text
+        assert 'выключенным' in text and 'Опубликовать 1 лот' in text
         c.get.assert_not_called()
         cb = await send(action('ru'))
         assert c.draft['payload']['title_ru'] in cb.message.answer.call_args.args[0]
@@ -122,12 +122,13 @@ def test_saved_preview_explicit_currency_fresh_inspection_no_false_success(saved
         text = cb.message.edit_text.call_args.args[0]
         assert 'Публикация заблокирована' in text
         assert 'POST не выполнялся' in text
-        for key in ('NEW_SEMANTICS', 'MANUAL_MAPPING', 'CURRENCY_MAPPING', 'VISIBILITY_MAPPING',
-                    'SUBMIT_CONTROLS', 'RESPONSE_ID', 'OWNER_READBACK'):
-            assert PUBLICATION_BLOCKERS[key] in text
-        assert c.get.call_count == 1
+        # The synthetic form has no title/description controls: explicit reason.
+        assert 'Причина: поля формы не совпадают с черновиком' in text
+        assert 'Опубликовать 1 лот' not in str(cb.message.edit_text.call_args.kwargs['reply_markup'])
+        # Two read-only GETs: diagnostics, then the contract check before a button.
+        assert c.get.call_count == 2
         await send(request)
-        assert c.get.call_count == 1
+        assert c.get.call_count == 2
     asyncio.run(run())
     assert database_snapshot(c) == before
     assert 'SYNTHETIC-PRIVATE-CANARY' not in caplog.text
@@ -246,7 +247,7 @@ def test_currency_token_rotation_and_simultaneous_double_click(saved):
         assert view._flows[1]['publication']['token'] == token
         intent = action('inspect')
         await asyncio.gather(send(intent), send(intent))
-        assert c.get.call_count == 1
+        assert c.get.call_count == 2  # one consumed intent: diagnostics + contract GET
     asyncio.run(run())
 
 
