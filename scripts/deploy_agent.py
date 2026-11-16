@@ -330,7 +330,7 @@ class Agent:
             require(out.strip() in ("inactive", "failed", "unknown", ""), "LEGACY_ACTIVE")
         state = self._service_state()
         require(state["LoadState"] == "loaded", "SERVICE_MISSING")
-        require(state["DropInPaths"] == "", "UNIT_DROPIN")
+        # Drop-ins are allowed: the EFFECTIVE ExecStart must use `current`.
         require(str(self.current) in state["ExecStart"], "UNIT_NOT_ON_CURRENT")
         require(self.current_sha() == job["previous"], "CURRENT_CHANGED")
 

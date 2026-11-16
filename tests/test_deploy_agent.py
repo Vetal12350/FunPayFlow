@@ -279,7 +279,6 @@ def test_tampered_wheel_digest_fails(env):
 
 @pytest.mark.parametrize("setup,code", [
     (lambda h: setattr(h, "legacy", "active"), "LEGACY_ACTIVE"),
-    (lambda h: setattr(h, "dropins", "/etc/systemd/system/x.d/o.conf"), "UNIT_DROPIN"),
     (lambda h: setattr(h, "exec_path", "/root/other/python"), "UNIT_NOT_ON_CURRENT"),
     (lambda h: setattr(h, "pip_rc", 1), "INSTALL_FAILED"),
     (lambda h: setattr(h, "free", 10), "LOW_DISK"),
@@ -395,3 +394,9 @@ def test_config_validation():
         agent_mod.validate_config({"root": "relative"})
     with pytest.raises(agent_mod.Rejected):
         agent_mod.load_config(Path("/nonexistent/funpayflow/config.json"))
+
+
+def test_drop_ins_are_fine_when_effective_execstart_uses_current(env):
+    agent, host = env
+    host.dropins = "/etc/systemd/system/funpayflow.service.d/97-x.conf /etc/systemd/system/funpayflow.service.d/99-funpayflow-autoupdate.conf"
+    assert deploy(agent) == "DEPLOYED"

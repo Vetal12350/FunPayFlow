@@ -14,8 +14,9 @@
 #  4. /etc/funpayflow-deploy/config.json and a narrow sudoers rule;
 #  5. releases/<current sha> pointing at the CURRENT code, so even the first
 #     update has an automatic rollback target;
-#  6. the unit's ExecStart -> /opt/funpayflow/current/venv/bin/python
-#     (backup kept) + daemon-reload ONLY: the running bot is not touched;
+#  6. a last drop-in 99-funpayflow-autoupdate.conf sets ExecStart to
+#     /opt/funpayflow/current/venv/bin/python (the unit file and any older
+#     drop-ins stay untouched) + daemon-reload ONLY: the running bot is not touched;
 #  7. a dedicated SSH key for GitHub Actions; prints the 4 GitHub secrets.
 set -euo pipefail
 umask 077
@@ -56,18 +57,20 @@ say "Проверка сервера"
 [ "$(systemctl show -p LoadState --value "$SERVICE")" = "loaded" ] || die "$SERVICE не найден"
 legacy_state="$(systemctl is-active "$LEGACY" 2>/dev/null || true)"
 [ "$legacy_state" != "active" ] || die "старая служба $LEGACY активна: два бота одновременно запрещены"
-[ -z "$(systemctl show -p DropInPaths --value "$SERVICE")" ] || die "у $SERVICE есть drop-in: настройте вручную"
 UNIT="$PREFIX$(systemctl show -p FragmentPath --value "$SERVICE")"
 [ -f "$UNIT" ] || die "файл юнита не найден"
+DROPIN_DIR="$UNIT.d"
+OUR_DROPIN="$DROPIN_DIR/99-funpayflow-autoupdate.conf"
 data_dir="$(systemctl show -p Environment --value "$SERVICE" | tr ' ' '\n' \
             | sed -n 's/^FUNPAY_BOT_DATA_DIR=//p' | tr -d '"' | head -n1)"
 [[ "$data_dir" == /* ]] || die "в юните не задан абсолютный FUNPAY_BOT_DATA_DIR"
 [ -f "$PREFIX$data_dir/state.sqlite3" ] || die "в $data_dir нет state.sqlite3"
 
-exec_line="$(grep -E '^ExecStart=' "$UNIT")"
-[ "$(grep -cE '^ExecStart=' "$UNIT")" = 1 ] || die "в юните не одна строка ExecStart"
-old_python="$(sed -E 's/^ExecStart=([^ ]+) -m funpayflow\.main$/\1/' <<<"$exec_line")"
-[ "$old_python" != "$exec_line" ] || die "ExecStart не вида '<python> -m funpayflow.main'"
+# The EFFECTIVE command line (unit + all drop-ins), as systemd runs it.
+exec_line="$(systemctl show -p ExecStart --value "$SERVICE")"
+old_python="$(sed -nE 's/.*argv\[\]=([^ ]+) -m funpayflow\.main ;.*/\1/p' <<<"$exec_line")"
+[ -n "$old_python" ] && [ "$(grep -o 'argv\[\]=' <<<"$exec_line" | wc -l)" = 1 ] \
+  || die "фактический ExecStart не вида '<python> -m funpayflow.main'"
 CURRENT_PY="/opt/funpayflow/current/venv/bin/python"
 if [ "$old_python" = "$CURRENT_PY" ]; then
   say "Юнит уже переведён на $CURRENT_PY"
@@ -149,10 +152,16 @@ fi
 
 # ------------------------------------- 6. unit -> current (no restart)
 if [ "$old_python" != "$CURRENT_PY" ]; then
-  say "Перевожу ExecStart на $CURRENT_PY (без перезапуска)"
-  cp -p "$UNIT" "$UNIT.before-autoupdate"
-  sed -i "s|^ExecStart=.*|ExecStart=$CURRENT_PY -m funpayflow.main|" "$UNIT"
+  say "Добавляю $OUR_DROPIN: ExecStart -> $CURRENT_PY (без перезапуска)"
+  install -d -m 0755 "$DROPIN_DIR"
+  printf '[Service]\nExecStart=\nExecStart=%s -m funpayflow.main\n' "$CURRENT_PY" > "$OUR_DROPIN"
+  chmod 0644 "$OUR_DROPIN"
   systemctl daemon-reload
+  if ! systemctl show -p ExecStart --value "$SERVICE" | grep -qF "argv[]=$CURRENT_PY -m funpayflow.main"; then
+    rm -f "$OUR_DROPIN"
+    systemctl daemon-reload
+    die "systemd не применил $OUR_DROPIN (другой drop-in важнее?) — файл удалён"
+  fi
 fi
 
 # --------------------------------------------------------- 7. SSH key
@@ -186,4 +195,4 @@ if [ -f "$key" ]; then
   echo "После копирования удалите ключ с сервера:  sudo rm -f $key $key.pub"
 fi
 echo
-echo "Откат настройки: sudo cp $UNIT.before-autoupdate $UNIT && sudo systemctl daemon-reload"
+echo "Откат настройки: sudo rm -f ${OUR_DROPIN#$PREFIX} && sudo systemctl daemon-reload"

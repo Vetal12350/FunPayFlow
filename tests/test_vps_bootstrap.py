@@ -28,8 +28,15 @@ case "$1" in
     prop="${3}"
     case "$prop" in
       LoadState) echo loaded ;;
-      DropInPaths) echo "${FAKE_DROPIN:-}" ;;
+      DropInPaths) ls "$FPF_PREFIX"/etc/systemd/system/funpayflow.service.d/*.conf 2>/dev/null | tr '\n' ' ' ;;
       FragmentPath) echo /etc/systemd/system/funpayflow.service ;;
+      ExecStart)
+        py="${FAKE_EXEC:-/root/stage/.venv/bin/python}"
+        if [ -z "${FAKE_IGNORE_DROPIN:-}" ] && \
+           [ -f "$FPF_PREFIX/etc/systemd/system/funpayflow.service.d/99-funpayflow-autoupdate.conf" ]; then
+          py=/opt/funpayflow/current/venv/bin/python
+        fi
+        echo "{ path=$py ; argv[]=$py -m funpayflow.main ; ignore_errors=no ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }" ;;
       Environment) echo 'FUNPAY_BOT_DATA_DIR=/root/FunPayFlow-data' ;;
       WorkingDirectory) echo /root/stage ;;
     esac ;;
@@ -121,12 +128,12 @@ def test_full_setup_without_touching_the_running_bot(box):
     current = p / "opt/funpayflow/current"
     assert current.is_symlink() and Path(os.readlink(current)).name == "0" * 40
     assert (current / "venv/bin/python").exists()
-    # Only ExecStart changed; backup kept; daemon-reload, never restart/stop/start.
-    unit = box.unit.read_text()
-    assert "ExecStart=/opt/funpayflow/current/venv/bin/python -m funpayflow.main" in unit
-    assert unit.replace("/opt/funpayflow/current/venv/bin/python",
-                        "/root/stage/.venv/bin/python") == original_unit
-    assert Path(str(box.unit) + ".before-autoupdate").read_text() == original_unit
+    # Unit file untouched; our last drop-in overrides ExecStart; daemon-reload only.
+    assert box.unit.read_text() == original_unit
+    dropin = Path(str(box.unit) + ".d") / "99-funpayflow-autoupdate.conf"
+    assert dropin.read_text() == ("[Service]\nExecStart=\n"
+                                  "ExecStart=/opt/funpayflow/current/venv/bin/python -m funpayflow.main\n")
+    assert "sudo rm -f /etc/systemd/system/funpayflow.service.d/99-funpayflow-autoupdate.conf" in result.stdout
     log = calls(box)
     assert "systemctl daemon-reload" in log and "FORBIDDEN" not in log
     assert "useradd --create-home --shell /bin/bash funpayflow-deploy" in log
@@ -142,18 +149,19 @@ def test_full_setup_without_touching_the_running_bot(box):
 def test_second_run_is_idempotent(box):
     assert run(box).returncode == 0
     keys = (box.p / "home/funpayflow-deploy/.ssh/authorized_keys").read_text()
-    unit = box.unit.read_text()
+    dropin = Path(str(box.unit) + ".d") / "99-funpayflow-autoupdate.conf"
+    first = dropin.read_text()
     again = run(box)
     assert again.returncode == 0, again.stderr
     assert (box.p / "home/funpayflow-deploy/.ssh/authorized_keys").read_text() == keys
-    assert box.unit.read_text() == unit
+    assert dropin.read_text() == first and "уже переведён" in again.stdout
     assert calls(box).count("ssh-keygen") == 1  # key is not regenerated
     assert "FORBIDDEN" not in calls(box)
 
 
 @pytest.mark.parametrize("change,message", [
     ({"FAKE_LEGACY": "active"}, "funpay-bot.service активна"),
-    ({"FAKE_DROPIN": "/etc/systemd/system/funpayflow.service.d/x.conf"}, "drop-in"),
+    ({"FAKE_EXEC": "/root/stage/.venv/bin/python3 -X"}, "ExecStart"),
 ])
 def test_unsafe_server_state_changes_nothing(box, change, message):
     original = box.unit.read_text()
@@ -164,13 +172,33 @@ def test_unsafe_server_state_changes_nothing(box, change, message):
     assert "FORBIDDEN" not in calls(box)
 
 
-def test_bad_ref_and_odd_execstart_are_rejected(box):
+def test_bad_ref_is_rejected(box):
     result = subprocess.run(["bash", str(SCRIPT), "--ref", "main", "--yes"], env=box.env,
                             capture_output=True, text=True, timeout=60)
     assert result.returncode != 0 and "--ref" in result.stderr
-    box.unit.write_text(box.unit.read_text().replace("-m funpayflow.main", "-m other"))
-    result = run(box)
-    assert result.returncode != 0 and "ExecStart" in result.stderr
+
+
+def test_existing_owner_drop_ins_are_kept_and_effective_path_is_used(box):
+    """Like the real server: older drop-ins move the bot to another stage."""
+    stage = box.p / "root/stage-2/.venv"
+    import shutil as sh
+    sh.copytree(box.p / "root/stage/.venv", stage, symlinks=True)
+    old = Path(str(box.unit) + ".d") / "97-owner-update-abc.conf"
+    old.parent.mkdir()
+    old.write_text("[Service]\nExecStart=\nExecStart=/root/stage-2/.venv/bin/python -m funpayflow.main\n")
+    original = box.unit.read_text()
+    result = run(box, FAKE_EXEC="/root/stage-2/.venv/bin/python")
+    assert result.returncode == 0, result.stderr
+    assert old.read_text().startswith("[Service]") and box.unit.read_text() == original
+    current = box.p / "opt/funpayflow/current"
+    assert Path(os.readlink(current / "venv")) == stage
+
+
+def test_drop_in_not_applied_is_removed_and_stops(box):
+    result = run(box, FAKE_IGNORE_DROPIN="1")
+    assert result.returncode != 0 and "не применил" in result.stderr
+    assert not (Path(str(box.unit) + ".d") / "99-funpayflow-autoupdate.conf").exists()
+    assert "FORBIDDEN" not in calls(box)
 
 
 def test_script_never_restarts_or_reads_env():
