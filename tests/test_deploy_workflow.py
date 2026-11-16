@@ -48,6 +48,21 @@ def test_builder_rejects_bad_input(tmp_path, sha, names):
         builder.assemble(sha, wheels(tmp_path, names), tmp_path / "r.tar")
 
 
+def test_project_wheel_collected_without_uv_gitignore(tmp_path):
+    """uv build writes .gitignore into its out-dir; it must not reach the set."""
+    wheel_set = wheels(tmp_path, ("aiogram-3.0-py3-none-any.whl",))
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "funpayflow-1.0.0-py3-none-any.whl").write_bytes(b"PKproject")
+    (project / ".gitignore").write_text("*\n")
+    builder.collect_wheels(project, wheel_set)
+    assert sorted(p.name for p in wheel_set.iterdir()) == [
+        "aiogram-3.0-py3-none-any.whl", "funpayflow-1.0.0-py3-none-any.whl"]
+    builder.assemble(SHA, wheel_set, tmp_path / "r.tar")
+    with pytest.raises(ValueError):
+        builder.collect_wheels(tmp_path / "empty-dir-missing", wheel_set)
+
+
 @pytest.mark.skipif(os.name == "nt", reason="deploy agent is Linux-only")
 def test_agent_accepts_builder_archive(tmp_path):
     agent = load("deploy_agent_wf", "scripts/deploy_agent.py")

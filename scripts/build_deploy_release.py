@@ -52,6 +52,15 @@ def assemble(sha: str, wheel_dir: Path, archive: Path) -> str:
     return hashlib.sha256(archive.read_bytes()).hexdigest()
 
 
+def collect_wheels(source: Path, wheels: Path) -> None:
+    """Move exactly the *.whl files of `source` into `wheels`; at least one."""
+    built = sorted(source.glob("*.whl"))
+    if not built:
+        raise ValueError("project wheel was not built")
+    for wheel in built:
+        wheel.replace(wheels / wheel.name)
+
+
 def run(*argv: str) -> None:
     subprocess.run(argv, cwd=ROOT, check=True)
 
@@ -75,7 +84,11 @@ def main(argv: list[str]) -> int:
         "--format", "requirements-txt", "--output-file", str(req))
     run(sys.executable, "-m", "pip", "wheel", "--require-hashes", "--no-deps",
         "--disable-pip-version-check", "--wheel-dir", str(wheels), "-r", str(req))
-    run("uv", "build", "--wheel", "--out-dir", str(wheels))
+    # uv build also writes a .gitignore into its out-dir: build the project
+    # wheel separately and move only the .whl into the release wheel set.
+    project = out / "project"
+    run("uv", "build", "--wheel", "--out-dir", str(project))
+    collect_wheels(project, wheels)
     digest = assemble(args.sha, wheels, out / "release.tar")
     print(f"DIGEST={digest}")
     return 0
