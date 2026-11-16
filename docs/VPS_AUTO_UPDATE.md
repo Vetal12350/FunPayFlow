@@ -33,12 +33,15 @@ Issue #156. Код: [deploy_agent.py](../scripts/deploy_agent.py), [build_deploy
    curl -fsSLo /tmp/fpf-bootstrap.sh https://raw.githubusercontent.com/Vetal12350/FunPayFlow/<COMMIT>/scripts/vps_bootstrap.sh
    sudo bash /tmp/fpf-bootstrap.sh --ref <COMMIT>
    ```
-   Скрипт проверяет: одна `funpayflow.service`, `funpay-bot.service` не активна, нет drop-in,
-   `FUNPAY_BOT_DATA_DIR` задан, бот на Python 3.13, x86_64. Затем: пользователь
+   Скрипт проверяет: одна `funpayflow.service`, `funpay-bot.service` не активна,
+   `FUNPAY_BOT_DATA_DIR` задан, бот на Python 3.13, x86_64. Путь бота берётся из фактического
+   `ExecStart` (`systemctl show`), с учётом старых drop-in. Затем: пользователь
    `funpayflow-deploy` с forced command, агент того же коммита, конфиг, правило sudo
    (проверено `visudo`), текущий код регистрируется как первый релиз (цель отката даже
-   для первого обновления), в юните меняется **только** `ExecStart` на
-   `/opt/funpayflow/current/venv/bin/python` (копия `*.before-autoupdate`), `daemon-reload`.
+   для первого обновления). Файл юнита и старые drop-in не меняются: добавляется последний
+   drop-in `funpayflow.service.d/99-funpayflow-autoupdate.conf` с `ExecStart` на
+   `/opt/funpayflow/current/venv/bin/python`, затем `daemon-reload` и проверка, что systemd
+   его применил (иначе файл удаляется).
    В конце печатает 4 секрета.
 2. **GitHub** → Settings → Environments → `production` (создать): Deployment branches —
    только `main`. Environment secrets: `DEPLOY_HOST`, `DEPLOY_USER`, `DEPLOY_KNOWN_HOSTS`,
@@ -47,7 +50,7 @@ Issue #156. Код: [deploy_agent.py](../scripts/deploy_agent.py), [build_deploy
 3. Удалить приватный ключ с сервера командой, которую напечатал скрипт.
 4. Первое обновление — когда владелец рядом с ПК (первый перезапуск на новом пути).
 
-Откат настройки: `sudo cp <unit>.before-autoupdate <unit> && sudo systemctl daemon-reload`.
+Откат настройки: `sudo rm -f /etc/systemd/system/funpayflow.service.d/99-funpayflow-autoupdate.conf && sudo systemctl daemon-reload`.
 
 ## Разбор `NEEDS_OWNER`
 
