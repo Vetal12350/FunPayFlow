@@ -29,6 +29,7 @@ from .telegram import (dp, bot_settings, get_user_settings, get_all_recipients,
                       _audit_action,
                       get_night_mode_reply_text,
                       expand_review_request_text, is_review_request_enabled,
+                      is_review_thanks_enabled, review_thanks_text,
                       configure_module_runtime, module_enabled, save_settings, SETTINGS_FILE)
 from .feature_registry import is_fresh_install
 from .funpay import FunPayClient, _AmbiguousRaiseOutcome
@@ -320,6 +321,8 @@ async def _fetch_and_send_review(
                 client, client.review_state.record_review_observation,
                 verified_order_id, None, stars if type(stars) is int and 1 <= stars <= 5 else None,
             )
+            await _maybe_send_review_thanks(
+                client, verified_order_id, buyer, stars if type(stars) is int else None)
             if not module_enabled("notifications"):
                 return
             if client._notified_reviews.get(verified_order_id) == fingerprint:
@@ -439,6 +442,46 @@ def _review_chat_context(client: FunPayClient, buyer: str):
     if type(chat_id) is not int or chat_id <= 0 or type(account_name) is not str or not account_name:
         return None
     return chat_id, account_name
+
+
+async def _maybe_send_review_thanks(client: FunPayClient, order_id: str, buyer: str,
+                                    stars: int | None) -> None:
+    """Thank the buyer in chat once per order for a 4-5 star review.
+
+    Claimed in SQLite before sending; a crash or unclear result is never retried.
+    Failures here never block the owner's review notification."""
+    if stars not in (4, 5) or buyer == "Покупатель":
+        return
+    try:
+        if (not module_enabled("review_request") or not is_review_thanks_enabled()
+                or is_safe_mode_enabled() or restart_requested()):
+            return
+        if not await asyncio.to_thread(client.review_state.claim_review_thanks,
+                                       order_id, int(time.time())):
+            return
+        context = await asyncio.to_thread(_review_chat_context, client, buyer)
+        if context is None:
+            logger.warning("Review thanks skipped: chat unavailable.")
+            return
+        chat_id, _account_name = context
+        sent = await asyncio.to_thread(
+            client.send_review_request_once, chat_id, review_thanks_text(buyer),
+            enabled_check=lambda: (module_enabled("review_request")
+                                   and is_review_thanks_enabled()
+                                   and not is_safe_mode_enabled()
+                                   and not restart_requested()),
+        )
+    except Exception as e:
+        logger.warning(f"Review thanks result ambiguous: {type(e).__name__}.")
+        return
+    if sent:
+        try:
+            await asyncio.to_thread(client.review_state.mark_review_thanks_sent,
+                                    order_id, int(time.time()))
+            await asyncio.to_thread(_audit_action, "automation", "REVIEW_THANKS_SEND",
+                                    "order", "SUCCESS")
+        except Exception as e:
+            logger.warning(f"Review thanks bookkeeping failed: {type(e).__name__}.")
 
 
 async def _send_scheduled_review_request(

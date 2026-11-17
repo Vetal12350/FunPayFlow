@@ -307,6 +307,12 @@ class ReviewReceiptStore:
                                    for name in ("state", "buyer", "created_at", "scheduled_at"))):
                         raise StateError("Persistent review request schema is incompatible.")
                     connection.execute(
+                        "CREATE TABLE IF NOT EXISTS review_thanks ("
+                        "order_id TEXT PRIMARY KEY, state TEXT NOT NULL "
+                        "CHECK(state IN ('ambiguous', 'sent')), "
+                        "claimed_at INTEGER NOT NULL, sent_at INTEGER)"
+                    )
+                    connection.execute(
                         "CREATE TABLE IF NOT EXISTS withdrawals ("
                         "transaction_id TEXT PRIMARY KEY, amount TEXT NOT NULL, "
                         "currency TEXT, observed_at INTEGER NOT NULL)"
@@ -806,6 +812,32 @@ class ReviewReceiptStore:
                 ).fetchall()
         except (sqlite3.Error, OSError):
             raise StateError("Persistent review request read failed.") from None
+
+    def claim_review_thanks(self, order_id: str, now: int) -> bool:
+        """One thank-you per order: claimed before network I/O, never retried."""
+        self._require_order_id(order_id)
+        try:
+            with closing(self._connect()) as connection:
+                with connection:
+                    result = connection.execute(
+                        "INSERT OR IGNORE INTO review_thanks (order_id, state, claimed_at) "
+                        "VALUES (?, 'ambiguous', ?)", (order_id, now),
+                    )
+                    return result.rowcount == 1
+        except (sqlite3.Error, OSError):
+            raise StateError("Persistent review thanks claim failed.") from None
+
+    def mark_review_thanks_sent(self, order_id: str, sent_at: int) -> None:
+        self._require_order_id(order_id)
+        try:
+            with closing(self._connect()) as connection:
+                with connection:
+                    connection.execute(
+                        "UPDATE review_thanks SET state = 'sent', sent_at = ? "
+                        "WHERE order_id = ? AND state = 'ambiguous'", (sent_at, order_id),
+                    )
+        except (sqlite3.Error, OSError):
+            raise StateError("Persistent review thanks write failed.") from None
 
     def has_review_observation(self, order_id: str) -> bool:
         self._require_order_id(order_id)

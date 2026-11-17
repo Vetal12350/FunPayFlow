@@ -506,7 +506,8 @@ class TelegramModuleTests(ModuleStateMixin, unittest.IsolatedAsyncioTestCase):
                                  _notified_reviews={})
         source = Path("src/funpayflow/main.py").read_text(encoding="utf-8")
         names = {"_review_state_operation", "_review_fingerprint",
-                 "_safe_review_event_part", "_fetch_and_send_review"}
+                 "_safe_review_event_part", "_fetch_and_send_review",
+                  "_maybe_send_review_thanks"}
         nodes = [node for node in ast.parse(source).body
                  if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
                  and node.name in names]
