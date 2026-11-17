@@ -55,7 +55,7 @@ def test_loads_packages_and_modules_skips_bad_ones_and_isolates_errors(tmp_path)
     write(tmp_path, "alpha/__init__.py", "from .helper import VALUE\n"
           "def setup(api):\n    api.on('order', lambda e: SEEN.append((VALUE, e)))\nSEEN = []\n")
     write(tmp_path, "alpha/helper.py", "VALUE = 'pkg'\n")
-    write(tmp_path, "beta.py", "def setup(api):\n    api.on('message', lambda e: 1 / 0)\n")
+    write(tmp_path, "beta.py", "def setup(api):\n    api.on('message', lambda e: (MSGS.append(e), 1 / 0))\nMSGS = []\n")
     write(tmp_path, "broken.py", "def setup(api):\n    raise RuntimeError('SECRET-DETAIL')\n")
     write(tmp_path, "Bad-Name.py", "raise SystemExit\n")
     write(tmp_path, "notes.txt", "ignored")
@@ -71,6 +71,8 @@ def test_loads_packages_and_modules_skips_bad_ones_and_isolates_errors(tmp_path)
     host.dispatch(SimpleNamespace(type=EVENTS.NEW_ORDER, order=order))
     host.dispatch(SimpleNamespace(type=EVENTS.NEW_MESSAGE, message=SimpleNamespace(
         chat_id=5, chat_name="buyer", author="buyer", author_id=7, text="+")))
+    host.dispatch(SimpleNamespace(type=EVENTS.LAST_CHAT_MESSAGE_CHANGED, chat=SimpleNamespace(
+        id=6, name="buyer", last_message_text="+", unread=True)))
     host.dispatch(SimpleNamespace(type=EVENTS.INITIAL_CHAT, chat=object()))
     flush(host)
     import sys
@@ -78,6 +80,10 @@ def test_loads_packages_and_modules_skips_bad_ones_and_isolates_errors(tmp_path)
     assert seen == [("pkg", {"order_id": "ABC", "description": "Lot [X1]", "price": 1.5,
                              "amount": 2, "buyer_username": "buyer", "buyer_id": 7,
                              "subcategory_name": "Games", "status": "PAID"})]
+    msgs = sys.modules["funpayflow_plugin_beta"].MSGS
+    assert msgs[0]["source"] == "message" and msgs[0]["text"] == "+"
+    assert msgs[1] == {"chat_id": 6, "chat_name": "buyer", "author": "buyer", "text": "+",
+                       "unread": True, "source": "chat_list"}
 
 
 def test_send_message_respects_safe_mode_restart_and_unbind(tmp_path):
