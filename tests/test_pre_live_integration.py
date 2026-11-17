@@ -200,7 +200,8 @@ class MessageLimitsTests(unittest.IsolatedAsyncioTestCase):
     def review_runtime(self):
         source = Path("src/funpayflow/main.py").read_text(encoding="utf-8")
         wanted = {"_review_state_operation", "_review_fingerprint",
-                  "_safe_review_event_part", "_fetch_and_send_review"}
+                  "_safe_review_event_part", "_fetch_and_send_review",
+                  "_maybe_send_review_thanks"}
         nodes = [n for n in ast.parse(source).body
                  if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name in wanted]
         runtime = {"asyncio": asyncio, "hashlib": hashlib, "json": json, "re": re,

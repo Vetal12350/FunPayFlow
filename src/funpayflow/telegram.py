@@ -323,6 +323,8 @@ SETTINGS_FILE = str(runtime_file("bot_settings.json"))
 OLD_DEFAULT_REVIEW_REQUEST_TEXT = "Спасибо за покупку! Если всё понравилось, пожалуйста, оставьте отзыв о заказе."
 DEFAULT_REVIEW_REQUEST_TEXT = OLD_DEFAULT_REVIEW_REQUEST_TEXT + "\n\n{order_url}"
 DEFAULT_REVIEW_REQUEST_DELAY_SECONDS = 300
+REVIEW_THANKS_TEXT = ("{buyer}, большое спасибо за отзыв! 🙏 Рады, что всё понравилось — "
+                      "будем ждать вас снова. {wish}")
 
 # Глобальные настройки — общие для всего бота
 _DEFAULT_GLOBAL_SETTINGS: dict = {
@@ -339,6 +341,7 @@ _DEFAULT_GLOBAL_SETTINGS: dict = {
     "review_request_enabled": False,
     "review_request_text": DEFAULT_REVIEW_REQUEST_TEXT,
     "review_request_delay_seconds": DEFAULT_REVIEW_REQUEST_DELAY_SECONDS,
+    "review_thanks_enabled": False,
     "modules_version": MODULES_VERSION,
     "setup_completed": True,
     "modules": profile_modules("all"),
@@ -423,7 +426,8 @@ def load_settings() -> None:
                 or type(saved.get("auto_bump", False)) is not bool
                 or type(saved.get("night_mode", False)) is not bool
                 or type(saved.get("safe_mode", False)) is not bool
-                or type(saved.get("review_request_enabled", False)) is not bool):
+                or type(saved.get("review_request_enabled", False)) is not bool
+                or type(saved.get("review_thanks_enabled", False)) is not bool):
             raise ValueError("Invalid global settings.")
         user_ids = saved.get("authorized_user_ids", [])
         if (not isinstance(user_ids, list)
@@ -558,6 +562,7 @@ def save_settings(*, required: bool = False) -> None:
             "review_request_enabled": bot_settings["review_request_enabled"],
             "review_request_text": bot_settings["review_request_text"],
             "review_request_delay_seconds": bot_settings["review_request_delay_seconds"],
+            "review_thanks_enabled": bot_settings.get("review_thanks_enabled", False),
             "modules_version": MODULES_VERSION,
             "setup_completed": bot_settings["setup_completed"],
             "modules": modules,
@@ -617,6 +622,25 @@ def toggle_safe_mode_saved(*, actor: str = "system") -> bool:
 def is_review_request_enabled() -> bool:
     with _night_mode_state_lock:
         return bot_settings.get("review_request_enabled", False)
+
+
+def is_review_thanks_enabled() -> bool:
+    with _night_mode_state_lock:
+        return bot_settings.get("review_thanks_enabled", False) is True
+
+
+def review_thanks_text(buyer: str, now: datetime | None = None) -> str:
+    """Thank-you for a good review with a wish matching Moscow time of day."""
+    hour = (now or datetime.now(timezone.utc)).astimezone(timezone(timedelta(hours=3))).hour
+    if 5 <= hour < 12:
+        wish = "Доброго утра и отличного дня!"
+    elif 12 <= hour < 18:
+        wish = "Хорошего вам дня!"
+    elif 18 <= hour < 23:
+        wish = "Приятного вечера!"
+    else:
+        wish = "Доброй ночи!"
+    return REVIEW_THANKS_TEXT.format(buyer=buyer, wish=wish)
 
 
 def get_night_mode_reply_text(kind: str = "message") -> str:
@@ -1045,9 +1069,13 @@ def _review_request_screen() -> tuple[str, InlineKeyboardMarkup]:
     status = "✅ Включён" if bot_settings["review_request_enabled"] else "⛔ Выключен"
     text = (f"⭐ <b>Запрос отзыва</b>\n\nСтатус: {status}\n"
             f"Текст: {_escaped_preview(bot_settings['review_request_text'], 3400)}\n"
-            f"Задержка: {_review_delay_label(bot_settings['review_request_delay_seconds'])}")
+            f"Задержка: {_review_delay_label(bot_settings['review_request_delay_seconds'])}\n\n"
+            f"🙏 Благодарность за отзыв 4–5★: "
+            f"{'✅ включена' if is_review_thanks_enabled() else '⛔ выключена'}")
     return text, _menu([
         [_button("⛔ Выключить" if bot_settings["review_request_enabled"] else "✅ Включить", "review_toggle")],
+        [_button("🙏 Благодарность: выключить" if is_review_thanks_enabled()
+                 else "🙏 Благодарность: включить", "review_thanks_toggle")],
         [_button("✏️ Изменить текст", "review_edit")],
         [_button("⏱ Изменить задержку", "review_delay")],
         [_button("🔄 Сбросить текст", "review_reset")],
@@ -1067,7 +1095,7 @@ def _review_delay_screen() -> tuple[str, InlineKeyboardMarkup]:
 async def _review_callback(callback: CallbackQuery, action: str, user_id: int) -> bool:
     prefix = action.split(":", 1)[0]
     if prefix not in {"review_menu", "review_toggle", "review_edit", "review_delay",
-                      "review_delay_custom", "review_reset"}:
+                      "review_delay_custom", "review_reset", "review_thanks_toggle"}:
         return False
     _interaction_state.pop(user_id, None)
     answered = False
@@ -1076,6 +1104,10 @@ async def _review_callback(callback: CallbackQuery, action: str, user_id: int) -
             text, markup = _review_request_screen()
         elif action == "review_toggle":
             _save_global_setting("review_request_enabled", not bot_settings["review_request_enabled"],
+                                 actor=f"telegram:{user_id}")
+            text, markup = _review_request_screen()
+        elif action == "review_thanks_toggle":
+            _save_global_setting("review_thanks_enabled", not is_review_thanks_enabled(),
                                  actor=f"telegram:{user_id}")
             text, markup = _review_request_screen()
         elif action == "review_edit":
