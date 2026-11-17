@@ -323,7 +323,7 @@ SETTINGS_FILE = str(runtime_file("bot_settings.json"))
 OLD_DEFAULT_REVIEW_REQUEST_TEXT = "Спасибо за покупку! Если всё понравилось, пожалуйста, оставьте отзыв о заказе."
 DEFAULT_REVIEW_REQUEST_TEXT = OLD_DEFAULT_REVIEW_REQUEST_TEXT + "\n\n{order_url}"
 DEFAULT_REVIEW_REQUEST_DELAY_SECONDS = 300
-REVIEW_THANKS_TEXT = ("{buyer}, большое спасибо за отзыв! 😊 Рады, что всё понравилось — "
+REVIEW_THANKS_TEXT = ("{buyer}, большое спасибо за отзыв! Рады, что всё понравилось — "
                       "будем ждать вас снова. {wish}")
 
 # Глобальные настройки — общие для всего бота
