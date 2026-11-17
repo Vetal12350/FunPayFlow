@@ -62,6 +62,20 @@ def event_payload(event) -> tuple[str, dict] | None:
             "author": getattr(message, "author", None),
             "author_id": getattr(message, "author_id", None),
             "text": getattr(message, "text", None),
+            "source": "message",
+        }
+    if kind is types.LAST_CHAT_MESSAGE_CHANGED:
+        # The runtime disables NEW_MESSAGE (history requests failed), so chat
+        # activity arrives as the chat-list preview: last text, interlocutor
+        # name, unread flag. The author is NOT known: it may be our own text.
+        chat = event.chat
+        return "message", {
+            "chat_id": getattr(chat, "id", None),
+            "chat_name": getattr(chat, "name", None),
+            "author": getattr(chat, "name", None),
+            "text": getattr(chat, "last_message_text", None),
+            "unread": getattr(chat, "unread", None),
+            "source": "chat_list",
         }
     return None
 
