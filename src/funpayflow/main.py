@@ -32,7 +32,8 @@ from .telegram import (dp, bot_settings, get_user_settings, get_all_recipients,
                       is_review_thanks_enabled, review_thanks_text,
                       configure_module_runtime, module_enabled, save_settings, SETTINGS_FILE)
 from .feature_registry import is_fresh_install
-from .funpay import FunPayClient, _AmbiguousRaiseOutcome
+from .funpay import (FunPayClient, _AmbiguousRaiseOutcome,
+                     CLOSED_BY_BUYER_TITLE, CLOSED_BY_ADMIN_TITLE)
 from .runtime_events import (ActionEvent, ActionKind, QueuedCriticalEvent,
                             ReviewCheckEvent, html_preview)
 from .runtime_control import (RuntimeAction, automatic_action_gate,
@@ -432,6 +433,28 @@ async def _send_night_mode_reply(
             logger.notify("Ночной режим: автоответ отправлен.")
     except Exception as e:
         logger.warning(f"Не удалось отправить автоответ: {type(e).__name__}.")
+
+
+def _closed_by_admin(client: FunPayClient, buyer, order_id) -> bool:
+    """True when the order chat says FunPay staff confirmed this order.
+
+    Read-only; any failure means "unknown" and keeps the buyer wording."""
+    admin_type = getattr(FunPayAPI.enums.MessageTypes, "ORDER_CONFIRMED_BY_ADMIN", None)
+    if admin_type is None or not isinstance(buyer, str) or not isinstance(order_id, str):
+        return False
+    try:
+        with client._account_lock:
+            chat = client.account.get_chat_by_name(buyer, make_request=True)
+            chat_id = getattr(chat, "id", None)
+            if type(chat_id) is not int:
+                return False
+            history = client.account.get_chat_history(chat_id, interlocutor_username=buyer)
+    except Exception as e:
+        logger.warning(f"Order chat unavailable for close notice: {type(e).__name__}.")
+        return False
+    return any(getattr(message, "type", None) is admin_type
+               and f"#{order_id}" in (getattr(message, "text", None) or "")
+               for message in history or ())
 
 
 def _review_chat_context(client: FunPayClient, buyer: str):
@@ -840,6 +863,12 @@ async def notifications_loop(bot: Bot, client: FunPayClient):
 
                 setting_key = action.kind.value
                 text = action.text
+                if isinstance(text, str) and text.startswith(CLOSED_BY_BUYER_TITLE):
+                    order = getattr(event, "order", None)
+                    if await asyncio.to_thread(_closed_by_admin, client,
+                                               getattr(order, "buyer_username", None),
+                                               getattr(order, "id", None)):
+                        text = CLOSED_BY_ADMIN_TITLE + text[len(CLOSED_BY_BUYER_TITLE):]
 
                 # Раньше здесь не было НИКАКОГО вывода в консоль - Telegram получал
                 # уведомление, а в CMD было тихо. Теперь то же самое, что летит в
