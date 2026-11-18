@@ -2638,6 +2638,31 @@ async def _autobump_schedule_input(message, user_id):
     return True
 
 
+async def _plugin_button_callback(callback: CallbackQuery, action: str, user_id: int) -> None:
+    """Owner pressed a button attached by a local plugin (authorized users only)."""
+    from . import plugins
+    await callback.answer()
+    try:
+        reply = await asyncio.to_thread(plugins.host.press, action, user_id)
+    except Exception as e:
+        logger.warning(f"Plugin button unavailable: {type(e).__name__}.")
+        reply = "⚠️ Не удалось обработать кнопку. Ничего не изменено, попробуйте ещё раз."
+        keep_buttons = True
+    else:
+        keep_buttons = False
+        if reply is None:
+            reply = "⚠️ Кнопка устарела или плагин не загружен."
+    message = callback.message
+    original = getattr(message, "text", None) or ""
+    try:
+        if keep_buttons:
+            await message.answer(reply)
+        else:
+            await message.edit_text(f"{original}\n\n{reply}"[:4096])
+    except Exception as e:
+        logger.warning(f"Plugin button reply unavailable: {type(e).__name__}.")
+
+
 @dp.callback_query()
 async def callback_handler(callback: CallbackQuery):
     user_id = callback.from_user.id
@@ -2648,6 +2673,9 @@ async def callback_handler(callback: CallbackQuery):
         return
 
     action = callback.data or ""
+    if action.startswith("plg:"):
+        await _plugin_button_callback(callback, action, user_id)
+        return
     if await _autobump_schedule_callback(callback, action, user_id):
         return
     _discard_schedule_editor(user_id)

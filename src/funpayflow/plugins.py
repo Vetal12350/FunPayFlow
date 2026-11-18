@@ -3,7 +3,8 @@
 The directory (absolute path, outside any repository) may contain plugin
 packages (``<name>/__init__.py``) or modules (``<name>.py``). Each defines
 ``setup(api)`` and subscribes with ``api.on(kind, callback)`` where kind is
-"order" (new order), "message" (new chat message) or "order_status".
+"order" (new order), "message" (new chat message), "order_status" or
+"button" (the owner pressed a button the plugin attached to a notice).
 
 Callbacks run one at a time in a dedicated worker thread, never blocking the
 bot. A failing plugin is logged by exception type only and never stops the
@@ -28,8 +29,11 @@ from .runtime_control import automatic_action_gate, restart_requested
 from .runtime_paths import data_dir
 
 PLUGINS_DIR_ENV = "FUNPAYFLOW_PLUGINS_DIR"
-KINDS = ("order", "message", "order_status")
+KINDS = ("order", "message", "order_status", "button")
 _NAME = re.compile(r"[a-z][a-z0-9_]{0,40}")
+_TOKEN = re.compile(r"[A-Za-z0-9_:-]{1,40}")
+BUTTON_PREFIX = "plg:"
+BUTTON_TIMEOUT = 60.0
 
 
 def _order_fields(order) -> dict:
@@ -131,9 +135,26 @@ class PluginAPI:
             client.account.send_message(chat_id, text, update_last_saved_message=True)
             return True
 
-    def notify_owner(self, text: str) -> bool:
-        """Telegram message to the bot owner(s)."""
-        return self._host._notify(text)
+    def notify_owner(self, text: str, buttons=None) -> bool:
+        """Telegram message to the bot owner(s).
+
+        ``buttons``: optional rows of (label, token). Pressing one delivers a
+        "button" event {"token", "user_id"} to this plugin; the callback's
+        return value (a short text) is shown to the owner under the notice."""
+        markup = None
+        if buttons:
+            markup = []
+            for row in buttons:
+                cells = []
+                for label, token in row:
+                    data = f"{BUTTON_PREFIX}{self.name}:{token}"
+                    if (not isinstance(label, str) or not label.strip()
+                            or not isinstance(token, str) or not _TOKEN.fullmatch(token)
+                            or len(data.encode()) > 64):
+                        raise ValueError("invalid button")
+                    cells.append((label[:40], data))
+                markup.append(cells)
+        return self._host._notify(text, markup)
 
 
 class PluginHost:
@@ -192,15 +213,44 @@ class PluginHost:
         with self._lock:
             self._client, self._notifier, self._safe_mode = None, None, (lambda: True)
 
-    def _notify(self, text) -> bool:
+    def _notify(self, text, buttons=None) -> bool:
         notifier = self._notifier
         if notifier is None or not isinstance(text, str) or not text.strip():
             return False
         try:
-            notifier(text[:3500])
+            if buttons:
+                notifier(text[:3500], buttons)
+            else:
+                notifier(text[:3500])
             return True
         except Exception:
             return False
+
+    def press(self, data: str, user_id: int) -> str | None:
+        """Owner pressed a plugin button (blocking; call from a thread).
+
+        Runs in the plugin worker, after events already queued, and returns
+        the plugin's reply text, or None when nobody handled it."""
+        if not isinstance(data, str) or not data.startswith(BUTTON_PREFIX):
+            return None
+        name, _, token = data[len(BUTTON_PREFIX):].partition(":")
+        if not _NAME.fullmatch(name) or not _TOKEN.fullmatch(token or "") or self._executor is None:
+            return None
+        callbacks = [cb for owner, cb in self._subscribers["button"] if owner == name]
+        if not callbacks:
+            return None
+
+        def run():
+            for callback in callbacks:
+                try:
+                    reply = callback({"token": token, "user_id": user_id})
+                except Exception as error:
+                    logger.warning(f"Плагин {name}: ошибка кнопки: {type(error).__name__}.")
+                    return "⚠️ Ошибка обработки кнопки, подробности у плагина."
+                if isinstance(reply, str) and reply.strip():
+                    return reply[:1000]
+            return None
+        return self._executor.submit(run).result(timeout=BUTTON_TIMEOUT)
 
     def dispatch(self, event) -> None:
         """Hand an event to subscribed plugins without waiting for them."""

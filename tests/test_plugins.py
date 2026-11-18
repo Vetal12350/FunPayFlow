@@ -120,3 +120,41 @@ def test_account_call_uses_lock_and_notify_owner(tmp_path, monkeypatch):
     assert api.data_dir == tmp_path / "plugins" / "demo" and api.data_dir.is_dir()
     with pytest.raises(ValueError):
         api.on("payment", print)
+
+
+def test_buttons_reach_only_their_plugin_and_reply(tmp_path):
+    write(tmp_path, "alpha.py",
+          "def setup(api):\n"
+          "    api.on('button', lambda e: f\"ok {e['token']} {e['user_id']}\")\n"
+          "    api.notify_owner('code ready', buttons=[[('Send', 'send:A1'), ('Cancel', 'cancel:A1')]])\n")
+    write(tmp_path, "beta.py", "def setup(api):\n    api.on('button', lambda e: 'beta')\n")
+    host = plugins.PluginHost()
+    sent = []
+    host.bind(client(), lambda text, buttons=None: sent.append((text, buttons)), lambda: False)
+    host.load(str(tmp_path))
+    host.bind(client(), lambda text, buttons=None: sent.append((text, buttons)), lambda: False)
+    assert sent == [("code ready", [[("Send", "plg:alpha:send:A1"),
+                                     ("Cancel", "plg:alpha:cancel:A1")]])]
+    assert host.press("plg:alpha:send:A1", 7) == "ok send:A1 7"
+    assert host.press("plg:beta:x", 7) == "beta"
+    assert host.press("plg:gamma:x", 7) is None          # unknown plugin
+    assert host.press("plg:alpha:bad token!", 7) is None  # invalid token
+    assert host.press("other:alpha:x", 7) is None
+
+
+def test_invalid_buttons_are_refused():
+    host = plugins.PluginHost()
+    api = plugins.PluginAPI(host, "alpha")
+    host.bind(client(), lambda *a: None, lambda: False)
+    with pytest.raises(ValueError):
+        api.notify_owner("x", buttons=[[("Send", "has space")]])
+    with pytest.raises(ValueError):
+        api.notify_owner("x", buttons=[[("Send", "a" * 41)]])
+
+
+def test_failing_button_callback_reports_without_raising(tmp_path):
+    write(tmp_path, "alpha.py", "def setup(api):\n    api.on('button', lambda e: 1 / 0)\n")
+    host = plugins.PluginHost()
+    host.load(str(tmp_path))
+    host.bind(client(), lambda *a: None, lambda: False)
+    assert "Ошибка" in host.press("plg:alpha:t", 1)

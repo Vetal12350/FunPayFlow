@@ -960,14 +960,22 @@ async def session_refresh_loop(client: FunPayClient):
             logger.warning(f"Не удалось обновить сессию FunPay: {type(e).__name__}.")
 
 
-async def _send_runtime_notice(bot: Bot, message: str, *, restore_keyboard: bool = False) -> None:
-    """Одна попытка отправки каждому авторизованному получателю."""
+async def _send_runtime_notice(bot: Bot, message: str, *, restore_keyboard: bool = False,
+                               buttons=None) -> None:
+    """Одна попытка отправки каждому авторизованному получателю.
+
+    ``buttons`` — строки [(подпись, callback_data)] для inline-кнопок плагинов."""
     try:
         recipients = get_all_recipients()
     except Exception as e:
         logger.warning(f"Не удалось получить получателей системного уведомления: {type(e).__name__}.")
         return
     notice_kwargs = {"reply_markup": get_reply_keyboard()} if restore_keyboard else {}
+    if buttons:
+        from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+        notice_kwargs = {"reply_markup": InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text=label, callback_data=data) for label, data in row]
+            for row in buttons])}
     for recipient_id in recipients:
         try:
             await asyncio.wait_for(
@@ -1143,8 +1151,8 @@ async def main():
         heartbeat = start_heartbeat(client)
         plugins.load_from_env()
         loop = asyncio.get_running_loop()
-        plugins.host.bind(client, lambda text: asyncio.run_coroutine_threadsafe(
-            _send_runtime_notice(bot, text), loop), is_safe_mode_enabled)
+        plugins.host.bind(client, lambda text, buttons=None: asyncio.run_coroutine_threadsafe(
+            _send_runtime_notice(bot, text, buttons=buttons), loop), is_safe_mode_enabled)
         try:
             action = await _supervise_tasks(bot, client)
         finally:
