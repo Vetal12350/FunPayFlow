@@ -244,6 +244,9 @@ class RuntimeCoreTests(unittest.TestCase):
             "_clear_problem": lambda *args: None,
             "logger": SimpleNamespace(error=lambda *args: None, notify=lambda *args: None),
             "_strip_html": lambda value: value,
+                     "CLOSED_BY_BUYER_TITLE": "✅ <b>Заказ закрыт покупателем</b>",
+                     "CLOSED_BY_ADMIN_TITLE": "✅ <b>Заказ закрыт администратором</b>",
+                     "_closed_by_admin": lambda *args: False,
         }
         exec(compile(ast.Module(body=nodes, type_ignores=[]), "main.py", "exec"), runtime)
         snapshot = critical_snapshot(order_event())

@@ -125,6 +125,10 @@ def _apply_funpay_cookie_patch():
     _funpay_cookie_patch_applied = True
 
 
+CLOSED_BY_BUYER_TITLE = "✅ <b>Заказ закрыт покупателем</b>"
+CLOSED_BY_ADMIN_TITLE = "✅ <b>Заказ закрыт администратором</b>"
+
+
 class FunPayClient:
     def __init__(self, golden_key: str):
         _apply_funpay_cookie_patch()
@@ -1130,7 +1134,7 @@ class FunPayClient:
 
                 if closed_status is not None and status == closed_status:
                     text = (
-                        "✅ <b>Заказ закрыт покупателем</b>\n"
+                        f"{CLOSED_BY_BUYER_TITLE}\n"
                         f"Покупатель: <b>{html_preview(buyer, 120)}</b>\n"
                         f"№ заказа: {html_preview(order_id, 80)}"
                     )
