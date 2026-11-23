@@ -18,7 +18,7 @@ from FunPayAPI.common.enums import SubCategoryTypes
 from . import logger
 from .runtime_control import automatic_action_gate
 from .bump_reports import build_bump_report_chunks, format_seconds as _format_seconds
-from .state import StateError, AUTOBUMP_SAFE_INTERVAL
+from .state import StateError, AUTOBUMP_SAFE_INTERVAL, error_label
 from .runtime_events import (ActionEvent, ActionKind, QueuedCriticalEvent,
                             critical_snapshot, hydrate_critical, html_preview)
 
@@ -719,7 +719,7 @@ class FunPayClient:
                         self._runner_health = "failed"
                         self._runner_last_failure_category = self._classify_runner_error(e)
                         self._runner_last_failure_type = type(e).__name__
-                logger.error(f"Runner producer завершился с ошибкой: {type(e).__name__}.")
+                logger.error(f"Runner producer завершился с ошибкой: {error_label(e)}.")
         finally:
             if self._runner_stop.is_set():
                 with self._runner_health_lock:
@@ -921,7 +921,7 @@ class FunPayClient:
                         self._runner_health = "failed"
                         self._runner_retry_delay = None
                 if category != "RECOVERABLE":
-                    logger.error(f"Runner polling остановлен: {category}, {error_type}.")
+                    logger.error(f"Runner polling остановлен: {category}, {error_label(e)}.")
                     raise
                 backoff = min(RUNNER_RETRY_MAX_SECONDS,
                               RUNNER_RETRY_INITIAL_SECONDS * 2 ** min(consecutive_errors - 1, 4))

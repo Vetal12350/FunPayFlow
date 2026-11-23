@@ -155,6 +155,19 @@ _REVIEWS_CTE = (
 )
 
 
+def error_label(error: BaseException) -> str:
+    """Log-safe label: StateError messages are fixed strings; its SQLite cause adds only a code."""
+    if not isinstance(error, StateError):
+        return type(error).__name__
+    label = f"{type(error).__name__}: {error}"
+    cause = error.__context__  # kept by `raise ... from None`, only hidden from tracebacks
+    if isinstance(cause, sqlite3.Error):
+        label += f" ({type(cause).__name__} {getattr(cause, 'sqlite_errorname', '?')})"
+    elif cause is not None:
+        label += f" ({type(cause).__name__})"
+    return label
+
+
 class StateError(RuntimeError):
     """Persistent state недоступен или не может быть проверен."""
 

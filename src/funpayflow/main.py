@@ -38,7 +38,7 @@ from .runtime_events import (ActionEvent, ActionKind, QueuedCriticalEvent,
                             ReviewCheckEvent, html_preview)
 from .runtime_control import (RuntimeAction, automatic_action_gate,
                              begin_runtime_cycle, restart_requested, wait_for_restart)
-from .state import ReviewReceiptStore, StateError, DEFAULT_DB_PATH
+from .state import ReviewReceiptStore, StateError, DEFAULT_DB_PATH, error_label
 from . import logger
 
 
@@ -1045,7 +1045,7 @@ async def _supervise_tasks(bot: Bot, client: FunPayClient):
                         continue
                     if isinstance(result, BaseException):
                         # Текст исключения и traceback могут содержать credentials.
-                        logger.error(f"Ошибка задачи {name}: {type(result).__name__}.")
+                        logger.error(f"Ошибка задачи {name}: {error_label(result)}.")
                         _set_problem("CRITICAL_TASK")
                         if primary_error is None:
                             primary_error = result
@@ -1225,7 +1225,7 @@ def run():
     except KeyboardInterrupt:
         pass
     except Exception as e:
-        logger.error(f"Бот завершён с ошибкой: {type(e).__name__}.")
+        logger.error(f"Бот завершён с ошибкой: {error_label(e)}.")
         raise SystemExit(1) from None
     finally:
         release_lock()
