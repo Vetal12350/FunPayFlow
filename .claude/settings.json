@@ -1,0 +1,11 @@
+{
+  "enabledPlugins": {
+    "ponytail@ponytail": true,
+    "context7@claude-plugins-official": true,
+    "agent-skills@addy-agent-skills": true
+  },
+  "extraKnownMarketplaces": {
+    "ponytail": { "source": { "source": "git", "url": "https://github.com/DietrichGebert/ponytail.git" } },
+    "addy-agent-skills": { "source": { "source": "github", "repo": "addyosmani/agent-skills" } }
+  }
+}
