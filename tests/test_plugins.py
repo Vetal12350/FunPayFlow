@@ -158,3 +158,53 @@ def test_failing_button_callback_reports_without_raising(tmp_path):
     host.load(str(tmp_path))
     host.bind(client(), lambda *a: None, lambda: False)
     assert "Ошибка" in host.press("plg:alpha:t", 1)
+
+
+def test_toggles_default_flip_persist_and_validate(tmp_path, monkeypatch):
+    monkeypatch.setenv("FUNPAY_BOT_DATA_DIR", str(tmp_path))
+    host = plugins.PluginHost()
+    api = plugins.PluginAPI(host, "demo")
+    api.toggle("game_a", "Game A", default=True)
+    api.toggle("game_b", "Game B")
+    assert api.enabled("game_a") is True and api.enabled("game_b") is False
+    assert api.enabled("unknown") is False
+    assert host.toggles() == [("demo", "game_a", "Game A", True), ("demo", "game_b", "Game B", False)]
+
+    assert host.flip("demo", "game_a") is False
+    assert host.flip("other", "game_a") is None
+    assert api.enabled("game_a") is False
+
+    restarted = plugins.PluginHost()
+    again = plugins.PluginAPI(restarted, "demo")
+    again.toggle("game_a", "Game A", default=True)
+    assert again.enabled("game_a") is False
+
+    for key, label in (("Bad Key", "x"), ("k" * 17, "x"), ("ok", ""), ("ok", None)):
+        with pytest.raises(ValueError):
+            api.toggle(key, label)
+
+
+def test_telegram_toggle_menu_flips_for_owner_only(tmp_path, monkeypatch):
+    import asyncio
+    from unittest.mock import AsyncMock
+    from funpayflow import telegram as ui
+    monkeypatch.setenv("FUNPAY_BOT_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("ADMIN_ID", "7")
+    host = plugins.PluginHost()
+    monkeypatch.setattr(plugins, "host", host)
+    plugins.PluginAPI(host, "demo").toggle("game_a", "Game A", default=True)
+
+    def press(user_id, data):
+        callback = SimpleNamespace(answer=AsyncMock(),
+                                   message=SimpleNamespace(edit_text=AsyncMock()))
+        asyncio.run(ui._plugin_toggle_callback(callback, data, user_id))
+        return callback
+
+    assert "plgt:" in str(ui.get_main_keyboard(7))
+    stranger = press(8, "plgt:demo:game_a")
+    assert stranger.message.edit_text.await_count == 0 and host.toggles()[0][3] is True
+    owner = press(7, "plgt:demo:game_a")
+    assert host.toggles()[0][3] is False
+    markup = owner.message.edit_text.await_args.kwargs["reply_markup"]
+    assert markup.inline_keyboard[0][0].callback_data == "plgt:demo:game_a"
+    assert press(7, "plgt:demo:missing").answer.await_args.kwargs["show_alert"] is True

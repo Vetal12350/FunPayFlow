@@ -6,6 +6,10 @@ packages (``<name>/__init__.py``) or modules (``<name>.py``). Each defines
 "order" (new order), "message" (new chat message), "order_status" or
 "button" (the owner pressed a button the plugin attached to a notice).
 
+``api.toggle(key, label, default)`` adds an on/off switch to the owner's
+"Plugins" menu in Telegram; ``api.enabled(key)`` reads it. The state is kept
+in the plugin's data directory and survives restarts.
+
 Callbacks run one at a time in a dedicated worker thread, never blocking the
 bot. A failing plugin is logged by exception type only and never stops the
 bot. Events may be delivered again after a restart (backlog replay): plugins
@@ -16,6 +20,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 import importlib.util
+import json
 import os
 from pathlib import Path
 import re
@@ -32,6 +37,8 @@ PLUGINS_DIR_ENV = "FUNPAYFLOW_PLUGINS_DIR"
 KINDS = ("order", "message", "order_status", "button")
 _NAME = re.compile(r"[a-z][a-z0-9_]{0,40}")
 _TOKEN = re.compile(r"[A-Za-z0-9_:-]{1,40}")
+_TOGGLE_KEY = re.compile(r"[a-z0-9_]{1,16}")
+TOGGLE_PREFIX = "plgt:"
 BUTTON_PREFIX = "plg:"
 BUTTON_TIMEOUT = 60.0
 
@@ -135,6 +142,17 @@ class PluginAPI:
             client.account.send_message(chat_id, text, update_last_saved_message=True)
             return True
 
+    def toggle(self, key: str, label: str, default: bool = False) -> None:
+        """Register an owner on/off switch shown in the Telegram plugins menu."""
+        if (not isinstance(key, str) or not _TOGGLE_KEY.fullmatch(key)
+                or not isinstance(label, str) or not label.strip()):
+            raise ValueError("invalid toggle")
+        self._host._register_toggle(self.name, key, label.strip()[:40], bool(default))
+
+    def enabled(self, key: str) -> bool:
+        """Current state of a registered switch; unknown keys are off."""
+        return self._host._toggle_value(self.name, key)
+
     def notify_owner(self, text: str, buttons=None) -> bool:
         """Telegram message to the bot owner(s).
 
@@ -167,6 +185,7 @@ class PluginHost:
         self._lock = threading.Lock()
         self.loaded: list[str] = []
         self._attempted = False
+        self._toggles: dict[tuple[str, str], list] = {}  # (plugin, key) -> [label, value]
 
     @property
     def active(self) -> bool:
@@ -212,6 +231,49 @@ class PluginHost:
     def unbind(self) -> None:
         with self._lock:
             self._client, self._notifier, self._safe_mode = None, None, (lambda: True)
+
+    @staticmethod
+    def _toggle_file(name: str) -> Path:
+        path = data_dir() / "plugins" / name
+        path.mkdir(mode=0o700, parents=True, exist_ok=True)
+        return path / "toggles.json"
+
+    def _saved_toggles(self, name: str) -> dict:
+        try:
+            saved = json.loads(self._toggle_file(name).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+        return saved if isinstance(saved, dict) else {}
+
+    def _register_toggle(self, name: str, key: str, label: str, default: bool) -> None:
+        saved = self._saved_toggles(name).get(key)
+        with self._lock:
+            self._toggles[(name, key)] = [label, saved if isinstance(saved, bool) else default]
+
+    def _toggle_value(self, name: str, key: str) -> bool:
+        with self._lock:
+            entry = self._toggles.get((name, key))
+            return bool(entry and entry[1])
+
+    def toggles(self) -> list[tuple[str, str, str, bool]]:
+        with self._lock:
+            return [(name, key, label, value)
+                    for (name, key), (label, value) in self._toggles.items()]
+
+    def flip(self, name: str, key: str) -> bool | None:
+        """Invert and persist a switch; None if it is not registered."""
+        with self._lock:
+            entry = self._toggles.get((name, key))
+            if entry is None:
+                return None
+            state = {k: v[1] for (n, k), v in self._toggles.items() if n == name}
+            state[key] = not entry[1]
+            path = self._toggle_file(name)
+            temporary = path.with_suffix(".tmp")
+            temporary.write_text(json.dumps(state), encoding="utf-8")
+            os.replace(temporary, path)  # the new value is used only once it is on disk
+            entry[1] = state[key]
+            return entry[1]
 
     def _notify(self, text, buttons=None) -> bool:
         notifier = self._notifier

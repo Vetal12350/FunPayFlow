@@ -945,6 +945,9 @@ def get_main_keyboard(user_id: int):
     if _owner_id(user_id):
         rows.append([_button("📦 Лоты", "products")])
         rows.append([_button("🧩 Модули", "modules_open")])
+        from . import plugins
+        if plugins.host.toggles():
+            rows.append([_button("🔌 Плагины", plugins.TOGGLE_PREFIX)])
         rows.append([_button("🔄 Перезапустить бота", "restart_open")])
     return _menu(rows)
 
@@ -2638,6 +2641,35 @@ async def _autobump_schedule_input(message, user_id):
     return True
 
 
+def get_plugin_toggles_keyboard():
+    from . import plugins
+    rows = [[_button(f"{label}: {on_icon(value)}", f"{plugins.TOGGLE_PREFIX}{name}:{key}")]
+            for name, key, label, value in plugins.host.toggles()]
+    rows.append([_button("🔙 Назад", "menu_main")])
+    return _menu(rows)
+
+
+async def _plugin_toggle_callback(callback: CallbackQuery, action: str, user_id: int) -> None:
+    """Owner-only on/off switches that local plugins registered."""
+    from . import plugins
+    if not _owner_id(user_id):
+        await callback.answer("Настройка доступна только владельцу.", show_alert=True)
+        return
+    name, _, key = action[len(plugins.TOGGLE_PREFIX):].partition(":")
+    if name:
+        try:
+            state = await asyncio.to_thread(plugins.host.flip, name, key)
+        except OSError as e:
+            logger.warning(f"Plugin toggle not saved: {type(e).__name__}.")
+            await callback.answer("⚠️ Не удалось сохранить. Ничего не изменено.", show_alert=True)
+            return
+        if state is None:
+            await callback.answer("Переключатель устарел или плагин не загружен.", show_alert=True)
+            return
+    await callback.answer()
+    await _edit_or_keep_menu(callback.message, "🔌 <b>Плагины</b>", get_plugin_toggles_keyboard())
+
+
 async def _plugin_button_callback(callback: CallbackQuery, action: str, user_id: int) -> None:
     """Owner pressed a button attached by a local plugin (authorized users only)."""
     from . import plugins
@@ -2675,6 +2707,9 @@ async def callback_handler(callback: CallbackQuery):
     action = callback.data or ""
     if action.startswith("plg:"):
         await _plugin_button_callback(callback, action, user_id)
+        return
+    if action.startswith("plgt:"):
+        await _plugin_toggle_callback(callback, action, user_id)
         return
     if await _autobump_schedule_callback(callback, action, user_id):
         return
