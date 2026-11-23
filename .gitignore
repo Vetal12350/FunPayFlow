@@ -68,3 +68,6 @@ logs/
 .DS_Store
 Thumbs.db
 .qa-reports/
+
+# graphify knowledge graph (local only)
+graphify-out/
