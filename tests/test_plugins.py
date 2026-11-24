@@ -208,3 +208,84 @@ def test_telegram_toggle_menu_flips_for_owner_only(tmp_path, monkeypatch):
     markup = owner.message.edit_text.await_args.kwargs["reply_markup"]
     assert markup.inline_keyboard[0][0].callback_data == "plgt:demo:game_a"
     assert press(7, "plgt:demo:missing").answer.await_args.kwargs["show_alert"] is True
+
+
+def order_event(order_id, buyer, category, status=None, kind=EVENTS.NEW_ORDER):
+    status = status or FunPayAPI.types.OrderStatuses.PAID
+    order = SimpleNamespace(id=order_id, description="lot", price=1, amount=1,
+                            buyer_username=buyer, buyer_id=1, subcategory_name=category,
+                            status=status)
+    return SimpleNamespace(type=kind, order=order)
+
+
+def chat_event(name):
+    chat = SimpleNamespace(id=5, name=name, last_message_text="@me", unread=True)
+    return SimpleNamespace(type=EVENTS.LAST_CHAT_MESSAGE_CHANGED, chat=chat)
+
+
+def test_disabled_game_hides_order_and_buyer_chat_until_closed(tmp_path, monkeypatch):
+    monkeypatch.setenv("FUNPAY_BOT_DATA_DIR", str(tmp_path))
+    write(tmp_path, "p/demo.py",
+          "seen = []\n"
+          "def setup(api):\n"
+          "    api.on('order', lambda d: seen.append(('order', d['order_id'])))\n"
+          "    api.on('order_status', lambda d: seen.append(('status', d['order_id'])))\n"
+          "    api.on('message', lambda d: seen.append(('message', d['author'])))\n")
+    host = plugins.PluginHost()
+    host.load(str(tmp_path / "p"))
+    host.bind(client(), None, lambda: False)
+    seen = __import__("sys").modules["funpayflow_plugin_demo"].seen
+
+    assert host.add_game("GTA") and host.add_game("Ёлка") and not host.add_game("gta")
+    assert host.toggle_game(0) is False                      # GTA off
+    host.dispatch(order_event("AAAAAAAA", "bob", "GTA 6, PS5"))
+    host.dispatch(chat_event("bob"))
+    host.dispatch(order_event("BBBBBBBB", "ann", "Steam"))
+    host.dispatch(order_event("CCCCCCCC", "eve", "елка"))    # ё/е and case
+    flush(host)
+    assert seen == [("order", "BBBBBBBB"), ("order", "CCCCCCCC")]
+
+    restarted = plugins.PluginHost()                         # hold survives restart
+    restarted._subscribers, restarted._executor = host._subscribers, host._executor
+    restarted.bind(client(), None, lambda: False)
+    assert restarted.games() == [("GTA", False), ("Ёлка", True)]
+    restarted.dispatch(chat_event("bob"))
+    restarted.dispatch(order_event("AAAAAAAA", "bob", "GTA 6, PS5",
+                                   FunPayAPI.types.OrderStatuses.CLOSED,
+                                   EVENTS.ORDER_STATUS_CHANGED))
+    restarted.dispatch(chat_event("bob"))                    # order closed: chat flows again
+    flush(restarted)
+    assert seen[2:] == [("message", "bob")]
+    assert restarted.remove_game(1) and restarted.games() == [("GTA", False)]
+    assert not restarted.add_game("") and not restarted.add_game("x" * 41)
+
+
+def test_telegram_game_filter_add_toggle_owner_only(tmp_path, monkeypatch):
+    import asyncio
+    from unittest.mock import AsyncMock
+    from funpayflow import telegram as ui
+    monkeypatch.setenv("FUNPAY_BOT_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("ADMIN_ID", "7")
+    host = plugins.PluginHost()
+    host.loaded = ["demo"]
+    monkeypatch.setattr(plugins, "host", host)
+
+    def press(user_id, data):
+        callback = SimpleNamespace(answer=AsyncMock(),
+                                   message=SimpleNamespace(edit_text=AsyncMock()))
+        asyncio.run(ui._game_filter_callback(callback, data, user_id))
+        return callback
+
+    assert "plgf:" in str(ui.get_main_keyboard(7))
+    assert press(8, "plgf:add").answer.await_args.kwargs["show_alert"] is True
+    press(7, "plgf:add")
+    reply = SimpleNamespace(text="GTA", answer=AsyncMock())
+    assert asyncio.run(ui._game_filter_input(reply, 7)) is True
+    assert host.games() == [("GTA", True)]
+    assert asyncio.run(ui._game_filter_input(reply, 7)) is False   # prompt used once
+    press(7, "plgf:t:0")
+    assert host.games() == [("GTA", False)]
+    stale = press(7, "plgf:t:9")
+    assert stale.answer.await_count == 1 and stale.answer.await_args.kwargs["show_alert"]
+    press(7, "plgf:d:0")
+    assert host.games() == []
