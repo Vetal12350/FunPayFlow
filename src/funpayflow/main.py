@@ -743,13 +743,16 @@ async def notifications_loop(bot: Bot, client: FunPayClient):
 
     async def refill_backlog() -> None:
         try:
-            malformed = await asyncio.to_thread(client.enqueue_pending_critical_events)
-            _clear_problem("BACKLOG_UNAVAILABLE")
-            if malformed:
-                _set_problem("BACKLOG_MALFORMED")
+            malformed = await asyncio.to_thread(client.refill_critical_events)
         except Exception:
             _set_problem("BACKLOG_UNAVAILABLE")
             raise
+        if malformed is None:
+            _set_problem("BACKLOG_UNAVAILABLE")
+            return
+        _clear_problem("BACKLOG_UNAVAILABLE")
+        if malformed:
+            _set_problem("BACKLOG_MALFORMED")
 
     client.start_runner()
     try:

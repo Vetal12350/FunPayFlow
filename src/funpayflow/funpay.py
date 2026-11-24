@@ -973,6 +973,30 @@ class FunPayClient:
                     self._queued_backlog_ids.add(row["event_id"])
         return malformed
 
+    BACKLOG_OUTAGE_LIMIT = 600.0
+
+    def refill_critical_events(self, now: float | None = None) -> int | None:
+        """Refill the delivery queue, riding out a short storage outage.
+
+        The hosting snapshot freezes the disk for a few minutes every night; the
+        backlog stays durable, so a read failure is retried on the next idle tick.
+        Returns None while unavailable; raises once it lasts BACKLOG_OUTAGE_LIMIT."""
+        now = time.monotonic() if now is None else now
+        try:
+            malformed = self.enqueue_pending_critical_events()
+        except StateError as error:
+            since = getattr(self, "_backlog_outage_since", None)
+            if since is None:
+                self._backlog_outage_since = since = now
+                logger.warning(f"Очередь событий недоступна, повтор до 10 мин: {error_label(error)}.")
+            if now - since > self.BACKLOG_OUTAGE_LIMIT:
+                raise
+            return None
+        if getattr(self, "_backlog_outage_since", None) is not None:
+            logger.info("Очередь событий снова доступна.")
+        self._backlog_outage_since = None
+        return malformed
+
     def dequeued_critical_event(self, event_id: str) -> None:
         with self._runner_publish_lock:
             self._queued_backlog_ids.discard(event_id)

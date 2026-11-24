@@ -215,6 +215,22 @@ class RuntimeCoreTests(unittest.TestCase):
                                                  snapshot.entity_id, snapshot.payload)
         self.assertEqual(self.client().event_queue.qsize(), 0)
 
+    def test_refill_rides_out_a_short_storage_freeze(self):
+        snapshot = critical_snapshot(order_event())
+        self.store.insert_critical_event(snapshot.event_id, snapshot.event_type,
+                                         snapshot.entity_id, snapshot.payload)
+        client = self.client()
+        frozen = sqlite3.OperationalError("database is locked")
+        with patch.object(self.store, "_connect", side_effect=frozen):
+            self.assertIsNone(client.refill_critical_events(now=100.0))
+            self.assertIsNone(client.refill_critical_events(now=100.0 + 599))
+            with self.assertRaises(StateError):
+                client.refill_critical_events(now=100.0 + 601)
+        self.assertEqual(client.refill_critical_events(now=800.0), 0)
+        self.assertEqual(client.event_queue.qsize(), 1)
+        with patch.object(self.store, "_connect", side_effect=frozen):
+            self.assertIsNone(client.refill_critical_events(now=900.0))   # new outage, new window
+
     def test_replayed_order_flows_through_consumer_once(self):
         source = Path("src/funpayflow/main.py").read_text(encoding="utf-8")
         wanted = {"_order_observation", "_order_history_fields",
