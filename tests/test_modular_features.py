@@ -606,7 +606,7 @@ class WorkerGateTests(ModuleStateMixin, unittest.IsolatedAsyncioTestCase):
         state = SimpleNamespace(recover_critical_events=lambda: None,
                                 pending_review_requests=lambda: [])
         client = SimpleNamespace(event_queue=queue_, review_state=state,
-                                 enqueue_pending_critical_events=lambda: 0,
+                                 enqueue_pending_critical_events=lambda: 0, refill_critical_events=lambda: 0,
                                  start_runner=lambda: calls.append("runner"),
                                  runner_failed=lambda: False,
                                  describe_event=lambda event: [ActionEvent(
