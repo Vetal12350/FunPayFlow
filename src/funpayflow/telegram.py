@@ -948,6 +948,8 @@ def get_main_keyboard(user_id: int):
         from . import plugins
         if plugins.host.toggles():
             rows.append([_button("🔌 Плагины", plugins.TOGGLE_PREFIX)])
+        if plugins.host.loaded:
+            rows.append([_button("🤖 Автовыдача", "plgf:")])
         rows.append([_button("🔄 Перезапустить бота", "restart_open")])
     return _menu(rows)
 
@@ -2670,6 +2672,74 @@ async def _plugin_toggle_callback(callback: CallbackQuery, action: str, user_id:
     await _edit_or_keep_menu(callback.message, "🔌 <b>Плагины</b>", get_plugin_toggles_keyboard())
 
 
+_GAME_FILTER_TEXT = (
+    "🤖 <b>Автовыдача</b>\n\n"
+    "❌ — заказы этой игры не передаются плагину: выдаёте вручную. "
+    "Сообщения покупателя тоже не передаются, пока заказ не закрыт.\n"
+    "Игра определяется по названию категории заказа на FunPay.")
+
+
+def get_game_filter_keyboard():
+    from . import plugins
+    rows = [[_button(f"{name}: {on_icon(on)}", f"plgf:t:{index}"),
+             _button("🗑", f"plgf:d:{index}")]
+            for index, (name, on) in enumerate(plugins.host.games())]
+    rows.append([_button("➕ Добавить игру", "plgf:add")])
+    rows.append([_button("🔙 Назад", "menu_main")])
+    return _menu(rows)
+
+
+async def _game_filter_callback(callback: CallbackQuery, action: str, user_id: int) -> None:
+    """Owner-only: which games local plugins may handle automatically."""
+    from . import plugins
+    if not _owner_id(user_id):
+        await callback.answer("Настройка доступна только владельцу.", show_alert=True)
+        return
+    _interaction_state.pop(user_id, None)
+    operation, _, index = action[len("plgf:"):].partition(":")
+    if operation == "add":
+        _interaction_state[user_id] = {"action": "game_filter_add"}
+        await callback.answer()
+        await callback.message.edit_text(
+            "Отправьте название игры так, как оно написано в категории FunPay, например: GTA.",
+            reply_markup=_menu([[_button("🔙 Назад", "plgf:")]]))
+        return
+    if operation in {"t", "d"}:
+        if not index.isdecimal():
+            await callback.answer("Кнопка устарела.", show_alert=True)
+            return
+        change = plugins.host.toggle_game if operation == "t" else plugins.host.remove_game
+        try:
+            result = await asyncio.to_thread(change, int(index))
+        except OSError as e:
+            logger.warning(f"Game filter not saved: {type(e).__name__}.")
+            await callback.answer("⚠️ Не удалось сохранить. Ничего не изменено.", show_alert=True)
+            return
+        if result is None or (operation == "d" and result is False):
+            await callback.answer("Кнопка устарела, список обновлён.", show_alert=True)
+            await _edit_or_keep_menu(callback.message, _GAME_FILTER_TEXT, get_game_filter_keyboard())
+            return
+    await callback.answer()
+    await _edit_or_keep_menu(callback.message, _GAME_FILTER_TEXT, get_game_filter_keyboard())
+
+
+async def _game_filter_input(message, user_id) -> bool:
+    if _interaction_state.get(user_id, {}).get("action") != "game_filter_add":
+        return False
+    from . import plugins
+    _interaction_state.pop(user_id, None)
+    try:
+        added = await asyncio.to_thread(plugins.host.add_game, message.text or "")
+    except OSError as e:
+        logger.warning(f"Game filter not saved: {type(e).__name__}.")
+        added = None
+    note = ("" if added else "⚠️ Не добавлено: пустое или длиннее 40 символов, уже есть в списке, "
+            "или не удалось сохранить.\n\n")
+    await message.answer(note + _GAME_FILTER_TEXT, reply_markup=get_game_filter_keyboard(),
+                         parse_mode="HTML")
+    return True
+
+
 async def _plugin_button_callback(callback: CallbackQuery, action: str, user_id: int) -> None:
     """Owner pressed a button attached by a local plugin (authorized users only)."""
     from . import plugins
@@ -2711,6 +2781,11 @@ async def callback_handler(callback: CallbackQuery):
     if action.startswith("plgt:"):
         await _plugin_toggle_callback(callback, action, user_id)
         return
+    if action.startswith("plgf:"):
+        await _game_filter_callback(callback, action, user_id)
+        return
+    if _interaction_state.get(user_id, {}).get("action") == "game_filter_add":
+        _interaction_state.pop(user_id, None)  # left the "add game" prompt via another button
     if await _autobump_schedule_callback(callback, action, user_id):
         return
     _discard_schedule_editor(user_id)
@@ -2926,6 +3001,8 @@ async def text_handler(message: Message):
         if await products_input(message, user_id):
             return
         if await _autobump_schedule_input(message, user_id):
+            return
+        if await _game_filter_input(message, user_id):
             return
         from .telegram_lots import templates_input
         if await templates_input(message, user_id):

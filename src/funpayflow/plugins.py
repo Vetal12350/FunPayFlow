@@ -10,6 +10,10 @@ packages (``<name>/__init__.py``) or modules (``<name>.py``). Each defines
 "Plugins" menu in Telegram; ``api.enabled(key)`` reads it. The state is kept
 in the plugin's data directory and survives restarts.
 
+The owner can also switch a game off for plugins (Telegram "Автовыдача"
+menu): orders whose category contains that name, and chat previews from
+their buyers until the order is closed, are not passed to any plugin.
+
 Callbacks run one at a time in a dedicated worker thread, never blocking the
 bot. A failing plugin is logged by exception type only and never stops the
 bot. Events may be delivered again after a restart (backlog replay): plugins
@@ -39,6 +43,8 @@ _NAME = re.compile(r"[a-z][a-z0-9_]{0,40}")
 _TOKEN = re.compile(r"[A-Za-z0-9_:-]{1,40}")
 _TOGGLE_KEY = re.compile(r"[a-z0-9_]{1,16}")
 TOGGLE_PREFIX = "plgt:"
+_FINISHED = {"CLOSED", "REFUNDED"}
+_MAX_HELD = 500
 BUTTON_PREFIX = "plg:"
 BUTTON_TIMEOUT = 60.0
 
@@ -186,6 +192,8 @@ class PluginHost:
         self.loaded: list[str] = []
         self._attempted = False
         self._toggles: dict[tuple[str, str], list] = {}  # (plugin, key) -> [label, value]
+        self._games: list[list] | None = None  # [[name, enabled]], loaded on first use
+        self._held: dict[str, str] = {}        # order_id -> buyer of a switched-off game
 
     @property
     def active(self) -> bool:
@@ -275,6 +283,106 @@ class PluginHost:
             entry[1] = state[key]
             return entry[1]
 
+    @staticmethod
+    def _filter_file() -> Path:
+        path = data_dir() / "plugins"
+        path.mkdir(mode=0o700, parents=True, exist_ok=True)
+        return path / "order_filter.json"
+
+    def _load_filter(self) -> None:
+        """Call under self._lock."""
+        if self._games is not None:
+            return
+        try:
+            saved = json.loads(self._filter_file().read_text(encoding="utf-8"))
+            games = [[str(n), bool(on)] for n, on in saved["games"]]
+            held = {str(k): str(v) for k, v in saved["held"].items()}
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
+            games, held = [], {}
+        self._games, self._held = games, held
+
+    def _save_filter(self) -> None:
+        """Call under self._lock; raises OSError so a failed save is not reported as done."""
+        path = self._filter_file()
+        temporary = path.with_suffix(".tmp")
+        temporary.write_text(json.dumps({"games": self._games, "held": self._held},
+                                        ensure_ascii=False), encoding="utf-8")
+        os.replace(temporary, path)
+
+    @staticmethod
+    def _norm(text) -> str:
+        return str(text or "").casefold().replace("ё", "е")
+
+    def games(self) -> list[tuple[str, bool]]:
+        with self._lock:
+            self._load_filter()
+            return [(name, on) for name, on in self._games]
+
+    def add_game(self, name: str) -> bool:
+        name = name.strip() if isinstance(name, str) else ""
+        with self._lock:
+            self._load_filter()
+            if (not 0 < len(name) <= 40 or len(self._games) >= 50
+                    or any(self._norm(n) == self._norm(name) for n, _ in self._games)):
+                return False
+            self._games.append([name, True])
+            try:
+                self._save_filter()
+            except OSError:
+                self._games.pop()
+                raise
+            return True
+
+    def toggle_game(self, index: int) -> bool | None:
+        with self._lock:
+            self._load_filter()
+            if not 0 <= index < len(self._games):
+                return None
+            self._games[index][1] = not self._games[index][1]
+            try:
+                self._save_filter()
+            except OSError:
+                self._games[index][1] = not self._games[index][1]
+                raise
+            return self._games[index][1]
+
+    def remove_game(self, index: int) -> bool:
+        with self._lock:
+            self._load_filter()
+            if not 0 <= index < len(self._games):
+                return False
+            removed = self._games.pop(index)
+            try:
+                self._save_filter()
+            except OSError:
+                self._games.insert(index, removed)
+                raise
+            return True
+
+    def _withheld(self, kind: str, data: dict) -> bool:
+        """True when this event belongs to a game the owner switched off."""
+        with self._lock:
+            self._load_filter()
+            if kind == "message":
+                author = data.get("author") or data.get("chat_name")
+                return author is not None and author in self._held.values()
+            order_id = data.get("order_id")
+            finished = data.get("status") in _FINISHED
+            if order_id in self._held:
+                if finished:
+                    del self._held[order_id]
+                    self._save_filter()
+                return True
+            text = self._norm(f"{data.get('subcategory_name')} {data.get('description')}")
+            if not any(not on and self._norm(name) in text for name, on in self._games):
+                return False
+            if not finished and isinstance(order_id, str):
+                self._held[order_id] = str(data.get("buyer_username"))
+                while len(self._held) > _MAX_HELD:
+                    del self._held[next(iter(self._held))]
+                self._save_filter()
+            return True
+
     def _notify(self, text, buttons=None) -> bool:
         notifier = self._notifier
         if notifier is None or not isinstance(text, str) or not text.strip():
@@ -322,6 +430,12 @@ class PluginHost:
         if payload is None or not self._subscribers[payload[0]]:
             return
         kind, data = payload
+        try:
+            if self._withheld(kind, data):
+                return
+        except OSError as error:  # cannot record the hold: fail closed for this event
+            logger.warning(f"Плагины: фильтр автовыдачи не сохранён: {type(error).__name__}.")
+            return
         self._executor.submit(self._run, kind, data)
 
     def _run(self, kind, data) -> None:
