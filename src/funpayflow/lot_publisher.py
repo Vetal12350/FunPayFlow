@@ -718,7 +718,7 @@ class LotPublisher:
         except Exception:
             raise PublisherError('DATABASE') from None
 
-    def inspect_new(self, review, *, diagnostics=None):
+    def inspect_new(self, review, *, diagnostics=None, control_names=None):
         """Consume an owner intent at the UI boundary; GET only, no claim/POST.
 
         The durable guard is consulted even though this path cannot submit.
@@ -745,7 +745,7 @@ class LotPublisher:
             observed = {}
             proof, matches = inspect_fresh_new_form(self.client, self.store, review.fingerprint,
                 tuple((name, value) for name, value, _, _ in review.selections),
-                node_id=review.node_id, diagnostics=observed)
+                node_id=review.node_id, diagnostics=observed, control_names=control_names)
             self._scope_gate(account, review)
             require(self.review(review.draft_id, review.revision, review.currency) == review, 'REVISION')
             route_current()

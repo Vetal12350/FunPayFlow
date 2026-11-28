@@ -439,8 +439,9 @@ async def _publication_callback(callback, user_id, parts, store, routes):
     elif operation == 'inspect':
         # Consume before waiting for the Account lock or making any request.
         state['token'] = None
-        diagnostics = {}
-        proof, _ = await asyncio.to_thread(publisher.inspect_new, review, diagnostics=diagnostics)
+        diagnostics, control_names = {}, []
+        proof, _ = await asyncio.to_thread(publisher.inspect_new, review, diagnostics=diagnostics,
+                                           control_names=control_names)
         if not current():
             return
         blocked = None
@@ -480,7 +481,8 @@ async def _publication_callback(callback, user_id, parts, store, routes):
             'editor_url', 'document_markup', 'form_subtree', 'submission', 'blank_identity',
             'node_identity', 'csrf_presence', 'control_inventory', 'select_names',
             'currency_control', 'currency', 'manual_control', 'manual_delivery')]
-        lines += ['Ничего не отправлено.']
+        lines += ['Поля формы: ' + (', '.join(control_names) or 'не прочитаны'),
+                  'Ничего не отправлено.']
         await _show(callback, escape('\n'.join(lines)), _menu([[('📝 Мои черновики', 'prd:drafts:0')]]))
         if current():
             await callback.message.answer(escape(_publication_diagnostics_text(diagnostics, review.currency)))

@@ -163,12 +163,24 @@ def test_action_and_method_fixed_enums(old, new, key, expected):
     assert observe(new_html().replace(old, new))[key] == expected
 
 
-@pytest.mark.parametrize('change', ['duplicate_attributes', 'script', 'outside_malformed', 'url'])
+def test_messy_page_outside_the_form_still_reports_the_form():
+    # A live FunPay page is never strict markup outside the editor form.
+    d = observe(new_html() + '<div><span></div><script>if (a < b) {}</script>', URL)
+    assert d['context'] == 'OBSERVED' and d['csrf_token_hidden'] != 'UNKNOWN'
+
+
+def test_form_control_names_report_names_and_kinds_never_values():
+    names = node_form.form_control_names(new_html().replace('</form>',
+        f'<input type="hidden" name="csrf_token" value="{CANARY}"><input name="bad name"></form>'))
+    assert 'price:text' in names and 'csrf_token:hidden' in names and '?:text' in names
+    assert CANARY not in str(names)
+
+
+@pytest.mark.parametrize('change', ['duplicate_attributes', 'script', 'url'])
 def test_unsafe_context_cannot_produce_positive_diagnostics(change):
     html, url = new_html(), URL
     if change == 'duplicate_attributes': html = html.replace('name="price"', 'name="price" name="private"')
     elif change == 'script': html = html.replace('</form>', f'<script>{CANARY}</script></form>')
-    elif change == 'outside_malformed': html += '<div><span></div>'
     else: url += '&offer=71'
     d = observe(html, url)
     assert d['context'] in {'UNSAFE_STRUCTURE', 'RESPONSE_CONTEXT'}

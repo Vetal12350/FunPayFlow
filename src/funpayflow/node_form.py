@@ -497,7 +497,7 @@ def prove_new_form_contract(html, response_url, node_id, *, diagnostics=None):
         result['form_subtree'] = 'verified' if valid else 'ambiguous'
         if type(diagnostics) is dict:
             context = ('RESPONSE_CONTEXT' if result['editor_url'] != 'verified' else
-                       'UNSAFE_STRUCTURE' if not valid or result['document_markup'] != 'verified' else
+                       'UNSAFE_STRUCTURE' if not valid else
                        'SELECT_CONTEXT' if not schema['fields'] else 'OBSERVED')
             diagnostics.update(_new_form_diagnostics(form, soup) if context == 'OBSERVED' else
                                dict(safe_new_form_diagnostics(), context=context))
@@ -918,7 +918,28 @@ def _fresh_new_editor(account, node_id):
                 pass
 
 
-def inspect_fresh_new_form(client, store, fingerprint, selections, *, node_id, diagnostics=None):
+_SAFE_CONTROL_NAME = re.compile(r'[A-Za-z_][A-Za-z0-9_]{0,40}(?:\[[A-Za-z0-9_]{0,40}\]){0,3}')
+
+
+def form_control_names(html):
+    """'name:kind' of each NEW-form control for the owner's report; never a value."""
+    try:
+        form = BeautifulSoup(html, 'html.parser').select_one('form.form-offer-editor')
+    except Exception:
+        return ()
+    result = []
+    for control in (form.find_all(['input', 'select', 'textarea']) if form is not None else ()):
+        name = control.get('name')
+        kind = control.name if control.name != 'input' else str(control.get('type', 'text')).lower()
+        result.append(('?' if type(name) is not str or not _SAFE_CONTROL_NAME.fullmatch(name) else name)
+                      + ':' + (kind if re.fullmatch(r'[a-z]{1,10}', kind) else '?'))
+        if len(result) >= 60:
+            break
+    return tuple(result)
+
+
+def inspect_fresh_new_form(client, store, fingerprint, selections, *, node_id, diagnostics=None,
+                           control_names=None):
     """Uncached, scoped NEW inspection; only fixed facts leave this call.
 
     Presence of a blank identity/CSRF is an observation, never authorization to
@@ -937,6 +958,8 @@ def inspect_fresh_new_form(client, store, fingerprint, selections, *, node_id, d
             html = _fresh_new_editor(account, node_id).decode('utf-8')
         except UnicodeError:
             raise NodeFormError('CONTENT_ENCODING') from None
+        if type(control_names) is list:
+            control_names[:] = form_control_names(html)
         schema = _parse(html, node_id, account_id=account.id)
         body = BeautifulSoup(html, 'html.parser').find('body')
         if body is None or not body.has_attr('data-app-data'):
