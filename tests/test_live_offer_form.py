@@ -201,3 +201,13 @@ def test_messy_live_page_around_a_clean_form_is_accepted(fingerprint):
     broken = live_html().replace('</form>', '<div></form>')        # inside the form: still refused
     with pytest.raises(PublisherError):
         read(broken)
+
+
+def test_page_hidden_parameter_is_sent_with_its_default_like_a_browser(fingerprint):
+    # FunPay hides some parameters (e.g. a region) until another choice needs them.
+    hidden = ('<div class="form-group hidden"><select name="fields[region2]">'
+              '<option value="">-</option><option value="7">EU</option></select></div>')
+    schema, service = read(live_html(extra=hidden))
+    assert dict(service)['fields[region2]'] == ''
+    with pytest.raises(PublisherError):                     # the same select, visible: refused
+        read(live_html(extra=hidden.replace(' hidden', '')))

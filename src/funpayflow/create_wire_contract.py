@@ -408,7 +408,10 @@ def read_live_form(html, *, fingerprint, account_id, selections, currency, node_
                 if c.get('name') and not c.has_attr('disabled')]
     hidden = {c['name'] for c in controls
               if c.name == 'input' and c.get('type', '').lower() == 'hidden'}
-    visible = {c['name'] for c in controls} - hidden
+    # Parameters the page hides until another choice needs them go out with the
+    # form's own default, exactly as a browser (and FunPayAPI save_lot) submits them.
+    page_hidden = {c['name'] for c in controls if node_form._hidden(c)}
+    visible = {c['name'] for c in controls} - hidden - page_hidden
     require(visible <= KNOWN_VISIBLE | select_names, 'SCHEMA')
     # A hidden lot parameter (e.g. filled by a script) would also go out empty.
     require(not {n for n in hidden if n.startswith('fields[')} - select_names - {'fields[images]'},
