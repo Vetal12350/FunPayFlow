@@ -198,9 +198,9 @@ def test_owner_get_diagnostic_redacted_transient_and_single_use(saved, caplog):
         request = action('inspect')
         cb = await send(request)
         text = cb.message.answer.call_args.args[0]
-        assert 'Данные формы / диагностика' in text
+        assert 'Технические данные формы' in text
         for expected in ('price=RUB', 'CHECKBOX_NO', 'secrets=TEXTAREA', 'active=ABSENT',
-                         'account=UNKNOWN', 'OBSERVED_CONFLICT', 'location=PRESENT', 'POST OFF', 'скриншоты'):
+                         'account=UNKNOWN', 'OBSERVED_CONFLICT', 'location=PRESENT', 'Ничего не отправлено', 'Не присылайте cookies'):
             assert expected in text
         assert CANARY not in str(cb.message.answer.call_args_list) + str(cb.message.edit_text.call_args_list)
         assert 'inspect' not in str(cb.message.edit_text.call_args.kwargs['reply_markup'])
@@ -260,7 +260,7 @@ def test_wrong_account_edit_and_node_never_emit_diagnostic(saved, old, new, capl
         await preview(c)
         intent = action('inspect')
         cb = await send(intent)
-        assert 'Данные формы / диагностика' not in str(cb.message.answer.call_args_list)
+        assert 'Технические данные формы' not in str(cb.message.answer.call_args_list)
         assert CANARY not in str(cb.message.answer.call_args_list) + caplog.text
         await send(intent)
         assert c.get.call_count == 1

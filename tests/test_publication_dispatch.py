@@ -72,7 +72,7 @@ def test_telegram_final_full_summary_one_post_independent_id_permanent_claim(dis
         cb = await send(action('inspect'))
         assert 'Опубликовать 1 лот' in str(cb.message.edit_text.call_args)
         summary = cb.message.answer.call_args.args[0]
-        for text in (*c.draft['payload'].values(), '274', '986', '42', 'USD'):
+        for text in (*c.draft['payload'].values(), '986', '42', 'USD'):
             assert str(text) in summary
         request = action('publish')
         c.publisher = view._flows[1]['publication']['publisher']

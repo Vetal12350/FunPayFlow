@@ -121,11 +121,11 @@ def test_compact_menus_and_legacy_entries(context):
             assert 'локальные черновики' in shown.args[0]
             assert 'лот создаётся выключенным' in shown.args[0].lower()
             assert not any(word in shown.args[0] for word in ('Template', 'Route', 'variables'))
-        for action, title in [('prd:drafts:0', 'drafts'),
+        for action, title in [('prd:drafts:0', 'черновики'),
                               ('prd:templates:0', 'Product Templates'),
-                              ('prd:choose:single:0', 'Выберите Product Template'),
-                              ('prd:choose:bulk:0', 'Выберите Product Template'),
-                              ('prd:choose:routes:0', 'Выберите Product Template')]:
+                              ('prd:choose:single:0', 'Что продаёте?'),
+                              ('prd:choose:bulk:0', 'Что продаёте?'),
+                              ('prd:choose:routes:0', 'Что продаёте?')]:
             await view.products_callback(cb, action, 1)
             assert title in cb.message.edit_text.call_args.args[0]
         assert not await view.products_callback(cb, 'lot_templates', 1)  # Existing lots handler owns it.
@@ -720,7 +720,7 @@ def test_single_draft_wizard_edit_save_duplicate_and_restart(context, quick):
         for lang in ('ru', 'en'):
             assert 'Elden Ring' in payload['title_' + lang]
             assert payload['description_' + lang]
-        assert 'RU + EN' in str(view._preview_screen(view._flows[1]))
+        assert 'Черновик лота' in str(view._preview_screen(view._flows[1]))
         await view.products_callback(cb, preview_action('prd:edit:emoji'), 1)
         await view.products_input(message('⚔️'), 1)
         await view.products_callback(cb, preview_action('prd:edit:en'), 1)
@@ -767,7 +767,7 @@ def test_quick_entry_saved_routes_custom_template_and_cancel(context):
         await view.products_callback(cb, 'prd:quick', 1)
         shown = str(cb.message.edit_text.call_args)
         assert all(route['game_name'] in shown for route in routes)
-        assert 'Выберите Product Template' not in shown
+        assert 'Что продаёте?' not in shown
         assert view._flows[1]['template_id'] == customized['id']
         assert ctx.templates.get(customized['id']) == customized
         ctx.client.account.method.assert_not_called()
@@ -841,7 +841,7 @@ def test_type_selector_confirmed_catalog_node_fields_preview_save_restart(contex
         await view.products_callback(cb, f"prd:rt:{state['token']}:game:200", 1)
         state = flow['catalog_state']
         assert state['view'] == 'confirm' and ctx.store.list_routes() == []
-        assert 'legacy game_name' in str(cb.message.edit_text.call_args)
+        assert 'Игра на FunPay' in str(cb.message.edit_text.call_args)
         await view.products_callback(cb, f"prd:rt:{state['token']}:confirm:0", 1)
         route = ctx.store.list_routes()[0]
         assert route['node_id'] == 100 and route['template_id'] == kind
@@ -966,7 +966,7 @@ def test_type_selector_leaving_screen_and_missing_safe_category(context, kind):
         ctx.client.account.subcategories = []
         await view.products_callback(cb, 'prd:types', 1)
         await view.products_callback(cb, f"prd:preset:{view._flows[1]['type_token']}:{kind}", 1)
-        assert 'Без подходящей подтверждённой COMMON-категории' in str(cb.message.edit_text.call_args)
+        assert 'такой игры не нашлось' in str(cb.message.edit_text.call_args)
         flow = view._flows[1]
         assert not flow.get('preview') and not flow.get('route_id')
         await view.products_callback(cb, 'prd:save:invented', 1)
@@ -1138,7 +1138,7 @@ def test_long_preview_is_safe_and_legacy_drafts_untouched(context):
     text, markup = view._preview_screen({'preview': preview})
     assert len(text.encode('utf-16-le')) // 2 < 4096
     assert '&lt;' in text
-    assert 'PUBLISH отсутствует' in text
+    assert 'на FunPay пока ничего не отправлено' in text
     assert all(len(b.callback_data.encode()) <= 64 for row in markup.inline_keyboard for b in row)
     assert ctx.receipt.get_lot_template_draft('1', old['draft_id']) == old
 
