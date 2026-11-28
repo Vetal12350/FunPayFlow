@@ -103,6 +103,8 @@ def test_opt_in_presets_concurrent_initialization_and_customization(tmp_path):
 
 def test_new_presets_require_actual_product_details_and_authorization():
     for kind, _ in BUILTIN_TYPES[1:]:
+        if kind == 'XBOX_KEY':      # a key: edition/region have honest defaults, the name does not
+            continue
         body = builtin_template(kind)
         assert body['defaults'] == {'quantity': '1'}
         with unittest.TestCase().assertRaises(ProductValidationError):
@@ -188,3 +190,11 @@ def test_xbox_key_preset_renders_bilingual_texts():
                                     'Xbox One / Series X|S | Ключ | Argentina')
     assert 'Key' in rendered['title_en'] and 'redeem.microsoft.com' in rendered['description_ru']
     assert 'Argentina' in rendered['description_en'] and len(rendered['title_ru']) <= 100
+
+
+def test_xbox_key_defaults_only_edition_region_quantity():
+    body = builtin_template('XBOX_KEY')
+    assert body['defaults'] == {'quantity': '1', 'sale_edition': 'Standard Edition',
+                                'availability': 'Global'}
+    with unittest.TestCase().assertRaises(ProductValidationError):   # the game name is never guessed
+        ProductTemplate(body).render({'game': 'Catalogue category', 'product_name': 'Category'})
