@@ -17,7 +17,7 @@ CANARY = 'SYNTHETIC-PRIVATE-CANARY'
 
 def observe(html=None, url=URL):
     diagnostics = {'untrusted': CANARY}
-    proof = node_form.prove_new_form_contract(html or new_html(), url, diagnostics=diagnostics)
+    proof = node_form.prove_new_form_contract(html or new_html(), url, 986, diagnostics=diagnostics)
     assert node_form.safe_new_form_diagnostics(diagnostics) == diagnostics
     assert proof['publish_ready'] is False
     assert all(proof[k] == 'unverified' for k in (
@@ -231,13 +231,13 @@ def test_account_replacement_during_get_withholds_diagnostic_even_from_inspector
     review = publisher.review(c.draft['id'], c.draft['revision'], 'USD')
     diagnostics = observe()
 
-    def get(account):
+    def get(account, node_id):
         c.client.account = SimpleNamespace(**vars(account))
         return c.html.encode()
     c.get.side_effect = get
     with pytest.raises(node_form.NodeFormError, match='Не удалось'):
         node_form.inspect_fresh_new_form(c.client, c.store, review.fingerprint,
-            tuple((n, v) for n, v, _, _ in review.selections), diagnostics=diagnostics)
+            tuple((n, v) for n, v, _, _ in review.selections), node_id=986, diagnostics=diagnostics)
     assert diagnostics == node_form.safe_new_form_diagnostics()
     assert c.get.call_count == 1
 

@@ -199,7 +199,7 @@ def test_transport_calls_are_limited_to_guarded_integration():
 ])
 def test_exact_structural_blocker_does_not_hide_currency_or_id_evidence(old, new, code):
     proof = prove_new_form_contract(new_html().replace(old, new),
-                                    'https://funpay.com/lots/offerEdit?node=986')
+                                    'https://funpay.com/lots/offerEdit?node=986', 986)
     blockers = publication_blockers(proof, True)
     assert code in blockers
     assert 'CURRENCY_MAPPING' in blockers and 'MANUAL_MAPPING' in blockers
@@ -209,7 +209,7 @@ def test_exact_structural_blocker_does_not_hide_currency_or_id_evidence(old, new
 
 
 def test_even_forged_green_matrix_cannot_remove_semantic_blockers():
-    proof = prove_new_form_contract(new_html(), 'https://funpay.com/lots/offerEdit?node=986')
+    proof = prove_new_form_contract(new_html(), 'https://funpay.com/lots/offerEdit?node=986', 986)
     assert proof['currency_control'] == 'absent'
     assert 'CURRENCY_MAPPING' in publication_blockers(proof, True)
     proof['publish_ready'] = True

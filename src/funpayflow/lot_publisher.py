@@ -1,4 +1,4 @@
-"""Saved GAME_KEY owner confirmation; unverified live profiles stay disabled.
+"""Saved draft owner confirmation for its own FunPay node; one fail-closed POST.
 
 The service controls and receipt below are an OFFLINE protocol, not a claim
 about FunPay's wire format. SyntheticTransport has no implementation. The dormant
@@ -25,7 +25,7 @@ from .node_form import (is_safe_node_binding_name, inspect_fresh_new_form, safe_
                         safe_new_form_diagnostics, _EvidenceMarkup)
 from .node_products import selected_fields
 from .product_drafts import validate_price
-from .product_templates import GAME_KEY, safe_text
+from .product_templates import safe_text
 from .runtime_control import automatic_action_gate
 from .game_routes import RouteService, RouteError
 
@@ -74,7 +74,7 @@ class OwnOffer:
 
 @dataclass(frozen=True)
 class OwnInventory:
-    """Transient, node-986-only evidence; no HTML, controls or offer text."""
+    """Transient evidence for the review's node only; no HTML, controls or offer text."""
     owner_id: str
     account_id: int
     account_instance: int
@@ -96,7 +96,7 @@ def _inventory_digest(value):
         separators=(',', ':')).encode('utf-8')).hexdigest()
 
 
-def _inventory_get(account, offer_id=None):
+def _inventory_get(account, node_id, offer_id=None):
     """Pinned 1.1.0 authentication, bounded GET only, no redirects/retries.
 
     1.1.0 has no get_my_subcategory_lots or Session. Its get_lot_fields echoes
@@ -106,7 +106,8 @@ def _inventory_get(account, offer_id=None):
     """
     require(version('FunPayAPI') == '1.1.0' and type(account) is Account, 'READBACK')
     require(offer_id is None or (type(offer_id) is int and offer_id > 0), 'READBACK')
-    url = 'https://funpay.com/' + ('lots/986/trade' if offer_id is None
+    require(type(node_id) is int and 0 < node_id < 2**63, 'READBACK')
+    url = 'https://funpay.com/' + (f'lots/{node_id}/trade' if offer_id is None
                                  else f'lots/offerEdit?offer={offer_id}')
     headers = {'accept': '*/*', 'cookie': f'golden_key={account.golden_key}',
                'cache-control': 'no-cache', 'pragma': 'no-cache'}
@@ -140,7 +141,7 @@ def _inventory_get(account, offer_id=None):
             response.close()
 
 
-def _trade_inventory(html, account_id):
+def _trade_inventory(html, account_id, node_id):
     markup = _EvidenceMarkup()
     markup.feed(html)
     markup.close()
@@ -152,9 +153,9 @@ def _trade_inventory(html, account_id):
     require(type(identity) is int and identity == account_id, 'SCOPE')
     # Require explicit remote node context even for an empty inventory. A
     # generic authenticated page at the requested URL is not an empty baseline.
-    require(soup.select_one('a[href="/lots/offerEdit?node=986"], '
-                            'a[href="https://funpay.com/lots/offerEdit?node=986"]') is not None,
-            'READBACK')
+    require(type(node_id) is int and node_id > 0 and soup.select_one(
+        f'a[href="/lots/offerEdit?node={node_id}"], '
+        f'a[href="https://funpay.com/lots/offerEdit?node={node_id}"]') is not None, 'READBACK')
     # Partial/paginated or filtered inventories cannot prove set difference.
     require(not soup.select('.pagination, .load-more, [data-next-page]'), 'READBACK')
     result = {}
@@ -217,7 +218,7 @@ def _editor_inventory(html, offer_id, review):
         require(type(value) is str and len(value) <= 10000, 'READBACK')
         values[name] = value
     require(values.pop('offer_id', None) == str(offer_id)
-            and values.pop('node_id', None) == '986', 'READBACK')
+            and values.pop('node_id', None) == str(review.node_id), 'READBACK')
     if 'user_id' in values:
         require(values.pop('user_id') == str(review.account_id), 'SCOPE')
     required = {*TEXT_FIELDS.values(), 'price', 'amount',
@@ -299,6 +300,8 @@ class PublicationReview:
     selections: tuple
     content: tuple
     fetched_at: float = field(compare=False)
+    node_id: int
+    category_id: int
 
 
 # Fixed diagnostics only. A complete structural observation still cannot prove
@@ -311,10 +314,10 @@ PUBLICATION_BLOCKERS = {
     'SUBMIT_CONTROLS': 'SUBMIT_CONTROLS: значения form_created_at/location/deleted и submit-controls требуют отдельной проверки; defaults из fpx не используются.',
     'RESPONSE_ID': 'RESPONSE_ID: fpx возвращает True по HTTP 200, без доказательства нового offer ID.',
     'OWNER_READBACK': 'OWNER_READBACK: нет независимого подтверждения владельца, данных нового ID и сохранности остальных лотов.',
-    'SELECTS': 'Три явных выбора не совпадают с актуальной схемой NEW-формы.',
+    'SELECTS': 'Выбранные параметры не совпадают с актуальной схемой NEW-формы.',
     'FORM_STRUCTURE': 'FORM_STRUCTURE: NEW-форма или её HTTPS action/method неоднозначны.',
     'CONTROL_INVENTORY': 'CONTROL_INVENTORY: есть неизвестные, повторные или неподдержанные controls.',
-    'NEW_IDENTITY': 'NEW_IDENTITY: нет единственных проверенных blank offer_id и node_id=986.',
+    'NEW_IDENTITY': 'NEW_IDENTITY: нет единственных проверенных blank offer_id и node_id раздела.',
     'CSRF': 'CSRF: не наблюдается единственный непустой CSRF control.',
 }
 
@@ -356,6 +359,24 @@ class SyntheticTransport:
         raise PublisherError('LIVE_DISABLED')
 
 
+def _scoped_draft(draft, route, template):
+    """Draft, route and template agree on one COMMON node of one FunPay category.
+
+    Any game: the node comes from the owner's saved route, and the live form,
+    the inventory page and the read-back are all checked against that node.
+    """
+    metadata = route['metadata']
+    return (template is not None and not draft.get('variant_id')
+            and type(metadata) is dict and set(metadata) == {'category_id', 'type'}
+            and metadata['type'] == 'COMMON'
+            and type(metadata['category_id']) is int and metadata['category_id'] > 0
+            and type(route['node_id']) is int and 0 < route['node_id'] < 2**63
+            and route['node_id'] == draft['node']
+            and route['game_name'].casefold() == draft['game'].casefold()
+            and draft['route_id'] == route['id']
+            and draft['template_id'] == route['template_id'] == template['id'])
+
+
 def _fresh(fetched_at, now):
     require(type(fetched_at) in (int, float) and type(now) in (int, float)
             and math.isfinite(fetched_at) and math.isfinite(now)
@@ -380,12 +401,7 @@ def build_new_offer(draft, route, template, form, *, owner_id, account_id,
         require(draft is not None and route is not None and template is not None, 'SCOPE')
         require(type(revision) is int and revision > 0 and draft['revision'] == revision
                 and draft.get('status') != 'cancelled', 'REVISION')
-        require(template['name'] == GAME_KEY and not draft.get('variant_id')
-                and route['metadata'] == {'category_id': 274, 'type': 'COMMON'}
-                and route['node_id'] == draft['node'] == 986
-                and route['game_name'].casefold() == draft['game'].casefold() == 'elden ring'
-                and draft['route_id'] == route['id']
-                and draft['template_id'] == route['template_id'] == template['id'], 'SCOPE')
+        require(_scoped_draft(draft, route, template), 'SCOPE')
         require(draft['route_revision'] == route['revision']
                 and draft['template_revision'] == template['revision']
                 and draft['route_snapshot'] == route
@@ -395,10 +411,10 @@ def build_new_offer(draft, route, template, form, *, owner_id, account_id,
         if form.provenance == 'live-v1':
             # A freshly fetched form: same node and the same fingerprint as the
             # saved draft schema; its own fetch time is the freshness anchor.
-            require(schema['node_id'] == 986
+            require(schema['node_id'] == draft['node']
                     and schema['fingerprint'] == draft['node_schema']['fingerprint'], 'SCHEMA')
         else:
-            require(schema['node_id'] == 986 and draft['node_schema'] == {
+            require(schema['node_id'] == draft['node'] and draft['node_schema'] == {
                 k: schema[k] for k in ('node_id', 'fields', 'fingerprint', 'fetched_at')}, 'SCHEMA')
         fields = schema['fields']
         names = [f['html_name'] for f in fields]
@@ -557,15 +573,18 @@ class LotPublisher:
 
         check()
         require(self.review(review.draft_id, review.revision, review.currency) == review, 'REVISION')
-        node = account.get_subcategory(SubCategoryTypes.COMMON, 986)
-        require(node.id == 986 and node.category.id == 274
+        node = account.get_subcategory(SubCategoryTypes.COMMON, review.node_id)
+        require(node is not None and node.id == review.node_id
+                and node.category.id == review.category_id
                 and node.type is SubCategoryTypes.COMMON, 'SCOPE')
-        inventory = _trade_inventory(_inventory_get(account), review.account_id)
+        inventory = _trade_inventory(_inventory_get(account, review.node_id), review.account_id,
+                                     review.node_id)
         require(len(inventory) <= 20, 'READBACK')
         offers = []
         for offer_id, observed in sorted(inventory.items()):
             check()
-            fields, matches = _editor_inventory(_inventory_get(account, offer_id), offer_id, review)
+            fields, matches = _editor_inventory(_inventory_get(account, review.node_id, offer_id),
+                                                offer_id, review)
             check()
             price, currency, amount, automatic, active, _, summary_digest = observed
             require(fields['price'] == price and fields['amount'] == str(amount), 'READBACK')
@@ -580,7 +599,8 @@ class LotPublisher:
                 _inventory_digest(value) for name, value in review.content if name.startswith('title_')}
             offers.append(OwnOffer(offer_id, _inventory_digest((observed, fields)), matches))
         check()
-        require(_trade_inventory(_inventory_get(account), review.account_id) == inventory, 'READBACK')
+        require(_trade_inventory(_inventory_get(account, review.node_id), review.account_id,
+                                 review.node_id) == inventory, 'READBACK')
         check()
         require(self.review(review.draft_id, review.revision, review.currency) == review, 'REVISION')
         return OwnInventory(review.owner_id, review.account_id, id(account),
@@ -659,11 +679,7 @@ class LotPublisher:
                 require(d is not None, 'SCOPE')
                 r = self.store._get(db, 'game_routes', d['route_id'])
                 t = self.store._get(db, 'product_templates', d['template_id'])
-                require(r is not None and t is not None and t['name'] == GAME_KEY
-                    and not d.get('variant_id') and r['metadata'] == {'category_id': 274, 'type': 'COMMON'}
-                    and r['node_id'] == d['node'] == 986
-                    and r['game_name'].casefold() == d['game'].casefold() == 'elden ring'
-                    and d['template_id'] == r['template_id'] == t['id'], 'SCOPE')
+                require(r is not None and _scoped_draft(d, r, t), 'SCOPE')
                 require(type(revision) is int and d['revision'] == revision
                     and d.get('status') != 'cancelled' and d['route_snapshot'] == r
                     and d['template_snapshot'] == t and d['route_revision'] == r['revision']
@@ -671,7 +687,7 @@ class LotPublisher:
                 schema, rows, payload = d['node_schema'], d['node_fields'], d['payload']
                 fields = schema['fields']
                 names = [f['html_name'] for f in fields]
-                require(schema['node_id'] == 986 and len(names) == len(set(names)) == len(rows) == 3
+                require(schema['node_id'] == d['node'] and len(names) == len(set(names)) == len(rows) > 0
                     and all(is_safe_node_binding_name(n) for n in names)
                     and all(f['kind'] == 'select' and f['disabled'] is False for f in fields)
                     and {row['html_name'] for row in rows} == set(names)
@@ -693,7 +709,8 @@ class LotPublisher:
                     id(self.client.account), d['id'], revision, r['id'], r['revision'], t['id'],
                     t['revision'], digest, currency, price,
                     tuple((row['html_name'], row['value'], row['display_label'], row['option_label'])
-                          for row in rows), content, self.clock())
+                          for row in rows), content, self.clock(),
+                    d['node'], r['metadata']['category_id'])
         except PublisherError:
             raise
         except (KeyError, TypeError, ValueError):
@@ -727,7 +744,8 @@ class LotPublisher:
             route_current()
             observed = {}
             proof, matches = inspect_fresh_new_form(self.client, self.store, review.fingerprint,
-                tuple((name, value) for name, value, _, _ in review.selections), diagnostics=observed)
+                tuple((name, value) for name, value, _, _ in review.selections),
+                node_id=review.node_id, diagnostics=observed)
             self._scope_gate(account, review)
             require(self.review(review.draft_id, review.revision, review.currency) == review, 'REVISION')
             route_current()

@@ -119,7 +119,7 @@ def test_compact_menus_and_legacy_entries(context):
             assert [[(b.text, b.callback_data) for b in row] for row in rows] == [
                 [button] for button in expected]
             assert 'локальные черновики' in shown.args[0]
-            assert 'публикация funpay пока отключена' in shown.args[0].lower()
+            assert 'лот создаётся выключенным' in shown.args[0].lower()
             assert not any(word in shown.args[0] for word in ('Template', 'Route', 'variables'))
         for action, title in [('prd:drafts:0', 'drafts'),
                               ('prd:templates:0', 'Product Templates'),
@@ -131,7 +131,7 @@ def test_compact_menus_and_legacy_entries(context):
         assert not await view.products_callback(cb, 'lot_templates', 1)  # Existing lots handler owns it.
         await view.products_callback(cb, 'prd:types', 1)
         rows = cb.message.edit_text.call_args.kwargs['reply_markup'].inline_keyboard
-        assert len(rows) == 8 and rows[0][0].callback_data.endswith(':GAME_KEY')
+        assert len(rows) == len(BUILTIN_TYPES) + 1 and rows[0][0].callback_data.endswith(':GAME_KEY')
         ctx.client.account.method.assert_not_called()
         ctx.client.account.get_user.assert_not_called()
         ctx.client.account.save_lot.assert_not_called()
@@ -594,7 +594,9 @@ def test_route_form_unknown_response_is_transient_and_never_leaks(context, monke
 
 
 @pytest.mark.parametrize('kind', [kind for kind, _ in BUILTIN_TYPES if kind != 'GAME_KEY'])
-def test_route_form_not_offered_for_other_product_types(context, kind):
+def test_route_form_offered_for_every_product_type_without_request(context, kind):
+    # Publication is no longer GAME_KEY-only, so every COMMON route can be checked;
+    # the read-only GET still waits for the owner's own press.
     ctx = context
     ctx.template = ctx.templates.ensure_builtin(kind)
     route = seed_route(ctx)
@@ -602,8 +604,8 @@ def test_route_form_not_offered_for_other_product_types(context, kind):
     async def run():
         cb = await pick(ctx, 'routes')
         await view.products_callback(cb, f"prd:route:{route['id']}", 1)
-        assert 'routeform' not in str(cb.message.edit_text.call_args)
-        assert not view._flows[1].get('route_form')
+        assert 'routeform' in str(cb.message.edit_text.call_args)
+        assert view._flows[1].get('route_form')
         ctx.client.account.method.assert_not_called()
     asyncio.run(run())
 
@@ -828,7 +830,7 @@ def test_type_selector_confirmed_catalog_node_fields_preview_save_restart(contex
         assert [screen.index(label) for _, label in BUILTIN_TYPES] == sorted(
             screen.index(label) for _, label in BUILTIN_TYPES)
         markup = cb.message.edit_text.call_args.kwargs['reply_markup']
-        assert len(markup.inline_keyboard) == 8  # Seven readable choices plus Back.
+        assert len(markup.inline_keyboard) == len(BUILTIN_TYPES) + 1  # every type plus Back
         assert all(len(button.callback_data.encode()) <= 64
             for row in markup.inline_keyboard for button in row)
         action = f"prd:preset:{view._flows[1]['type_token']}:{kind}"
@@ -880,7 +882,10 @@ def test_type_selector_confirmed_catalog_node_fields_preview_save_restart(contex
             assert title.startswith('⭐')
             if kind != 'GAME_KEY':
                 assert 'Actual product' in title and 'Service catalogue category' not in title + description
-                assert values['delivery_method'] in description
+                if kind == 'XBOX_KEY':      # a key: delivery is fixed text, not an owner claim
+                    assert 'Owner edition' in title and 'redeem.microsoft.com' in description
+                else:
+                    assert values['delivery_method'] in description
             if kind == 'AI_SUBSCRIPTION':
                 assert 'Owner plan' in title + description and '30 days' in title + description
             elif kind == 'PLAYSTATION_GAME':

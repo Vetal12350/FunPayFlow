@@ -134,7 +134,7 @@ def test_envelope_from_another_transport_or_stale_form_never_passes(live):
 
 
 def read(html, currency='USD'):
-    return wire.read_live_form(html, fingerprint=FINGERPRINT[0], account_id=42,
+    return wire.read_live_form(html, fingerprint=FINGERPRINT[0], account_id=42, node_id=986,
                                selections=tuple((f'fields[{n}]', v) for n, _, v, _ in SELECTS),
                                currency=currency)
 
@@ -162,6 +162,11 @@ def fingerprint(saved):
     (live_html(user_id=43), 'SCHEMA'),
     (live_html(extra='<input type="file" name="image">'), 'SCHEMA'),
     (live_html(extra='<input name="bad name">'), 'SCHEMA'),
+    # A visible field the draft does not fill (other nodes may ask e.g. a server)
+    # must block before any POST instead of being sent empty.
+    (live_html(extra='<input name="fields[server]" value="">'), 'SCHEMA'),
+    (live_html(extra='<textarea name="fields[activation]"></textarea>'), 'SCHEMA'),
+    (live_html(extra='<input type="hidden" name="fields[server]" value="">'), 'SCHEMA'),
     (live_html(selects=SELECTS[:2]), 'SCHEMA'),
     (live_html().replace('method="post"', 'method="get"'), 'CONTRACT_UNVERIFIED'),
     (live_html().replace('name="amount" value="1"', 'name="amount_x" value="1"'), 'SCHEMA'),
