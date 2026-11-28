@@ -153,9 +153,30 @@ def test_builder_is_pure_allowlisted_and_has_no_hidden_identity(case):
     assert c.publisher.outcome(c.draft['id']) is None
 
 
+def test_builder_accepts_any_game_node_consistently_scoped(case):
+    c = case
+    d, r, t, f = deepcopy((c.draft, c.route, c.template, c.form))
+    d['node'] = r['node_id'] = f.schema['node_id'] = d['node_schema']['node_id'] = 1234
+    r['metadata']['category_id'] = 999
+    r['game_name'] = d['game'] = 'The Witcher 3'
+    t['name'] = 'XBOX_KEY'
+    d['route_snapshot'], d['template_snapshot'] = r, t
+    result = build_new_offer(d, r, t, f, owner_id='1', account_id=42, revision=d['revision'],
+                             account_instance=id(c.client.account), price='15.00', currency='USD',
+                             now=c.now)
+    assert dict(result.business)['price'] == '15.00'
+    f.schema['node_id'] = 986                      # live form of another node: refused
+    with pytest.raises(PublisherError, match='SCHEMA'):
+        build_new_offer(d, r, t, f, owner_id='1', account_id=42, revision=d['revision'],
+                        account_instance=id(c.client.account), price='15.00', currency='USD',
+                        now=c.now)
+
+
 @pytest.mark.parametrize('change,reason', [
-    ('node', 'SCOPE'), ('category', 'SCOPE'), ('type', 'SCOPE'), ('game', 'SCOPE'),
-    ('template', 'SCOPE'), ('variant', 'SCOPE'), ('owner', 'SCOPE'), ('account', 'SCOPE'),
+    # Any game/category/template may publish now; an edited route or template
+    # still differs from the draft's saved snapshot and is refused as REVISION.
+    ('node', 'SCOPE'), ('category', 'REVISION'), ('type', 'SCOPE'), ('game', 'SCOPE'),
+    ('template', 'REVISION'), ('variant', 'SCOPE'), ('owner', 'SCOPE'), ('account', 'SCOPE'),
     ('revision', 'REVISION'), ('route_revision', 'REVISION'), ('template_revision', 'REVISION'),
     ('cancelled', 'REVISION'), ('stale', 'FORM_STALE'), ('future', 'FORM_STALE'),
     ('nan', 'FORM_STALE'), ('fingerprint', 'SCHEMA'), ('option', 'SCHEMA'),

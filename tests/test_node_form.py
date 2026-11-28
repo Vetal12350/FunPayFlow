@@ -521,7 +521,7 @@ CONTRACT_URL = 'https://funpay.com/lots/offerEdit?node=986'
 
 
 def test_contract_proof_independent_observations_are_not_live_semantics():
-    proof = prove_new_form_contract(contract_form(), CONTRACT_URL)
+    proof = prove_new_form_contract(contract_form(), CONTRACT_URL, 986)
     for key in ('editor_url', 'document_markup', 'form_subtree', 'submission',
                 'blank_identity', 'csrf_presence', 'node_identity', 'control_inventory', 'select_names'):
         assert proof[key] == 'verified'
@@ -542,7 +542,7 @@ def test_contract_proof_independent_observations_are_not_live_semantics():
     CONTRACT_URL.replace('https:', 'https:\n'),
 ])
 def test_contract_proof_exact_https_url(url):
-    proof = prove_new_form_contract(contract_form(), url)
+    proof = prove_new_form_contract(contract_form(), url, 986)
     assert proof['editor_url'] == 'ambiguous' and proof['publish_ready'] is False
     assert 'SYNTHETIC' not in json.dumps(proof) and url not in json.dumps(proof)
 
@@ -558,7 +558,7 @@ def test_contract_proof_exact_https_url(url):
     ('value="SYNTHETIC_PRIVATE"', 'value=""', 'csrf_presence'),
 ])
 def test_contract_proof_wrong_identity_action_encoding_csrf(old, new, key):
-    proof = prove_new_form_contract(contract_form().replace(old, new), CONTRACT_URL)
+    proof = prove_new_form_contract(contract_form().replace(old, new), CONTRACT_URL, 986)
     assert proof[key] != 'verified' and proof['publish_ready'] is False
 
 
@@ -581,7 +581,7 @@ def test_contract_proof_wrong_identity_action_encoding_csrf(old, new, key):
     ('<select hidden name="forged"></select>', 'control_inventory', 'ambiguous'),
 ])
 def test_contract_proof_hostile_and_unproven_controls(extra, key, state):
-    proof = prove_new_form_contract(contract_form(extra), CONTRACT_URL)
+    proof = prove_new_form_contract(contract_form(extra), CONTRACT_URL, 986)
     assert proof[key] == state
     assert proof['publish_ready'] is False and 'SYNTHETIC' not in json.dumps(proof)
     assert len(json.dumps(proof)) < 900
@@ -589,7 +589,7 @@ def test_contract_proof_hostile_and_unproven_controls(extra, key, state):
 
 @pytest.mark.parametrize('prefix,suffix', [('<html><body>', ''), ('<html><body><main>', '</main>')])
 def test_contract_proof_optional_outer_end_tags_allow_partial_observation_only(prefix, suffix):
-    proof = prove_new_form_contract(prefix + contract_form() + suffix, CONTRACT_URL)
+    proof = prove_new_form_contract(prefix + contract_form() + suffix, CONTRACT_URL, 986)
     assert proof['document_markup'] == 'ambiguous'
     assert proof['form_subtree'] == proof['blank_identity'] == 'verified'
     assert proof['publish_ready'] is False
@@ -597,29 +597,31 @@ def test_contract_proof_optional_outer_end_tags_allow_partial_observation_only(p
 
 def test_contract_proof_external_form_owner_and_missing_controls():
     html = contract_form().replace('class="form-offer-editor"', 'id="editor" class="form-offer-editor"')
-    proof = prove_new_form_contract(html + '<input form="editor" name="offer_id" value="42">', CONTRACT_URL)
+    proof = prove_new_form_contract(html + '<input form="editor" name="offer_id" value="42">', CONTRACT_URL, 986)
     assert proof['form_subtree'] == 'ambiguous' and proof['blank_identity'] != 'verified'
     for name, key in [('offer_id', 'blank_identity'), ('csrf_token', 'csrf_presence')]:
         soup = BeautifulSoup(contract_form(), 'html.parser')
         soup.find('input', attrs={'name': name}).decompose()
-        assert prove_new_form_contract(str(soup), CONTRACT_URL)[key] == 'absent'
+        assert prove_new_form_contract(str(soup), CONTRACT_URL, 986)[key] == 'absent'
 
 
 def test_contract_proof_three_safe_names_are_not_a_guessed_mapping():
     html = contract_form().replace('name="platform"', 'name="another_safe_name"')
-    assert prove_new_form_contract(html, CONTRACT_URL)['select_names'] == 'verified'
+    assert prove_new_form_contract(html, CONTRACT_URL, 986)['select_names'] == 'verified'
     html = contract_form('<div class="form-group"><label>Extra</label>'
                          '<select name="fourth"><option>A</option></select></div>')
-    assert prove_new_form_contract(html, CONTRACT_URL)['select_names'] == 'ambiguous'
+    assert prove_new_form_contract(html, CONTRACT_URL, 986)['select_names'] == 'ambiguous'
     html = contract_form().replace('<option value=', '<div></div><option value=')
-    assert prove_new_form_contract(html, CONTRACT_URL)['control_inventory'] == 'ambiguous'
+    assert prove_new_form_contract(html, CONTRACT_URL, 986)['control_inventory'] == 'ambiguous'
 
 
 def test_contract_proof_bounds_and_failure_do_not_leak_or_leave_old_evidence(service):
-    proof = prove_new_form_contract(contract_form('<input name="unexpected">' * 1100), CONTRACT_URL)
+    proof = prove_new_form_contract(contract_form('<input name="unexpected">' * 1100), CONTRACT_URL, 986)
     assert proof['unknown_count'] == proof['duplicate_count'] == proof['control_count'] == 1001
     assert len(json.dumps(proof)) < 900
-    assert prove_new_form_contract(contract_form(), CONTRACT_URL, 976) == safe_contract_proof()
+    assert prove_new_form_contract(contract_form(), CONTRACT_URL, 0) == safe_contract_proof()
+    other = prove_new_form_contract(contract_form(), CONTRACT_URL, 976)   # form/URL are node 986
+    assert other['editor_url'] != 'verified' and other['node_identity'] != 'verified'
     service.client.account.response.content = contract_form().encode()
     service.client.account.response.url = CONTRACT_URL
     service.get_with_evidence(986, contract_proof=proof)
@@ -655,7 +657,7 @@ def test_contract_proof_reuses_get_but_is_never_cached(service, monkeypatch):
     {'availability': []},
 ])
 def test_contract_proof_output_boundary(change):
-    proof = dict(prove_new_form_contract(contract_form(), CONTRACT_URL), **change)
+    proof = dict(prove_new_form_contract(contract_form(), CONTRACT_URL, 986), **change)
     assert safe_contract_proof(proof) == safe_contract_proof()
 
 

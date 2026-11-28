@@ -23,11 +23,11 @@ from .lot_publisher import LotPublisher, PublisherError, _fresh
 # Owner-facing reasons why the fresh form did not arm "Опубликовать 1 лот".
 PUBLISH_BLOCK_REASONS = {
     'CONTRACT_UNVERIFIED': 'форма FunPay не загрузилась или её структура не распознана.',
-    'SCHEMA': 'поля формы не совпадают с черновиком (названия, описания, цена или три выбора).',
+    'SCHEMA': 'поля формы не совпадают с черновиком (названия, описания, цена или параметры).',
     'PRICE': 'на форме не видна валюта цены или она отличается от выбранной.',
     'NEW_IDENTITY': 'форма не похожа на создание НОВОГО лота.',
     'CSRF': 'в форме нет защитного токена.',
-    'SCOPE': 'форма открыта не для этого аккаунта или не для Elden Ring (node 986).',
+    'SCOPE': 'форма открыта не для этого аккаунта или не для раздела этого черновика.',
     'FORM_STALE': 'проверка устарела, откройте черновик заново.',
     'REVISION': 'черновик изменился, откройте его заново.',
     'GATE': 'бот в SAFE_MODE или перезапускается.',
@@ -87,7 +87,7 @@ def _menu(rows):
 
 def _home():
     return ('📦 <b>Лоты · локальные черновики</b>\n'
-            'Черновики товаров · публикация FunPay пока отключена.\n'
+            'Черновики товаров · публикация 1 лота по кнопке, лот создаётся выключенным.\n'
             'Существующие лоты не изменяются.', _menu([
                 [('➕ Создать товар', 'prd:types')],
                 [('📝 Мои черновики', 'prd:drafts:0')],
@@ -98,7 +98,7 @@ def _home():
 
 def _advanced():
     return ('⚙️ <b>Дополнительно · локальные черновики</b>\n'
-            'Публикация FunPay пока отключена.', _menu([
+            'Публикация 1 лота по кнопке, лот создаётся выключенным.', _menu([
                 [('🗺 Категории и маршруты', 'prd:choose:routes:0')],
                 [('🧩 Шаблоны оформления', 'prd:templates:0')],
                 [('📚 Массовое создание черновиков', 'prd:choose:bulk:0')],
@@ -327,17 +327,17 @@ def _draft_label(row):
 
 def _publication_candidate(body):
     """Display filter only; the service revalidates the saved rows and scope."""
-    return (body.get('node') == 986 and body.get('game', '').casefold() == 'elden ring'
-            and body.get('template_snapshot', {}).get('name') == 'GAME_KEY'
+    node = body.get('node')
+    return (type(node) is int and node > 0 and bool(body.get('game'))
             and not body.get('variant_id') and body.get('status') != 'cancelled'
-            and body.get('payload', {}).get('amount') == 1 and len(body.get('node_fields', [])) == 3)
+            and body.get('payload', {}).get('amount') == 1 and len(body.get('node_fields', [])) > 0)
 
 
 async def _publication_screen(callback, state):
     review = state['review']
     token = state['token']
-    text = ('👁 <b>PREVIEW · новый лот Elden Ring</b>\n'
-        'GAME_KEY · category 274 · COMMON node 986\n'
+    text = ('👁 <b>PREVIEW · новый лот</b>\n'
+        f'Раздел FunPay: category {review.category_id} · COMMON node {review.node_id}\n'
         f'Draft revision: {review.revision}\n'
         + '\n'.join(escape(label[:65]) + ': ' + escape(option[:120])
                     for _, _, label, option in review.selections)
@@ -416,7 +416,7 @@ async def _publication_callback(callback, user_id, parts, store, routes):
                     'Он ВЫКЛЮЧЕН. Проверьте его на FunPay и включите вручную.')
         else:
             text = ('🔒 UNKNOWN: отправку не повторять. Проверьте свои лоты на сайте '
-                    'только чтением: новый ID, владелец, node 986, все тексты, три выбора, '
+                    f'только чтением: новый ID, владелец, node {review.node_id}, все тексты, параметры, '
                     'цена/валюта, количество 1 и ручная выдача. '
                     'Не очищайте lot_publish_attempts и не обходите барьер копией draft.')
             server_error = getattr(publisher, 'last_server_error', None)
@@ -454,9 +454,9 @@ async def _publication_callback(callback, user_id, parts, store, routes):
                 return
             content = dict(review.content)
             await _plain_chunks(callback.message,
-                'Финальное подтверждение · Elden Ring · GAME_KEY\n'
+                'Финальное подтверждение · новый лот\n'
                 'Владелец Telegram: ' + review.owner_id + '; FunPay: ' + str(review.account_id)
-                + '\ncategory 274 · COMMON node 986\n'
+                + f'\ncategory {review.category_id} · COMMON node {review.node_id}\n'
                 + '\n'.join(label + ': ' + option for _, _, label, option in review.selections)
                 + f'\nЦена: {review.price} {review.currency}\nКоличество: 1\n'
                 'Выдача: ручная · Видимость: ВЫКЛЮЧЕН (включите на FunPay сами)\n'
@@ -548,9 +548,7 @@ async def _check_route_form(callback, user_id, parts, store, templates, routes):
         with routes.client._account_lock:
             current()
             row = state['route']
-            proof = {} if (row['node_id'] == 986 and row['metadata']['category_id'] == 274
-                           and row['metadata']['type'] == 'COMMON'
-                           and state['template']['id'] == 'GAME_KEY') else None
+            proof = {} if row['metadata']['type'] == 'COMMON' else None
             schema, evidence = NodeFormService(routes.client, store).get_with_evidence(
                 row['node_id'], contract_proof=proof)
             current()
@@ -1265,7 +1263,7 @@ async def _products_callback(callback, action, user_id):
                 flow['route_id'] = row['id']
                 template = await asyncio.to_thread(templates.get, flow['template_id'])
                 token = None
-                if template['name'] == 'GAME_KEY':
+                if row['metadata'].get('type') == 'COMMON':
                     token = uuid.uuid4().hex[:12]
                     flow['route_form'] = dict(token=token, route=deepcopy(row), template=deepcopy(template),
                         context=_catalog_context(routes, store, flow['template_id']))
@@ -1430,7 +1428,7 @@ async def _products_callback(callback, action, user_id):
             for row in rows[:_PAGE]:
                 keyboard.append([(_draft_label(row), f"prd:open:{row['id']}")])
                 if _publication_candidate(row):
-                    keyboard.append([('👁 PREVIEW · Elden Ring', f"prd:pubopen:{row['id']}:{row['revision']}")])
+                    keyboard.append([('👁 PREVIEW публикации', f"prd:pubopen:{row['id']}:{row['revision']}")])
             keyboard += _page_buttons('prd:drafts', offset, len(rows) > _PAGE)
             keyboard.append([('Лоты', 'products')])
             await _show(callback, '📝 <b>Сохранённые product drafts</b>', _menu(keyboard))
@@ -1493,7 +1491,7 @@ async def _products_callback(callback, action, user_id):
         if cause.reason == 'ALREADY_CLAIMED':
             text = ('🔒 Для этого draft уже есть постоянный барьер попытки. Результат может быть UNKNOWN. '
                     'Не повторяйте отправку и не создавайте копию для обхода. Проверьте свои лоты '
-                    'на сайте только чтением: ID, владельца, node 986, цену, количество и выдачу. '
+                    'на сайте только чтением: ID, владельца, раздел, цену, количество и выдачу. '
                     'Не очищайте lot_publish_attempts; автоматического retry нет.')
         else:
             text = ('🔒 PREVIEW / проверка отклонены: ' + cause.reason

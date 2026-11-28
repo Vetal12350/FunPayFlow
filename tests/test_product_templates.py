@@ -93,7 +93,7 @@ def test_opt_in_presets_concurrent_initialization_and_customization(tmp_path):
             default_emoji='⭐', description_en='Owner text'), kind, body['revision'])
         reopened = TemplateService(ProductStore(ReviewReceiptStore(state.path), 1, 42))
         assert reopened.ensure_builtin(kind) == edited
-    assert len(service.list()) == 7
+    assert len(service.list()) == len(BUILTIN_TYPES)
     assert ProductStore(state, 2, 42).list_templates() == []
     assert ProductStore(state, 1, 43).list_templates() == []
     with unittest.TestCase().assertRaises(ProductValidationError):
@@ -176,3 +176,15 @@ def test_gaming_product_distinction_requires_explicit_term_or_face_value(product
     for lang in ('ru', 'en'):
         assert product_type in rendered['description_' + lang]
         assert term in rendered['title_' + lang]
+
+
+def test_xbox_key_preset_renders_bilingual_texts():
+    body = builtin_template('XBOX_KEY')
+    rendered = ProductTemplate(body).render({
+        'game': 'The Witcher 3', 'product_name': 'The Witcher 3',
+        'sale_name': 'The Witcher 3: Wild Hunt', 'sale_edition': 'Complete Edition',
+        'availability': 'Argentina'})
+    assert rendered['title_ru'] == ('🟩 The Witcher 3: Wild Hunt | Complete Edition | '
+                                    'Xbox One / Series X|S | Ключ | Argentina')
+    assert 'Key' in rendered['title_en'] and 'redeem.microsoft.com' in rendered['description_ru']
+    assert 'Argentina' in rendered['description_en'] and len(rendered['title_ru']) <= 100

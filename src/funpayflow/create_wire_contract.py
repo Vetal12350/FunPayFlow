@@ -1,4 +1,4 @@
-"""NEW-lot offerSave exchange for Elden Ring (node 986): one owner-confirmed POST.
+"""NEW-lot offerSave exchange for the draft's own node: one owner-confirmed POST.
 
 The live profile (`_fresh_contract`/`read_live_form`) mirrors FunPayAPI 1.1.0
 get_lot_fields + save_lot on ONE fresh NEW form; lots are created inactive with
@@ -25,13 +25,22 @@ from .lot_publisher import (FORM_TTL, TEXT_FIELDS, FormContext, PreparedLot, Pub
 from .node_form import is_safe_node_binding_name
 from .runtime_control import automatic_action_gate
 
-LIVE_URL = 'https://funpay.com/lots/offerEdit?node=986'
+
+
+def live_url(node_id):
+    return f'https://funpay.com/lots/offerEdit?node={node_id}'
+
+
 LIVE_PROVENANCE = 'live-v1'
 # Filled from the owner's draft; everything else comes from the form itself.
 OWNER_FIELDS = frozenset({*TEXT_FIELDS.values(), 'price', 'amount'})
 # Never sent: unchecked active => inactive lot; no auto_delivery/secrets =>
 # manual delivery; currency is verified, not set.
 NEVER_SENT = frozenset({'active', 'auto_delivery', 'deactivate_after_sale', 'secrets', 'currency'})
+# Visible fields the bot knows how to handle. Any other visible field (another
+# node may ask e.g. a server) would be sent empty, so the form is refused.
+KNOWN_VISIBLE = frozenset({*OWNER_FIELDS, *NEVER_SENT, 'location',
+                           'fields[payment_msg][ru]', 'fields[payment_msg][en]'})
 _CONTROL_NAME = re.compile(r'[A-Za-z_][A-Za-z0-9_]{0,40}(?:\[[A-Za-z0-9_]{0,40}\]){0,3}')
 _CURRENCY_TOKENS = {'₽': 'RUB', 'руб': 'RUB', 'руб.': 'RUB', 'RUB': 'RUB',
                     '$': 'USD', 'USD': 'USD', '€': 'EUR', 'EUR': 'EUR'}
@@ -99,14 +108,14 @@ class NewOfferTransport:
                 account = publisher.client.account
                 publisher._scope_gate(account, review)
                 try:
-                    html = node_form._fresh_new_editor(account).decode('utf-8')
+                    html = node_form._fresh_new_editor(account, review.node_id).decode('utf-8')
                 except Exception:
                     raise PublisherError('CONTRACT_UNVERIFIED') from None
                 now = publisher.clock()
                 schema, service = read_live_form(
                     html, fingerprint=review.fingerprint, account_id=review.account_id,
                     selections=tuple((n, v) for n, v, *_ in review.selections),
-                    currency=review.currency)
+                    currency=review.currency, node_id=review.node_id)
                 schema['fetched_at'] = now
                 form = FormContext(review.owner_id, review.account_id, review.account_instance,
                                    schema, review.currency, LIVE_PROVENANCE)
@@ -181,6 +190,9 @@ class NewOfferTransport:
             # Currency is verified against the form, never sent: FunPayAPI's
             # save_lot has no currency field; the price is in the form's currency.
             pairs = envelope.service + tuple(p for p in envelope.business if p[0] != 'currency')
+            node = dict(envelope.service).get('node_id', '')
+            require(type(node) is str and node.isascii() and node.isdigit()
+                    and 0 < int(node) < 2**63, 'SCOPE')
             require(type(envelope.service) is tuple and type(envelope.business) is tuple
                     and 0 < len(pairs) <= 64
                     and all(type(p) is tuple and len(p) == 2
@@ -191,7 +203,7 @@ class NewOfferTransport:
             headers = {
                 'Accept': 'application/json, text/javascript, */*; q=0.01',
                 'X-Requested-With': 'XMLHttpRequest',
-                'Referer': 'https://funpay.com/lots/offerEdit?node=986',
+                'Referer': live_url(int(node)),
                 'Origin': 'https://funpay.com',
                 'cookie': f'golden_key={account.golden_key}',
             }
@@ -348,7 +360,7 @@ def _price_currency(form, price):
     return found
 
 
-def read_live_form(html, *, fingerprint, account_id, selections, currency):
+def read_live_form(html, *, fingerprint, account_id, selections, currency, node_id):
     """Pure: validate one fresh NEW form and return (schema, service controls).
 
     Service controls are the form's own submitted values (hidden fields, CSRF,
@@ -356,14 +368,15 @@ def read_live_form(html, *, fingerprint, account_id, selections, currency):
     NEVER_SENT, plus location=trade as FunPayAPI save_lot does.
     """
     require(currency in {'RUB', 'USD', 'EUR'}, 'PRICE')
-    proof = node_form.prove_new_form_contract(html, LIVE_URL)
+    require(type(node_id) is int and 0 < node_id < 2**63, 'SCOPE')
+    proof = node_form.prove_new_form_contract(html, live_url(node_id), node_id)
     require(all(proof.get(key) == 'verified' for key in _STRUCTURE), 'CONTRACT_UNVERIFIED')
     try:
-        schema = node_form._parse(html, 986, account_id=account_id)
+        schema = node_form._parse(html, node_id, account_id=account_id)
     except node_form.NodeFormError:
         raise PublisherError('SCHEMA') from None
     fields = schema['fields']
-    require(schema['fingerprint'] == fingerprint and len(fields) == len(selections) == 3
+    require(schema['fingerprint'] == fingerprint and len(fields) == len(selections) > 0
             and all(not f['disabled'] and f['html_name'] == name
                     and any(o['value'] == value and not o['disabled'] for o in f['options'])
                     for f, (name, value) in zip(fields, selections)), 'SCHEMA')
@@ -388,11 +401,15 @@ def read_live_form(html, *, fingerprint, account_id, selections, currency):
         pairs.append((name, value))
     names = [n for n, _ in pairs]
     require(len(names) == len(set(names)) and len(names) <= 48, 'SCHEMA')
+    select_names = {f['html_name'] for f in fields}
+    visible = {c.get('name') for c in form.find_all(['input', 'select', 'textarea'])
+               if c.get('name') and not c.has_attr('disabled')
+               and not (c.name == 'input' and c.get('type', '').lower() == 'hidden')}
+    require(visible <= KNOWN_VISIBLE | select_names, 'SCHEMA')
     values = dict(pairs)
     require(values.get('offer_id') in {'', '0'}, 'NEW_IDENTITY')
-    require(values.get('node_id') == '986', 'SCOPE')
+    require(values.get('node_id') == str(node_id), 'SCOPE')
     require(bool(values.get('csrf_token', '').strip()), 'CSRF')
-    select_names = {f['html_name'] for f in fields}
     require(OWNER_FIELDS <= values.keys() and select_names <= values.keys(), 'SCHEMA')
     require(len(prices) == 1, 'PRICE')
     # A currency <select> is already rejected by the NodeForm parser above.

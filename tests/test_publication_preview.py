@@ -72,7 +72,7 @@ def saved(context, monkeypatch):
         {'fields[platform]': 'pc', 'fields[region]': 'eu', 'fields[edition]': 'base'}, price='15')
     c.draft = nd.confirm(nd.stage([preview])['token'])['results'][0]
     c.client.account.method.reset_mock()
-    def get(account):
+    def get(account, node_id):
         assert account is c.client.account
         assert c.client._account_lock._is_owned()
         return c.html.encode()
@@ -254,7 +254,7 @@ def test_currency_token_rotation_and_simultaneous_double_click(saved):
 @pytest.mark.parametrize('change', ['safe_mode', 'account', 'revision', 'navigation', 'claim'])
 def test_late_changes_during_get_cannot_return_a_valid_result(saved, monkeypatch, change):
     c = saved
-    def get(account):
+    def get(account, node_id):
         if change == 'safe_mode': monkeypatch.setattr(ui, 'is_safe_mode_enabled', lambda: True)
         elif change == 'account': c.client.account = SimpleNamespace(**vars(account))
         elif change == 'revision': c.store.edit_draft(c.draft['id'], deepcopy(c.draft), c.draft['revision'])
@@ -301,7 +301,7 @@ def test_existing_authenticated_account_get_policy_and_no_cached_response(monkey
         iter_content=Mock(return_value=iter([b'fresh'])), close=Mock())
     get = Mock(return_value=response)
     monkeypatch.setattr(requests, 'get', get)
-    assert node_form._fresh_new_editor(account) == b'fresh'
+    assert node_form._fresh_new_editor(account, 986) == b'fresh'
     assert get.call_count == 1
     args, kwargs = get.call_args
     assert args == ('https://funpay.com/lots/offerEdit?node=986',)
@@ -327,7 +327,7 @@ def test_runtime_account_method_wrappers_and_extra_cookies_are_preserved(monkeyp
     wrapped = client.account.method
     assert getattr(wrapped, '__func__', None) is not Account.method
     with client._account_lock:
-        assert node_form._fresh_new_editor(client.account) == b'fresh'
+        assert node_form._fresh_new_editor(client.account, 986) == b'fresh'
     assert client.account.method is wrapped
     assert transport.call_count == 1
     kwargs = transport.call_args.kwargs
@@ -355,7 +355,7 @@ def test_fresh_transport_fails_once_closes_and_sanitizes(monkeypatch, failure, r
     elif failure == 'oversize': response.iter_content.return_value = iter([b'x' * (node_form._MAX_HTML + 1)])
     elif failure == 'version': monkeypatch.setattr(node_form, 'version', lambda name: '2.0')
     with pytest.raises(node_form.NodeFormError) as raised:
-        node_form._fresh_new_editor(account)
+        node_form._fresh_new_editor(account, 986)
     assert raised.value.reason == reason
     assert 'SYNTHETIC-SECRET-CANARY' not in str(raised.value) + caplog.text
     assert get.call_count == (0 if failure == 'version' else 1)

@@ -8,6 +8,7 @@ from .node_form import is_safe_node_binding_name
 
 
 GAME_KEY = "GAME_KEY"
+XBOX_KEY = "XBOX_KEY"
 GIFT = "GIFT"
 PLAYSTATION_GAME = "PLAYSTATION_GAME"
 AI_SUBSCRIPTION = "AI_SUBSCRIPTION"
@@ -16,6 +17,7 @@ GAME_CURRENCY = "GAME_CURRENCY"
 GAMING_SUBSCRIPTION = "GAMING_SUBSCRIPTION"
 BUILTIN_TYPES = (
     (GAME_KEY, '🔑 Игровой ключ'),
+    (XBOX_KEY, '🟩 Ключ Xbox'),
     (GIFT, '🎁 Гифт игры'),
     (PLAYSTATION_GAME, '🎮 Игра PlayStation'),
     (AI_SUBSCRIPTION, '🤖 Подписка / доступ к ИИ-сервису'),
@@ -69,7 +71,14 @@ def builtin_template(kind=GAME_KEY):
         return default_template()
     body = default_template()
     body.update(name=kind, defaults={'quantity': '1'}, validation_rules={})
-    if kind == GIFT:
+    if kind == XBOX_KEY:
+        extra = ['sale_name', 'sale_edition', 'availability']
+        body.update(display_name='Ключ Xbox / Xbox key', default_emoji='🟩',
+            title_ru='{{sale_name}} | {{sale_edition}} | Xbox One / Series X|S | Ключ | {{availability}}',
+            title_en='{{sale_name}} | {{sale_edition}} | Xbox One / Series X|S | Key | {{availability}}',
+            description_ru='Цифровой ключ {{sale_name}} ({{sale_edition}}) для Xbox One и Xbox Series X|S. Регион ключа: {{availability}} — перед покупкой убедитесь, что он подходит вашей учётной записи Microsoft. Активация: на консоли Microsoft Store → «Использовать код» или на сайте redeem.microsoft.com. Ключ отправляется в чат заказа. Количество: {{quantity}}.',
+            description_en='Digital key for {{sale_name}} ({{sale_edition}}) on Xbox One and Xbox Series X|S. Key region: {{availability}} — make sure it matches your Microsoft account before buying. Activation: Microsoft Store on the console → "Redeem a code", or redeem.microsoft.com. The key is sent to the order chat. Quantity: {{quantity}}.')
+    elif kind == GIFT:
         extra = ['sale_name', 'sale_platform', 'availability', 'delivery_method']
         body.update(display_name='Гифт игры / Game gift', default_emoji='🎁',
             title_ru='{{sale_name}} — гифт | {{sale_platform}}',

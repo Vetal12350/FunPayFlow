@@ -322,3 +322,22 @@ def test_new_offer_that_came_out_active_is_not_confirmed(inventory):
     c.remote[72] = {'active': True}
     result = verify(c, baseline)
     assert (result.status, result.reason) == (InventoryStatus.UNKNOWN, InventoryReason.MISMATCH)
+
+
+def test_inventory_is_read_and_checked_for_the_drafts_own_node(inventory, monkeypatch):
+    c = inventory
+    html = trade(c).replace('/lots/offerEdit?node=986', '/lots/offerEdit?node=1234')
+    assert module._trade_inventory(html, c.owner, 1234) == module._trade_inventory(trade(c), c.owner, 986)
+    with pytest.raises(module.PublisherError, match='READBACK'):      # page of another node
+        module._trade_inventory(html, c.owner, 986)
+    seen = []
+
+    def get(url, **kwargs):
+        seen.append(url)
+        raise OSError('stop')
+    monkeypatch.setattr(module.requests, 'get', get)
+    with pytest.raises(OSError):
+        module._inventory_get(c.client.account, 1234)
+    assert seen == ['https://funpay.com/lots/1234/trade']
+    with pytest.raises(module.PublisherError, match='READBACK'):
+        module._inventory_get(c.client.account, 0)

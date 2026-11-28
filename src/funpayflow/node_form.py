@@ -455,10 +455,10 @@ def _new_form_diagnostics(form, soup):
     return safe_new_form_diagnostics(result)
 
 
-def prove_new_form_contract(html, response_url, node_id=986, *, diagnostics=None):
-    """Pure offline proof of observations for node 986, not NEW wire semantics.
+def prove_new_form_contract(html, response_url, node_id, *, diagnostics=None):
+    """Pure offline proof of observations for one NEW form of ``node_id``.
 
-    The three names come from the ordinary safe SELECT parser, never a guessed
+    Not NEW wire semantics. SELECT names come from the ordinary safe parser, never a guessed
     live mapping. Blank identity is literal presence, not a NEW authorization.
     All DOM/values are transient; the result contains only fixed enums/counts.
     """
@@ -466,7 +466,7 @@ def prove_new_form_contract(html, response_url, node_id=986, *, diagnostics=None
     if type(diagnostics) is dict:
         diagnostics.clear()
         diagnostics.update(safe_new_form_diagnostics())
-    if node_id != 986 or type(node_id) is not int:
+    if not _positive(node_id):
         return result
     result['availability'] = 'response'
     try:
@@ -476,7 +476,7 @@ def prove_new_form_contract(html, response_url, node_id=986, *, diagnostics=None
             and url.scheme == 'https' and url.netloc in {'funpay.com', 'www.funpay.com'}
             and url.path in {'/lots/offerEdit', '/en/lots/offerEdit', '/uk/lots/offerEdit'}
             and not url.fragment
-            and parse_qs(url.query, keep_blank_values=True) == {'node': ['986']}) else 'ambiguous'
+            and parse_qs(url.query, keep_blank_values=True) == {'node': [str(node_id)]}) else 'ambiguous'
         # Preserve all ordinary parser rejections, including EDIT/nonmatching node.
         schema = _parse(html, node_id)
         soup = BeautifulSoup(html, 'html.parser')
@@ -498,7 +498,7 @@ def prove_new_form_contract(html, response_url, node_id=986, *, diagnostics=None
         if type(diagnostics) is dict:
             context = ('RESPONSE_CONTEXT' if result['editor_url'] != 'verified' else
                        'UNSAFE_STRUCTURE' if not valid or result['document_markup'] != 'verified' else
-                       'SELECT_CONTEXT' if len(schema['fields']) != 3 else 'OBSERVED')
+                       'SELECT_CONTEXT' if not schema['fields'] else 'OBSERVED')
             diagnostics.update(_new_form_diagnostics(form, soup) if context == 'OBSERVED' else
                                dict(safe_new_form_diagnostics(), context=context))
         if not valid:
@@ -549,7 +549,7 @@ def prove_new_form_contract(html, response_url, node_id=986, *, diagnostics=None
                 'formaction', 'formmethod', 'formenctype', 'formtarget'))
         ) else 'ambiguous'
         for key, name, expected in (('blank_identity', 'offer_id', ''),
-                                    ('node_identity', 'node_id', '986'),
+                                    ('node_identity', 'node_id', str(node_id)),
                                     ('csrf_presence', 'csrf_token', None)):
             found = [c for c in controls if c.get('name') == name]
             result[key] = 'absent' if not found else 'ambiguous'
@@ -863,7 +863,7 @@ def parse_node_form(html, node_id):
     return _parse(html, node_id)
 
 
-def _fresh_new_editor(account):
+def _fresh_new_editor(account, node_id):
     """One GET using the existing Account's authentication, never Account.method.
 
     The installed 1.1.0 Account has no requests.Session and its method cannot
@@ -881,18 +881,21 @@ def _fresh_new_editor(account):
             raise NodeFormError('TRANSPORT_UNSUPPORTED')
         if account.is_initiated is not True:
             raise NodeFormError('ACCOUNT_UNINITIALIZED')
+        if not _positive(node_id):
+            raise NodeFormError('REQUEST_INVALID')
+        url = f'https://funpay.com/lots/offerEdit?node={node_id}'
         headers = {'accept-language': 'ru', 'accept': 'text/html',
                    'cookie': f'golden_key={account.golden_key}'}
         if account.phpsessid:
             headers['cookie'] += f'; PHPSESSID={account.phpsessid}'
         if account.user_agent:
             headers['user-agent'] = account.user_agent
-        response = requests.get('https://funpay.com/lots/offerEdit?node=986',
+        response = requests.get(url,
             headers=headers, proxies=account.proxy or {}, timeout=(5, 10),
             allow_redirects=False, verify=True, stream=True)
         if response.status_code != 200:
             raise NodeFormError(_http_reason(response.status_code))
-        if response.history or response.url != 'https://funpay.com/lots/offerEdit?node=986':
+        if response.history or response.url != url:
             raise NodeFormError('HTTP_REDIRECT')
         chunks, size, started = [], 0, time.monotonic()
         for chunk in response.iter_content(65536):
@@ -915,7 +918,7 @@ def _fresh_new_editor(account):
                 pass
 
 
-def inspect_fresh_new_form(client, store, fingerprint, selections, *, diagnostics=None):
+def inspect_fresh_new_form(client, store, fingerprint, selections, *, node_id, diagnostics=None):
     """Uncached, scoped NEW inspection; only fixed facts leave this call.
 
     Presence of a blank identity/CSRF is an observation, never authorization to
@@ -931,18 +934,18 @@ def inspect_fresh_new_form(client, store, fingerprint, selections, *, diagnostic
                 or getattr(account, 'is_initiated', False) is not True):
             raise NodeFormError('ACCOUNT_SCOPE')
         try:
-            html = _fresh_new_editor(account).decode('utf-8')
+            html = _fresh_new_editor(account, node_id).decode('utf-8')
         except UnicodeError:
             raise NodeFormError('CONTENT_ENCODING') from None
-        schema = _parse(html, 986, account_id=account.id)
+        schema = _parse(html, node_id, account_id=account.id)
         body = BeautifulSoup(html, 'html.parser').find('body')
         if body is None or not body.has_attr('data-app-data'):
             raise NodeFormError('AUTH_CONTEXT_MISSING')
         observed = {}
-        proof = prove_new_form_contract(html, 'https://funpay.com/lots/offerEdit?node=986',
-                                        diagnostics=observed)
+        proof = prove_new_form_contract(html, f'https://funpay.com/lots/offerEdit?node={node_id}',
+                                        node_id, diagnostics=observed)
         fields = schema['fields']
-        matching = (schema['fingerprint'] == fingerprint and len(fields) == len(selections) == 3
+        matching = (schema['fingerprint'] == fingerprint and len(fields) == len(selections) > 0
                     and all(not f['disabled'] and f['html_name'] == name
                         and any(o['value'] == value and not o['disabled'] for o in f['options'])
                         for f, (name, value) in zip(fields, selections)))
