@@ -190,9 +190,6 @@ class NewOfferTransport:
             # Currency is verified against the form, never sent: FunPayAPI's
             # save_lot has no currency field; the price is in the form's currency.
             pairs = envelope.service + tuple(p for p in envelope.business if p[0] != 'currency')
-            node = dict(envelope.service).get('node_id', '')
-            require(type(node) is str and node.isascii() and node.isdigit()
-                    and 0 < int(node) < 2**63, 'SCOPE')
             require(type(envelope.service) is tuple and type(envelope.business) is tuple
                     and 0 < len(pairs) <= 64
                     and all(type(p) is tuple and len(p) == 2
@@ -200,6 +197,9 @@ class NewOfferTransport:
                     and len(dict(pairs)) == len(pairs)
                     and sum(len(v.encode('utf-8')) for p in pairs for v in p) <= 200_000,
                     'SCHEMA')
+            node = dict(envelope.service).get('node_id', '')
+            require(type(node) is str and node.isascii() and node.isdigit()
+                    and 0 < int(node) < 2**63, 'SCOPE')
             headers = {
                 'Accept': 'application/json, text/javascript, */*; q=0.01',
                 'X-Requested-With': 'XMLHttpRequest',
@@ -402,10 +402,15 @@ def read_live_form(html, *, fingerprint, account_id, selections, currency, node_
     names = [n for n, _ in pairs]
     require(len(names) == len(set(names)) and len(names) <= 48, 'SCHEMA')
     select_names = {f['html_name'] for f in fields}
-    visible = {c.get('name') for c in form.find_all(['input', 'select', 'textarea'])
-               if c.get('name') and not c.has_attr('disabled')
-               and not (c.name == 'input' and c.get('type', '').lower() == 'hidden')}
+    controls = [c for c in form.find_all(['input', 'select', 'textarea'])
+                if c.get('name') and not c.has_attr('disabled')]
+    hidden = {c['name'] for c in controls
+              if c.name == 'input' and c.get('type', '').lower() == 'hidden'}
+    visible = {c['name'] for c in controls} - hidden
     require(visible <= KNOWN_VISIBLE | select_names, 'SCHEMA')
+    # A hidden lot parameter (e.g. filled by a script) would also go out empty.
+    require(not {n for n in hidden if n.startswith('fields[')} - select_names - {'fields[images]'},
+            'SCHEMA')
     values = dict(pairs)
     require(values.get('offer_id') in {'', '0'}, 'NEW_IDENTITY')
     require(values.get('node_id') == str(node_id), 'SCOPE')

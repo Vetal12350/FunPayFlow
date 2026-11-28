@@ -166,6 +166,7 @@ def fingerprint(saved):
     # must block before any POST instead of being sent empty.
     (live_html(extra='<input name="fields[server]" value="">'), 'SCHEMA'),
     (live_html(extra='<textarea name="fields[activation]"></textarea>'), 'SCHEMA'),
+    (live_html(extra='<input type="hidden" name="fields[server]" value="">'), 'SCHEMA'),
     (live_html(selects=SELECTS[:2]), 'SCHEMA'),
     (live_html().replace('method="post"', 'method="get"'), 'CONTRACT_UNVERIFIED'),
     (live_html().replace('name="amount" value="1"', 'name="amount_x" value="1"'), 'SCHEMA'),
