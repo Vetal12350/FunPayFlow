@@ -38,8 +38,9 @@ PUBLISH_BLOCK_REASONS = {
 _flows: dict[int, dict] = {}
 _locks: dict[int, tuple] = {}
 _PAGE = 8
-_TITLES = {'platform': 'Platform', 'region': 'Region', 'edition': 'Edition',
-           'quantity': 'Quantity', 'product_name': 'Product name', 'price': 'Price',
+_TITLES = {'platform': 'Платформа', 'region': 'Регион', 'edition': 'Издание',
+           'quantity': 'Количество в лоте (для публикации нужно 1)',
+           'product_name': 'Название товара', 'price': 'Цена',
            'sale_name': 'Фактическое название игры / DLC / сервиса / карты · Actual offer name',
            'base_game': 'Необходимая базовая игра (не включена) / Required base game (not included)',
            'currency_name': 'Название внутриигровой валюты / In-game currency name',
@@ -268,7 +269,7 @@ async def _catalog_confirmation(callback, user_id, store, routes, node_id):
         f"Раздел: {escape(candidate['section_name'][:150])} · node {candidate['node_id']}\n"
         'Подтверждение сохранит только локальное соответствие и продолжит создание draft.\n'
         'Подтвердите пригодность этого COMMON-раздела для вашего товара. Тип шаблона её не гарантирует.\n'
-        + (snapshot['warning'] if snapshot['stale'] else 'Публикация FunPay отсутствует.'), _menu([
+        + (snapshot['warning'] if snapshot['stale'] else 'На FunPay ничего не отправляется.'), _menu([
             [('✅ Использовать', _catalog_action(state, 'confirm'))],
             [('🔄 Обновить каталог', _catalog_action(state, 'refresh'))],
             [('🔍 Другой поиск', _catalog_action(state, 'search'))],
@@ -902,9 +903,14 @@ async def _wizard_prompt(message, user_id, flow, templates):
             await _variable_picker(message, user_id, flow, template, field,
                                    flow['variables'].get(field, defaults.get(field)), 'wizard')
             return False
-        await message.answer(f"{_TITLES.get(field, field)} [{default}]\n"
-                             'Введите значение; «-» — оставить default. ❌ Отмена — выйти. '
-                             'Только публичное описание товара: не вводите логины, пароли, токены, cookies или API keys.',
+        if field in defaults:
+            hint = f'Отправьте текст или «-», чтобы оставить «{defaults[field]}».'
+        elif field == 'price':
+            hint = 'Отправьте цену числом, например 15 или 15.50.'
+        else:
+            hint = 'Это поле обязательное: отправьте текст.'
+        await message.answer(f"{_TITLES.get(field, field)}\n{hint}\n"
+                             '❌ Отмена — выйти. Не вводите логины, пароли, токены и ключи.',
                              parse_mode=None)
         return False
     return True
@@ -1607,11 +1613,14 @@ async def _products_input(message, user_id):
                     value = validate_variable_value(template, field, value)
                     flow['variables'][field] = value
             elif field == 'price' and not flow.get('price'):
-                raise ValueError('Цена обязательна.')
+                await message.answer('Цена обязательная: отправьте число, например 15.')
+                return True
             elif field != 'price':
                 _, defaults, _ = await _variable_model(user_id, flow, templates)
                 if field not in flow['variables'] and field not in defaults:
-                    raise ValueError('У поля нет default; укажите фактическое значение или отмените создание.')
+                    await message.answer('У этого поля нет значения по умолчанию, «-» здесь не подходит. '
+                                         'Отправьте текст, например «Standard Edition».')
+                    return True
             await _advance_variables(message, user_id, flow, templates, drafts)
         elif step == 'similarinput':
             field = flow['similar_field']

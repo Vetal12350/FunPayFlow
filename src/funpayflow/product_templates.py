@@ -74,6 +74,7 @@ def builtin_template(kind=GAME_KEY):
     if kind == XBOX_KEY:
         extra = ['sale_name', 'sale_edition', 'availability']
         body.update(display_name='Ключ Xbox / Xbox key', default_emoji='🟩',
+            defaults={'quantity': '1', 'sale_edition': 'Standard Edition', 'availability': 'Global'},
             title_ru='{{sale_name}} | {{sale_edition}} | Xbox One / Series X|S | Ключ | {{availability}}',
             title_en='{{sale_name}} | {{sale_edition}} | Xbox One / Series X|S | Key | {{availability}}',
             description_ru='Цифровой ключ {{sale_name}} ({{sale_edition}}) для Xbox One и Xbox Series X|S. Регион ключа: {{availability}} — перед покупкой убедитесь, что он подходит вашей учётной записи Microsoft. Активация: на консоли Microsoft Store → «Использовать код» или на сайте redeem.microsoft.com. Ключ отправляется в чат заказа. Количество: {{quantity}}.',
