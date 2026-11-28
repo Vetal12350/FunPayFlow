@@ -169,7 +169,7 @@ def test_telegram_variant_pick_and_preview(context):
         assert preview['variant_id'] == deluxe['id']
         assert preview['variables']['edition'] == 'Deluxe Edition'
         assert preview['emoji'] == '⭐'
-        assert 'Variant: Deluxe' in view._preview_screen(view._flows[1])[0]
+        assert 'Вариант: Deluxe' in view._preview_screen(view._flows[1])[0]
         await asyncio.gather(*(view.products_callback(callback(), preview_action('prd:save'), 1) for _ in range(2)))
         assert len(ctx.store.list_drafts()) == 1
         await view.products_callback(cb, 'products', 1)

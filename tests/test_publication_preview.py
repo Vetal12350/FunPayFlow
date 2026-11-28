@@ -96,7 +96,7 @@ def action(operation):
 
 async def preview(c, currency=True):
     cb = await send('prd:drafts:0')
-    assert 'PREVIEW' in str(cb.message.edit_text.call_args)
+    assert 'Опубликовать на FunPay' in str(cb.message.edit_text.call_args)
     cb = await send(f"prd:pubopen:{c.draft['id']}:{c.draft['revision']}")
     assert 'выберите валюту' in cb.message.edit_text.call_args.args[0]
     assert 'inspect' not in str(cb.message.edit_text.call_args.kwargs['reply_markup'])
@@ -111,7 +111,7 @@ def test_saved_preview_explicit_currency_fresh_inspection_no_false_success(saved
     async def run():
         cb = await preview(c)
         text = cb.message.edit_text.call_args.args[0]
-        for expected in ('Elden Ring', '274', '986', 'PC', 'Европа', c.draft['payload']['price'] + ' USD', 'Количество: 1', 'ручная'):
+        for expected in ('Elden Ring', '986', 'PC', 'Европа', c.draft['payload']['price'] + ' USD', 'Количество: 1', 'ручная'):
             assert expected in text
         assert 'выключенным' in text and 'Опубликовать 1 лот' in text
         c.get.assert_not_called()
@@ -120,8 +120,8 @@ def test_saved_preview_explicit_currency_fresh_inspection_no_false_success(saved
         request = action('inspect')
         cb = await send(request)
         text = cb.message.edit_text.call_args.args[0]
-        assert 'Публикация заблокирована' in text
-        assert 'POST не выполнялся' in text
+        assert 'Публиковать пока нельзя' in text
+        assert 'Ничего не отправлено' in text
         # The synthetic form has no title/description controls: explicit reason.
         assert 'Причина: поля формы не совпадают с черновиком' in text
         assert 'Опубликовать 1 лот' not in str(cb.message.edit_text.call_args.kwargs['reply_markup'])
@@ -227,8 +227,8 @@ def test_unknown_guard_survives_restart_and_revision_without_get(saved):
     c.draft = c.store.edit_draft(c.draft['id'], deepcopy(c.draft), c.draft['revision'])
     async def run():
         cb = await send(f"prd:pubopen:{c.draft['id']}:{c.draft['revision']}")
-        assert 'UNKNOWN' in str(cb.message.answer.call_args)
-        assert 'Не очищайте lot_publish_attempts' in str(cb.message.answer.call_args)
+        assert 'уже публиковался' in str(cb.message.answer.call_args)
+        assert 'чтобы не создать дубль' in str(cb.message.answer.call_args)
         c.get.assert_not_called()
     asyncio.run(run())
     store = ProductStore(restarted, 1, 42)

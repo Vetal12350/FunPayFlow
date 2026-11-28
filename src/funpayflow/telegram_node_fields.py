@@ -237,7 +237,8 @@ async def show(message, user_id, flow, drafts):
              [('⬅️ Назад', action(state, 'back'))], [('❌ Отмена', action(state, 'cancel'))]]
     view._pending(user_id, flow, 'nodefields')
     await message.answer('<b>' + escape(field['display_label']) + '</b>\n'
-        + ('Обязательный параметр FunPay.' if field['required'] else 'Параметр FunPay.'),
+        + ('Выберите вариант кнопкой ниже (обязательно).' if field['required']
+           else 'Выберите вариант кнопкой ниже или пропустите.'),
         parse_mode='HTML', reply_markup=view._menu(rows))
     return False
 

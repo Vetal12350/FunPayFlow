@@ -62,7 +62,7 @@ def test_complete_create_saved_lookup_and_restart(ctx, query, game):
     async def run():
         await pick(ctx)
         cb = await search(ctx, query)
-        assert 'Подтвердите GameRoute' in str(cb.message.edit_text.call_args)
+        assert 'Проверьте раздел' in str(cb.message.edit_text.call_args)
         assert ctx.store.list_routes() == []
         confirm = action('confirm')
         await asyncio.gather(dispatch(confirm), dispatch(confirm))
@@ -137,7 +137,7 @@ def test_no_results_cancel_back_and_old_buttons(ctx):
     async def run():
         await pick(ctx)
         cb = await search(ctx, 'No such game')
-        assert 'Совпадений' in str(cb.message.edit_text.call_args)
+        assert 'не нашлось' in str(cb.message.edit_text.call_args)
         await search(ctx, 'Elden')
         old = action('confirm')
         await dispatch(action('back'))

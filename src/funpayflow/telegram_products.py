@@ -144,7 +144,7 @@ async def _template_picker(callback, purpose, offset, templates):
                 for row in rows[:_PAGE]]
     keyboard += _page_buttons(f'prd:choose:{purpose}', offset, len(rows) > _PAGE)
     keyboard.append([('🔙 Лоты', 'products')])
-    await _show(callback, '🧩 <b>Выберите Product Template</b>', _menu(keyboard))
+    await _show(callback, '🧩 <b>Что продаёте?</b>\nВыберите тип товара.', _menu(keyboard))
 
 
 async def _route_list(callback, user_id, store, offset=0, recent=False, catalog_fallback=True):
@@ -168,12 +168,11 @@ async def _route_list(callback, user_id, store, offset=0, recent=False, catalog_
                      [('🎮 Каталог FunPay', 'prd:catalog:0')],
                      [('Из собственного лота', 'prd:own:0')]]
     keyboard.append([('🔙 Лоты', 'products')])
-    title = '🕘 Недавние / последние routes' if recent else '🗺 Выберите маршрут / категорию'
+    title = '🕘 Недавние игры' if recent else '🗺 Выберите игру'
     await _show(callback, f'<b>{title}</b>\n'
-                f"Найденные маршруты · страница {offset // _PAGE + 1}.\n"
-                'Поиск сначала использует ваши routes, затем каталог FunPay. '
-                'game_name — внутреннее legacy-имя маршрута, не название продаваемого товара. '
-                'Выберите подходящую COMMON-категорию явно; если её нет, создание заблокировано.', _menu(keyboard))
+                f"Страница {offset // _PAGE + 1}.\n"
+                'Сначала показаны игры, с которыми вы уже работали. '
+                'Если нужной нет, нажмите «🎮 Каталог FunPay» и найдите её там.', _menu(keyboard))
 
 
 def _catalog_action(state, operation, value=0):
@@ -217,8 +216,9 @@ async def _catalog_results(callback, user_id, store, routes, *, offset=0, catego
             keyboard = [[(row['game_name'][:60], _catalog_action(state, 'game', row['category_id']))]
                         for row in rows[:_PAGE]]
             operation = 'gpage'
-            text = ('🔎 <b>Найдено в FunPay</b>\nВыберите категорию каталога.' if rows else
-                    '🔎 Совпадений в каталоге FunPay нет. Без подходящей подтверждённой COMMON-категории черновик создать нельзя.')
+            text = ('🔎 <b>Найдено на FunPay</b>\nВыберите игру.' if rows else
+                    '🔎 На FunPay такой игры не нашлось. Попробуйте написать название иначе, '
+                    'например по-английски или короче.')
         else:
             result = await asyncio.to_thread(catalog.sections, category_id, state['generation'],
                                              limit=_PAGE + 1, offset=offset)
@@ -264,11 +264,10 @@ async def _catalog_confirmation(callback, user_id, store, routes, node_id):
     if snapshot['generation'] != state['generation']:
         raise RouteError('Каталог изменился.')
     state.update(token=uuid.uuid4().hex[:12], view='confirm', candidate=candidate)
-    await _show(callback, '👁 <b>Подтвердите GameRoute</b>\n'
-        f"Категория каталога (legacy game_name): {escape(candidate['game_name'][:150])}\n"
-        f"Раздел: {escape(candidate['section_name'][:150])} · node {candidate['node_id']}\n"
-        'Подтверждение сохранит только локальное соответствие и продолжит создание draft.\n'
-        'Подтвердите пригодность этого COMMON-раздела для вашего товара. Тип шаблона её не гарантирует.\n'
+    await _show(callback, '👁 <b>Проверьте раздел</b>\n'
+        f"Игра на FunPay: {escape(candidate['game_name'][:150])}\n"
+        f"Раздел: {escape(candidate['section_name'][:150])} (№ {candidate['node_id']})\n"
+        'Лот будет выставлен именно в этот раздел. Если он подходит, нажмите «✅ Использовать».\n'
         + (snapshot['warning'] if snapshot['stale'] else 'На FunPay ничего не отправляется.'), _menu([
             [('✅ Использовать', _catalog_action(state, 'confirm'))],
             [('🔄 Обновить каталог', _catalog_action(state, 'refresh'))],
@@ -337,21 +336,21 @@ def _publication_candidate(body):
 async def _publication_screen(callback, state):
     review = state['review']
     token = state['token']
-    text = ('👁 <b>PREVIEW · новый лот</b>\n'
-        f'Раздел FunPay: category {review.category_id} · COMMON node {review.node_id}\n'
-        f'Draft revision: {review.revision}\n'
+    text = ('🚀 <b>Публикация лота</b>\n'
+        f'Раздел FunPay № {review.node_id}\n'
         + '\n'.join(escape(label[:65]) + ': ' + escape(option[:120])
                     for _, _, label, option in review.selections)
-        + f'\nЦена: {escape(review.price)} {review.currency or "— выберите валюту"}'
-        '\nКоличество: 1\nВыдача: ручная.\n'
-        'Видимость: лот создаётся <b>выключенным</b>; включите его на FunPay после проверки.\n\n'
-        'Следующий шаг — свежая проверка формы FunPay (только чтение). '
-        'Если форма подходит, появится отдельная кнопка «Опубликовать 1 лот».')
+        + f'\nЦена: {escape(review.price)} {review.currency or "— выберите валюту ниже"}'
+        '\nКоличество: 1\nВыдача: ручная — ключ покупателю отправляете вы.\n'
+        'Лот появится на FunPay <b>выключенным</b>: проверьте его и включите сами.\n\n'
+        '1. Выберите валюту, в которой у вас цены на FunPay.\n'
+        '2. Нажмите «🔎 Проверить форму FunPay» — бот только посмотрит форму, ничего не отправит.\n'
+        'Если всё совпадёт, появится кнопка «Опубликовать 1 лот».')
     rows = [[(currency, f'prd:pub:{token}:{currency}') for currency in ('RUB', 'USD', 'EUR')],
             [('Полный RU', f'prd:pub:{token}:ru'), ('Полный EN', f'prd:pub:{token}:en')]]
     if review.currency:
-        rows.append([('🔎 Проверить NEW-форму (GET)', f'prd:pub:{token}:inspect')])
-    rows += [[('❌ Отмена проверки', f'prd:pub:{token}:cancel')], [('📝 Мои черновики', 'prd:drafts:0')]]
+        rows.append([('🔎 Проверить форму FunPay', f'prd:pub:{token}:inspect')])
+    rows += [[('❌ Отмена', f'prd:pub:{token}:cancel')], [('📝 Мои черновики', 'prd:drafts:0')]]
     if any(len(label) > 65 or len(option) > 120 for _, _, label, option in review.selections):
         await _plain_chunks(callback.message, '\n'.join(label + ': ' + option
             for _, _, label, option in review.selections))
@@ -413,13 +412,14 @@ async def _publication_callback(callback, user_id, parts, store, routes):
             if result is None:
                 raise PublisherError('CONTRACT_UNVERIFIED') from None
         if result['state'] == 'CONFIRMED':
-            text = (f"✅ Лот создан и найден в ваших лотах: ID {result['remote_id']}.\n"
-                    'Он ВЫКЛЮЧЕН. Проверьте его на FunPay и включите вручную.')
+            text = (f"✅ Лот создан, ID {result['remote_id']}.\n"
+                    'Он выключен: проверьте его на FunPay и включите сами.')
         else:
-            text = ('🔒 UNKNOWN: отправку не повторять. Проверьте свои лоты на сайте '
-                    f'только чтением: новый ID, владелец, node {review.node_id}, все тексты, параметры, '
-                    'цена/валюта, количество 1 и ручная выдача. '
-                    'Не очищайте lot_publish_attempts и не обходите барьер копией draft.')
+            text = ('⚠️ Бот не смог подтвердить, что лот создан. Повторно он отправлять не будет, '
+                    'чтобы не создать дубль.\n'
+                    f'Откройте свои лоты на FunPay (раздел № {review.node_id}) и проверьте, '
+                    'появился ли новый выключенный лот с этим названием и ценой. '
+                    'Пришлите мне скриншот.')
             server_error = getattr(publisher, 'last_server_error', None)
             if server_error:
                 text += '\nОтвет FunPay: ' + escape(server_error)
@@ -455,30 +455,32 @@ async def _publication_callback(callback, user_id, parts, store, routes):
                 return
             content = dict(review.content)
             await _plain_chunks(callback.message,
-                'Финальное подтверждение · новый лот\n'
-                'Владелец Telegram: ' + review.owner_id + '; FunPay: ' + str(review.account_id)
-                + f'\ncategory {review.category_id} · COMMON node {review.node_id}\n'
+                'Проверьте лот перед публикацией\n'
+                'Аккаунт FunPay: ' + str(review.account_id)
+                + f'\nРаздел № {review.node_id}\n'
                 + '\n'.join(label + ': ' + option for _, _, label, option in review.selections)
                 + f'\nЦена: {review.price} {review.currency}\nКоличество: 1\n'
-                'Выдача: ручная · Видимость: ВЫКЛЮЧЕН (включите на FunPay сами)\n'
+                'Выдача: ручная · Лот появится выключенным\n'
                 + '\n\n'.join(language.upper() + '\n' + content['title_' + language]
                     + '\n' + content['description_' + language] for language in ('ru', 'en')))
             if not current():
                 return
             state['publisher'] = publisher
             state['token'] = uuid.uuid4().hex[:12]
-            await _show(callback, 'Одна попытка. При UNKNOWN повтор запрещён.', _menu([
+            await _show(callback, 'Форма FunPay подходит. Будет одна попытка: если результат окажется '
+                'неясным, бот не повторит отправку, чтобы не создать дубль.', _menu([
                 [('Опубликовать 1 лот', f"prd:pub:{state['token']}:publish")],
                 [('❌ Отмена', f"prd:pub:{state['token']}:cancel")]]))
             return
-        lines = ['🔒 Публикация заблокирована. Выполнена только свежая проверка формы (чтение).',
+        lines = ['🔒 Публиковать пока нельзя. Бот только посмотрел форму FunPay, ничего не отправил.',
                  'Причина: ' + PUBLISH_BLOCK_REASONS.get(blocked, str(blocked)),
-                 'Наблюдения формы:']
+                 'Пришлите скриншот этого и следующего сообщения разработчику.',
+                 'Технические данные:']
         lines += [f'{key}: {proof[key]}' for key in (
             'editor_url', 'document_markup', 'form_subtree', 'submission', 'blank_identity',
             'node_identity', 'csrf_presence', 'control_inventory', 'select_names',
             'currency_control', 'currency', 'manual_control', 'manual_delivery')]
-        lines += ['POST не выполнялся; попытка публикации не создавалась.']
+        lines += ['Ничего не отправлено.']
         await _show(callback, escape('\n'.join(lines)), _menu([[('📝 Мои черновики', 'prd:drafts:0')]]))
         if current():
             await callback.message.answer(escape(_publication_diagnostics_text(diagnostics, review.currency)))
@@ -492,7 +494,7 @@ def _publication_diagnostics_text(value, requested_currency):
     comparable = [d[k] for k in ('selector_currency', 'price_currency') if d[k] != 'UNKNOWN']
     relation = ('UNKNOWN' if not comparable or chosen == 'UNKNOWN' else
                 'OBSERVED_MATCH' if all(c == chosen for c in comparable) else 'OBSERVED_CONFLICT')
-    return ('Данные формы / диагностика\n'
+    return ('Технические данные формы (для разработчика)\n'
         f"Контекст: {d['context']}\n"
         f"Валюта: selector={d['currency_selector']} / {d['selector_currency']} ({d['selector_reason']}); "
         f"price={d['price_currency']} ({d['price_reason']}, {d['marker_count']}); "
@@ -504,9 +506,7 @@ def _publication_diagnostics_text(value, requested_currency):
             'node_id', 'offer_id', 'csrf_token', 'form_created_at', 'location', 'deleted'))
         + '\nYES/NO — только checked; ABSENT — нет control; HIDDEN — только тип. '
         'UNKNOWN — безопасного наблюдения нет.\n'
-        'Это наблюдения, не доказательство валюты сервера, выдачи или видимости. POST OFF.\n'
-        'Следующий шаг: для разбора неоднозначности пришлите скриншоты только видимых '
-        'секций цены и ручной выдачи. Без DevTools/HAR, заголовков, cookies, payload, CSRF и скрытых полей.')
+        'Ничего не отправлено. Не присылайте cookies, пароли и коды из браузера.')
 
 
 def _route_screen(row, check_token=None):
@@ -633,20 +633,20 @@ def _preview_screen(flow):
     body = flow['preview']; p = body['payload']
     token = flow.setdefault('preview_token', uuid.uuid4().hex[:12])
     clip = _ui()._escaped_preview
-    text = ('👁 <b>RU + EN draft</b>\n'
-            f"Route label (legacy game_name): {clip(body['game'], 80)}\n"
-            f"Template: {clip(body['template_name'], 60)}\n"
-            + (f"Variant: {clip(body['variant_name'], 80)}\n" if body.get('variant_id') else '') +
-            f"Section: {clip(body['section'], 80)} · node {body['node']}\n"
-            f"Emoji: {clip(body['emoji'], 64)}\n"
-            f"RU title: {clip(p['title_ru'], 200)}\n"
-            f"EN title: {clip(p['title_en'], 200)}\n"
-            f"RU description: {clip(p['description_ru'], 200)}\n"
-            f"EN description: {clip(p['description_en'], 200)}\n"
-            f"Price: {escape(p['price'])} · Quantity: {p['amount']}\n"
-            f"Variables: {clip(json.dumps(body['variables'], ensure_ascii=False), 200)}\n\n"
-            'Тексты здесь сокращены; полный RU/EN доступен ниже.\n'
-            'Сохраняется только локальный draft. PUBLISH отсутствует.')
+    text = ('👁 <b>Черновик лота</b>\n'
+            f"Игра: {clip(body['game'], 80)}\n"
+            f"Тип товара: {clip(body['template_name'], 60)}\n"
+            + (f"Вариант: {clip(body['variant_name'], 80)}\n" if body.get('variant_id') else '') +
+            f"Раздел: {clip(body['section'], 80)} (№ {body['node']})\n"
+            f"Эмодзи: {clip(body['emoji'], 64)}\n"
+            f"Название RU: {clip(p['title_ru'], 200)}\n"
+            f"Название EN: {clip(p['title_en'], 200)}\n"
+            f"Описание RU: {clip(p['description_ru'], 200)}\n"
+            f"Описание EN: {clip(p['description_en'], 200)}\n"
+            f"Цена: {escape(p['price'])} · Количество: {p['amount']}\n"
+            f"Данные шаблона: {clip(json.dumps(body['variables'], ensure_ascii=False), 200)}\n\n"
+            'Тексты сокращены, полностью — кнопками «Полный RU» и «Полный EN».\n'
+            'Это черновик: на FunPay пока ничего не отправлено.')
     if 'node_fields' in body:
         field_lines = [f"{row['display_label'][:65]}: {row['option_label'][:90]}" for row in body['node_fields']]
         text = '📋 <b>Параметры FunPay</b>\n' + escape('\n'.join(field_lines[:8])) + '\n\n' + text
@@ -656,12 +656,12 @@ def _preview_screen(flow):
             text += '\n⚠ ' + escape(body['node_warning'])
     else:
         text += '\n⚠ ' + LEGACY_WARNING
-    rows = [[('💾 Сохранить draft', 'prd:save')],
-            [('💵 Цена', 'prd:edit:price'), ('Emoji', 'prd:edit:emoji')],
+    rows = [[('💾 Сохранить черновик', 'prd:save')],
+            [('💵 Цена', 'prd:edit:price'), ('Эмодзи', 'prd:edit:emoji')],
             [('Изменить RU', 'prd:edit:ru'), ('Изменить EN', 'prd:edit:en')],
-            [('Variables', 'prd:edit:variables')],
+            [('Данные шаблона', 'prd:edit:variables')],
             [('Полный RU', 'prd:text:ru'), ('Полный EN', 'prd:text:en')],
-            [('❌ Cancel', 'prd:discard')], [('🔙 Лоты', 'products')]]
+            [('❌ Отменить', 'prd:discard')], [('🔙 Лоты', 'products')]]
     if body.get('status') == 'cancelled':
         rows = [[('🔙 Лоты', 'products')]]
     if 'node_fields' in body:
@@ -671,7 +671,7 @@ def _preview_screen(flow):
     if flow.get('stored_id') and not flow.get('dirty') and body.get('status') != 'cancelled':
         rows.insert(0, [('📑 Создать похожий', 'prd:clone')])
         if _publication_candidate(body):
-            rows.insert(0, [('👁 PREVIEW публикации', 'prd:pubpreview:' + token)])
+            rows.insert(0, [('🚀 Опубликовать на FunPay', 'prd:pubpreview:' + token)])
     if flow.get('similar') and not flow.get('stored_id'):
         rows.insert(0, [('📝 Параметры', _local_action(flow, 'menu'))])
     rows = [[(label, action + ':' + token if action.startswith('prd:') and action.split(':')[1] in {'save', 'edit', 'text', 'discard', 'clone', 'bindings'}
@@ -1434,10 +1434,10 @@ async def _products_callback(callback, action, user_id):
             for row in rows[:_PAGE]:
                 keyboard.append([(_draft_label(row), f"prd:open:{row['id']}")])
                 if _publication_candidate(row):
-                    keyboard.append([('👁 PREVIEW публикации', f"prd:pubopen:{row['id']}:{row['revision']}")])
+                    keyboard.append([('🚀 Опубликовать на FunPay', f"prd:pubopen:{row['id']}:{row['revision']}")])
             keyboard += _page_buttons('prd:drafts', offset, len(rows) > _PAGE)
             keyboard.append([('Лоты', 'products')])
-            await _show(callback, '📝 <b>Сохранённые product drafts</b>', _menu(keyboard))
+            await _show(callback, '📝 <b>Мои черновики</b>', _menu(keyboard))
         elif command == 'open':
             body = await asyncio.to_thread(store.get_draft, parts[2])
             if body is None:
@@ -1495,14 +1495,11 @@ async def _products_callback(callback, action, user_id):
             raise ValueError('Действие устарело.')
     except PublisherError as cause:
         if cause.reason == 'ALREADY_CLAIMED':
-            text = ('🔒 Для этого draft уже есть постоянный барьер попытки. Результат может быть UNKNOWN. '
-                    'Не повторяйте отправку и не создавайте копию для обхода. Проверьте свои лоты '
-                    'на сайте только чтением: ID, владельца, раздел, цену, количество и выдачу. '
-                    'Не очищайте lot_publish_attempts; автоматического retry нет.')
+            text = ('🔒 Этот черновик уже публиковался. Повторно бот отправлять не будет, '
+                    'чтобы не создать дубль. Проверьте свои лоты на FunPay.')
         else:
-            text = ('🔒 PREVIEW / проверка отклонены: ' + cause.reason
-                    + '. Откройте сохранённый draft заново; проверьте owner/account, route, '
-                    'revision, три выбора, quantity=1 и SAFE_MODE. POST не выполнялся.')
+            text = ('🔒 Не получилось: ' + PUBLISH_BLOCK_REASONS.get(cause.reason, cause.reason)
+                    + ' Откройте черновик заново через «📝 Мои черновики». Ничего не отправлено.')
         await callback.message.answer(text)
     except NodeSelectionError:
         if user_id in _flows and _flows[user_id].get('node_state'):
