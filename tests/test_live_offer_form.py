@@ -191,3 +191,13 @@ def test_currency_marker_and_matching_selector_are_accepted(fingerprint, marker)
 def test_offer_id_blank_also_means_new(fingerprint):
     _, service = read(live_html(offer_id=''))
     assert dict(service)['offer_id'] == ''
+
+
+def test_messy_live_page_around_a_clean_form_is_accepted(fingerprint):
+    # Live pages always carry inline scripts with '<' and loose markup outside the form.
+    page = live_html().replace('</body>', '<div><span></div><script>if (a < b) {}</script></body>')
+    schema, service = read(page)
+    assert dict(service)['node_id'] == '986'
+    broken = live_html().replace('</form>', '<div></form>')        # inside the form: still refused
+    with pytest.raises(PublisherError):
+        read(broken)

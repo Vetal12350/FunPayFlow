@@ -46,7 +46,9 @@ _CURRENCY_TOKENS = {'₽': 'RUB', 'руб': 'RUB', 'руб.': 'RUB', 'RUB': 'RUB
                     '$': 'USD', 'USD': 'USD', '€': 'EUR', 'EUR': 'EUR'}
 # Structure only. Identity, CSRF and selects are re-checked below without the
 # old allowlist: real forms carry extra site controls (e.g. form_created_at).
-_STRUCTURE = ('editor_url', 'document_markup', 'form_subtree', 'submission')
+# The whole page is not required to be strict markup: a live FunPay page never
+# is (inline scripts contain '<'). The editor form subtree itself must be.
+_STRUCTURE = ('editor_url', 'form_subtree', 'submission')
 
 
 @dataclass(frozen=True, repr=False)
